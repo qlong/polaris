@@ -136,6 +136,35 @@ public class JdbcBasePersistenceImpl implements BasePersistence, IntegrationPers
     }
   }
 
+  /**
+   * Writes a single entity AND inserts a {@code committed_table_snapshots} row in the same JDBC
+   * transaction. This is the atomicity fix required for schema-v5: a crash between the entity write
+   * and the snapshot record insert must not leave a partially-visible state.
+   *
+   * <p>Must only be called when schema v5 is active and {@code jdbcTxn} is non-null.
+   */
+  public void writeEntityWithSnapshotRecord(
+      @Nonnull PolarisCallContext callCtx,
+      @Nonnull PolarisBaseEntity entity,
+      @Nullable PolarisBaseEntity originalEntity,
+      @Nonnull JdbcTransactionPersistence.CommittedTableSnapshotRow snapshotRow,
+      @Nonnull JdbcTransactionPersistence jdbcTxn) {
+    try {
+      datasourceOperations.runWithinTransaction(
+          connection -> {
+            persistEntity(
+                callCtx, entity, originalEntity, connection, datasourceOperations::execute);
+            jdbcTxn.insertCommittedTableSnapshot(connection, snapshotRow);
+            return true;
+          });
+    } catch (RetryOnConcurrencyException e) {
+      throw e;
+    } catch (SQLException e) {
+      throw new RuntimeException(
+          "Error persisting entity with snapshot record: " + e.getMessage(), e);
+    }
+  }
+
   @Override
   public void writeEntities(
       @Nonnull PolarisCallContext callCtx,

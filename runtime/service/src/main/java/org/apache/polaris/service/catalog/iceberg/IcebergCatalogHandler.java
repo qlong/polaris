@@ -29,11 +29,14 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Maps;
+import io.quarkus.arc.InactiveBeanException;
 import io.smallrye.common.annotation.Identifier;
 import jakarta.annotation.Nonnull;
 import jakarta.annotation.Nullable;
 import jakarta.enterprise.inject.Instance;
+import jakarta.ws.rs.ServiceUnavailableException;
 import java.io.Closeable;
+import java.sql.SQLException;
 import java.time.Clock;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -47,6 +50,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
+import javax.sql.DataSource;
 import org.apache.iceberg.BaseMetadataTable;
 import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.MetadataUpdate;
@@ -68,6 +72,7 @@ import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.ForbiddenException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.NotFoundException;
+import org.apache.iceberg.exceptions.ServiceFailureException;
 import org.apache.iceberg.metrics.ScanReport;
 import org.apache.iceberg.rest.Endpoint;
 import org.apache.iceberg.rest.credentials.ImmutableCredential;
@@ -117,6 +122,8 @@ import org.apache.polaris.core.storage.PolarisStorageActions;
 import org.apache.polaris.core.storage.StorageAccessConfig;
 import org.apache.polaris.core.storage.StorageUtil;
 import org.apache.polaris.immutables.PolarisImmutable;
+import org.apache.polaris.persistence.relational.jdbc.DatasourceOperations;
+import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence;
 import org.apache.polaris.service.catalog.AccessDelegationMode;
 import org.apache.polaris.service.catalog.AccessDelegationModeResolver;
 import org.apache.polaris.service.catalog.CatalogPrefixParser;
@@ -130,6 +137,8 @@ import org.apache.polaris.service.events.EventAttributes;
 import org.apache.polaris.service.http.IcebergHttpUtil;
 import org.apache.polaris.service.http.IfNoneMatch;
 import org.apache.polaris.service.reporting.PolarisMetricsReporter;
+import org.apache.polaris.service.transaction.LockManager;
+import org.apache.polaris.service.transaction.TransactionService;
 import org.apache.polaris.service.types.NotificationRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -211,6 +220,10 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
 
   protected abstract AccessDelegationModeResolver accessDelegationModeResolver();
 
+  protected abstract Instance<DataSource> jdbcDataSource();
+
+  protected abstract Instance<DatasourceOperations> datasourceOperations();
+
   // Catalog instance will be initialized after authorizing resolver successfully resolves
   // the catalog entity.
   @SuppressWarnings("immutables:incompat")
@@ -230,7 +243,7 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
   private static final String SNAPSHOTS_ALL = "all";
   private static final String SNAPSHOTS_REFS = "refs";
 
-  private CatalogEntity getResolvedCatalogEntity() {
+  public CatalogEntity getResolvedCatalogEntity() {
     CatalogEntity catalogEntity = resolutionManifest.getResolvedCatalogEntity();
     diagnostics().checkNotNull(catalogEntity, "No catalog available");
     return catalogEntity;
@@ -707,12 +720,24 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
    */
   public Optional<LoadTableResponse> loadTableIfStale(
       TableIdentifier tableIdentifier, IfNoneMatch ifNoneMatch, String snapshots) {
+    return loadTableIfStale(
+        tableIdentifier, ifNoneMatch, snapshots, Optional.empty(), Optional.empty());
+  }
+
+  public Optional<LoadTableResponse> loadTableIfStale(
+      TableIdentifier tableIdentifier,
+      IfNoneMatch ifNoneMatch,
+      String snapshots,
+      Optional<Long> txnSnapshotId,
+      Optional<Long> txnId) {
     return loadTable(
         tableIdentifier,
         snapshots,
         ifNoneMatch,
         EnumSet.noneOf(AccessDelegationMode.class),
-        Optional.empty());
+        Optional.empty(),
+        txnSnapshotId,
+        txnId);
   }
 
   public LoadTableResponse loadTableWithAccessDelegation(
@@ -739,12 +764,30 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
       IfNoneMatch ifNoneMatch,
       String snapshots,
       Optional<String> refreshCredentialsEndpoint) {
+    return loadTableWithAccessDelegationIfStale(
+        tableIdentifier,
+        ifNoneMatch,
+        snapshots,
+        refreshCredentialsEndpoint,
+        Optional.empty(),
+        Optional.empty());
+  }
+
+  public Optional<LoadTableResponse> loadTableWithAccessDelegationIfStale(
+      TableIdentifier tableIdentifier,
+      IfNoneMatch ifNoneMatch,
+      String snapshots,
+      Optional<String> refreshCredentialsEndpoint,
+      Optional<Long> txnSnapshotId,
+      Optional<Long> txnId) {
     return loadTable(
         tableIdentifier,
         snapshots,
         ifNoneMatch,
         EnumSet.of(VENDED_CREDENTIALS),
-        refreshCredentialsEndpoint);
+        refreshCredentialsEndpoint,
+        txnSnapshotId,
+        txnId);
   }
 
   /**
@@ -852,18 +895,64 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
     return actionsRequested;
   }
 
+  /**
+   * Returns a {@link JdbcTransactionPersistence} for the current catalog and realm if JDBC
+   * persistence is active, or {@code null} if not (e.g. in-memory or NoSQL deployments).
+   */
+  @Nullable
+  private JdbcTransactionPersistence buildJdbcTransactionPersistenceIfActive() {
+    if (!jdbcDataSource().isResolvable() || !datasourceOperations().isResolvable()) {
+      return null;
+    }
+    try {
+      return new JdbcTransactionPersistence(
+          jdbcDataSource().get(),
+          datasourceOperations().get().getDatabaseType(),
+          realmContext().getRealmIdentifier(),
+          getResolvedCatalogEntity().getId());
+    } catch (InactiveBeanException e) {
+      return null;
+    }
+  }
+
+  public TransactionService newTransactionServiceForCatalog() {
+    if (!jdbcDataSource().isResolvable() || !datasourceOperations().isResolvable()) {
+      throw new ServiceUnavailableException(
+          "Multi-table transaction JDBC persistence is not available in this deployment");
+    }
+    try {
+      JdbcTransactionPersistence persistence =
+          new JdbcTransactionPersistence(
+              jdbcDataSource().get(),
+              datasourceOperations().get().getDatabaseType(),
+              realmContext().getRealmIdentifier(),
+              getResolvedCatalogEntity().getId());
+      return new TransactionService(persistence, new LockManager(persistence));
+    } catch (InactiveBeanException e) {
+      throw new ServiceUnavailableException(
+          "Multi-table transaction JDBC persistence is not available in this deployment: "
+              + e.getMessage());
+    }
+  }
+
   public Optional<LoadTableResponse> loadTable(
       TableIdentifier tableIdentifier,
       String snapshots,
       IfNoneMatch ifNoneMatch,
       EnumSet<AccessDelegationMode> delegationModes,
-      Optional<String> refreshCredentialsEndpoint) {
+      Optional<String> refreshCredentialsEndpoint,
+      Optional<Long> txnSnapshotId,
+      Optional<Long> txnId) {
 
     Set<PolarisStorageActions> actionsRequested =
         authorizeLoadTable(tableIdentifier, !delegationModes.isEmpty());
     Optional<AccessDelegationMode> resolvedMode = resolveAccessDelegationModes(delegationModes);
 
-    if (ifNoneMatch != null) {
+    boolean txnScopedRead =
+        txnSnapshotId.map(id -> id != null && id > 0).orElse(false)
+            || txnId.map(id -> id != null && id > 0).orElse(false);
+
+    if (ifNoneMatch != null && !txnScopedRead) {
       // Perform freshness-aware table loading if caller specified ifNoneMatch.
       IcebergTableLikeEntity tableEntity = getTableEntity(tableIdentifier);
       if (tableEntity == null || tableEntity.getMetadataLocation() == null) {
@@ -880,6 +969,53 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
         if (ifNoneMatch.anyMatch(tableETag)) {
           return Optional.empty();
         }
+      }
+    }
+
+    if (txnScopedRead) {
+      if (!(baseCatalog instanceof IcebergCatalog icebergCatalog)) {
+        throw new BadRequestException(
+            "txn_snapshot_id and txn_id are only supported for native Polaris-managed catalogs");
+      }
+      IcebergTableLikeEntity te = getTableEntity(tableIdentifier);
+      if (te == null) {
+        throw new NoSuchTableException("Table does not exist: %s", tableIdentifier);
+      }
+      String tableUuid = te.getId() + "";
+      TransactionService txnService = newTransactionServiceForCatalog();
+      try {
+        String metadataLocation = null;
+        if (txnId.map(id -> id != null && id > 0).orElse(false)) {
+          metadataLocation =
+              txnService.resolveRYOWMetadataLocation(tableUuid, txnId.get()).orElse(null);
+        }
+        if (metadataLocation == null
+            && txnSnapshotId.map(id -> id != null && id > 0).orElse(false)) {
+          metadataLocation =
+              txnService
+                  .resolveTableMetadataLocation(tableUuid, txnSnapshotId.get())
+                  .orElseThrow(
+                      () ->
+                          new NoSuchTableException(
+                              "No committed metadata visible for table %s under this snapshot",
+                              tableIdentifier));
+        }
+        if (metadataLocation != null) {
+          TableMetadata tableMetadata =
+              icebergCatalog.readTableMetadataAtLocation(tableIdentifier, metadataLocation);
+          LoadTableResponse response =
+              buildLoadTableResponseWithDelegationCredentials(
+                      tableIdentifier,
+                      tableMetadata,
+                      resolvedMode,
+                      actionsRequested,
+                      refreshCredentialsEndpoint)
+                  .build();
+          return Optional.of(filterResponseToSnapshots(response, snapshots));
+        }
+      } catch (SQLException e) {
+        throw new ServiceFailureException(
+            e, "Transaction snapshot resolution failed for table %s", tableIdentifier);
       }
     }
 
@@ -1210,6 +1346,33 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
       throw new CommitFailedException(
           "Transaction commit failed with status: %s, extraInfo: %s",
           result.getReturnStatus(), result.getExtraInformation());
+    }
+
+    // Record committed_table_snapshots rows for all Iceberg table entities in the batch,
+    // keeping the MVCC history consistent with the entity writes (best-effort: if JDBC
+    // persistence is unavailable the single-table path already skips recording too).
+    JdbcTransactionPersistence jdbcTxn = buildJdbcTransactionPersistenceIfActive();
+    if (jdbcTxn != null) {
+      for (EntityWithPath ewp : pendingUpdates) {
+        if (ewp.entity().getSubTypeCode() == PolarisEntitySubType.ICEBERG_TABLE.getCode()) {
+          IcebergTableLikeEntity tableEntity = new IcebergTableLikeEntity(ewp.entity());
+          String metadataLocation = tableEntity.getMetadataLocation();
+          if (metadataLocation != null) {
+            try {
+              long committedTxnId = jdbcTxn.nextTxnId();
+              jdbcTxn.insertCommittedTableSnapshotRow(
+                  new JdbcTransactionPersistence.CommittedTableSnapshotRow(
+                      tableEntity.getId() + "", committedTxnId, null, metadataLocation));
+            } catch (java.sql.SQLException e) {
+              LOGGER.warn(
+                  "Failed to record committed_table_snapshots for table entity {} during"
+                      + " commitTransaction finalize; snapshot reads may miss this commit: {}",
+                  tableEntity.getId(),
+                  e.getMessage());
+            }
+          }
+        }
+      }
     }
 
     eventAttributeMap().put(EventAttributes.TABLE_METADATAS, tableMetadataObjs);

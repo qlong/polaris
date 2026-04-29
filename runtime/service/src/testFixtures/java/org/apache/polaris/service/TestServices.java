@@ -62,6 +62,7 @@ import org.apache.polaris.core.secrets.UserSecretsManagerFactory;
 import org.apache.polaris.core.storage.StorageCredentialsVendor;
 import org.apache.polaris.core.storage.cache.StorageCredentialCache;
 import org.apache.polaris.core.storage.cache.StorageCredentialCacheConfig;
+import org.apache.polaris.persistence.relational.jdbc.DatasourceOperations;
 import org.apache.polaris.service.admin.PolarisAdminService;
 import org.apache.polaris.service.admin.PolarisServiceImpl;
 import org.apache.polaris.service.admin.api.PolarisCatalogsApi;
@@ -299,6 +300,13 @@ public record TestServices(
 
       TaskExecutor taskExecutor = Mockito.mock(TaskExecutor.class);
 
+      @SuppressWarnings("unchecked")
+      Instance<javax.sql.DataSource> jdbcDataSources = Mockito.mock(Instance.class);
+      Mockito.when(jdbcDataSources.isResolvable()).thenReturn(false);
+      @SuppressWarnings("unchecked")
+      Instance<DatasourceOperations> datasourceOperationsInstance = Mockito.mock(Instance.class);
+      Mockito.when(datasourceOperationsInstance.isResolvable()).thenReturn(false);
+
       PolarisEventDispatcher polarisEventDispatcher = new InMemoryEventCollector();
       LocalCatalogFactory localCatalogFactory =
           new PolarisLocalCatalogFactory(
@@ -311,7 +319,9 @@ public record TestServices(
               eventMetadataFactory,
               metaStoreManager,
               callContext,
-              principal);
+              principal,
+              jdbcDataSources,
+              datasourceOperationsInstance);
 
       ReservedProperties reservedProperties = ReservedProperties.NONE;
 
@@ -350,6 +360,8 @@ public record TestServices(
                   .clock(clock)
                   .accessDelegationModeResolver(
                       new DefaultAccessDelegationModeResolver(realmConfig))
+                  .jdbcDataSource(jdbcDataSources)
+                  .datasourceOperations(datasourceOperationsInstance)
                   .build();
             }
           };

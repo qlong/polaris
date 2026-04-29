@@ -964,6 +964,26 @@ paths:
           schema:
             type: string
             enum: [ all, refs ]
+        - in: query
+          name: txn_snapshot_id
+          description: >
+            Optional Polaris multi-table transaction snapshot ID. When set, the server resolves
+            the table metadata location visible under that snapshot (consistent read) instead of
+            the catalog's current pointer.
+          required: false
+          schema:
+            type: integer
+            format: int64
+        - in: query
+          name: txn_id
+          description: >
+            Optional in-progress Polaris write-transaction ID for read-your-own-writes: if this
+            transaction has a staged subtransaction for the table, return the staged metadata
+            location instead of the last committed pointer.
+          required: false
+          schema:
+            type: integer
+            format: int64
       responses:
         200:
           $ref: '#/components/responses/LoadTableResponse'

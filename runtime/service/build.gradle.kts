@@ -31,7 +31,8 @@ dependencies {
   implementation(project(":polaris-api-iceberg-service"))
   implementation(project(":polaris-api-catalog-service"))
 
-  runtimeOnly(project(":polaris-relational-jdbc"))
+  // Compile-time: transaction extension (JdbcTransactionPersistence, schema types)
+  implementation(project(":polaris-relational-jdbc"))
 
   implementation(project(":polaris-runtime-defaults"))
   implementation(project(":polaris-runtime-common"))
@@ -172,6 +173,7 @@ dependencies {
   testFixturesImplementation(project(":polaris-api-management-service"))
   testFixturesImplementation(project(":polaris-api-iceberg-service"))
   testFixturesImplementation(project(":polaris-api-catalog-service"))
+  testFixturesImplementation(project(":polaris-relational-jdbc"))
 
   testFixturesImplementation(libs.jakarta.enterprise.cdi.api)
   testFixturesImplementation(libs.jakarta.annotation.api)

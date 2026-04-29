@@ -152,6 +152,8 @@ public class FileIOExceptionsTest {
                 null,
                 null,
                 "ALL",
+                null,
+                null,
                 services.realmContext(),
                 services.securityContext());
     res.close();

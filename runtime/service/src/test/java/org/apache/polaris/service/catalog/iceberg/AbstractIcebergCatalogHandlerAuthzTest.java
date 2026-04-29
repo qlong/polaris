@@ -19,6 +19,7 @@
 package org.apache.polaris.service.catalog.iceberg;
 
 import com.google.common.collect.ImmutableMap;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import java.lang.reflect.Field;
 import java.time.Instant;
@@ -28,6 +29,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Stream;
+import javax.sql.DataSource;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.MetadataUpdate;
@@ -76,6 +78,7 @@ import org.apache.polaris.core.entity.PolarisPrivilege;
 import org.apache.polaris.core.entity.PrincipalEntity;
 import org.apache.polaris.core.persistence.dao.entity.CreatePrincipalResult;
 import org.apache.polaris.core.persistence.resolver.PolarisResolutionManifest;
+import org.apache.polaris.persistence.relational.jdbc.DatasourceOperations;
 import org.apache.polaris.service.admin.PolarisAuthzTestBase;
 import org.apache.polaris.service.context.catalog.PolarisLocalCatalogFactory;
 import org.apache.polaris.service.http.IfNoneMatch;
@@ -1508,6 +1511,13 @@ public abstract class AbstractIcebergCatalogHandlerAuthzTest extends PolarisAuth
   }
 
   private PolarisLocalCatalogFactory createExternalCatalogFactory(String externalCatalog) {
+    @SuppressWarnings("unchecked")
+    Instance<DataSource> jdbcDataSources = Mockito.mock(Instance.class);
+    Mockito.when(jdbcDataSources.isResolvable()).thenReturn(false);
+    @SuppressWarnings("unchecked")
+    Instance<DatasourceOperations> dsOpsInst = Mockito.mock(Instance.class);
+    Mockito.when(dsOpsInst.isResolvable()).thenReturn(false);
+
     return new PolarisLocalCatalogFactory(
         diagServices,
         resolverFactory,
@@ -1518,7 +1528,9 @@ public abstract class AbstractIcebergCatalogHandlerAuthzTest extends PolarisAuth
         eventMetadataFactory,
         metaStoreManager,
         callContext,
-        authenticatedRoot) {
+        authenticatedRoot,
+        jdbcDataSources,
+        dsOpsInst) {
       @Override
       public Catalog createCatalog(PolarisResolutionManifest resolvedManifest) {
         Catalog catalog = super.createCatalog(resolvedManifest);

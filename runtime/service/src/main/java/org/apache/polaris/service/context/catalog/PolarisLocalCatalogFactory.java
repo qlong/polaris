@@ -18,10 +18,13 @@
  */
 package org.apache.polaris.service.context.catalog;
 
+import io.quarkus.arc.InactiveBeanException;
 import jakarta.enterprise.context.RequestScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import java.util.HashMap;
 import java.util.Map;
+import javax.sql.DataSource;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.polaris.core.PolarisDiagnostics;
@@ -32,12 +35,15 @@ import org.apache.polaris.core.entity.CatalogEntity;
 import org.apache.polaris.core.persistence.PolarisMetaStoreManager;
 import org.apache.polaris.core.persistence.resolver.PolarisResolutionManifest;
 import org.apache.polaris.core.persistence.resolver.ResolverFactory;
+import org.apache.polaris.persistence.relational.jdbc.DatasourceOperations;
+import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence;
 import org.apache.polaris.service.catalog.iceberg.IcebergCatalog;
 import org.apache.polaris.service.catalog.io.FileIOFactory;
 import org.apache.polaris.service.catalog.io.StorageAccessConfigProvider;
 import org.apache.polaris.service.events.PolarisEventDispatcher;
 import org.apache.polaris.service.events.PolarisEventMetadataFactory;
 import org.apache.polaris.service.task.TaskExecutor;
+import org.apache.polaris.service.transaction.LockManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -55,6 +61,8 @@ public class PolarisLocalCatalogFactory implements LocalCatalogFactory {
   private final PolarisMetaStoreManager metaStoreManager;
   private final CallContext callContext;
   private final PolarisPrincipal principal;
+  private final Instance<DataSource> jdbcDataSources;
+  private final Instance<DatasourceOperations> datasourceOperations;
 
   @Inject
   public PolarisLocalCatalogFactory(
@@ -67,7 +75,9 @@ public class PolarisLocalCatalogFactory implements LocalCatalogFactory {
       PolarisEventMetadataFactory eventMetadataFactory,
       PolarisMetaStoreManager metaStoreManager,
       CallContext callContext,
-      PolarisPrincipal principal) {
+      PolarisPrincipal principal,
+      Instance<DataSource> jdbcDataSources,
+      Instance<DatasourceOperations> datasourceOperations) {
     this.diagnostics = diagnostics;
     this.resolverFactory = resolverFactory;
     this.taskExecutor = taskExecutor;
@@ -78,6 +88,8 @@ public class PolarisLocalCatalogFactory implements LocalCatalogFactory {
     this.metaStoreManager = metaStoreManager;
     this.callContext = callContext;
     this.principal = principal;
+    this.jdbcDataSources = jdbcDataSources;
+    this.datasourceOperations = datasourceOperations;
   }
 
   @Override
@@ -121,6 +133,26 @@ public class PolarisLocalCatalogFactory implements LocalCatalogFactory {
     // TODO: The initialize properties might need to take more from CallContext and the
     // CatalogEntity.
     catalogInstance.initialize(catalogName, catalogProperties);
+
+    if (jdbcDataSources.isResolvable() && datasourceOperations.isResolvable()) {
+      try {
+        JdbcTransactionPersistence jdbcTx =
+            new JdbcTransactionPersistence(
+                jdbcDataSources.get(),
+                datasourceOperations.get().getDatabaseType(),
+                realm,
+                catalog.getId());
+        catalogInstance.setLockManager(new LockManager(jdbcTx));
+        catalogInstance.setJdbcTransactionPersistence(jdbcTx);
+      } catch (InactiveBeanException e) {
+        LOGGER
+            .atDebug()
+            .addKeyValue("catalogKey", catalogKey)
+            .log(
+                "Skipping JDBC transaction persistence wiring (datasource inactive): {}",
+                e.getMessage());
+      }
+    }
 
     return catalogInstance;
   }

@@ -28,6 +28,7 @@ import io.quarkus.test.junit.QuarkusMock;
 import jakarta.annotation.Nonnull;
 import jakarta.enterprise.context.RequestScoped;
 import jakarta.enterprise.inject.Alternative;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import java.io.IOException;
 import java.util.Date;
@@ -36,6 +37,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import javax.sql.DataSource;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.catalog.Catalog;
@@ -74,6 +76,7 @@ import org.apache.polaris.core.persistence.resolver.ResolverFactory;
 import org.apache.polaris.core.policy.PredefinedPolicyTypes;
 import org.apache.polaris.core.secrets.UserSecretsManager;
 import org.apache.polaris.core.storage.cache.StorageCredentialCache;
+import org.apache.polaris.persistence.relational.jdbc.DatasourceOperations;
 import org.apache.polaris.service.catalog.PolarisPassthroughResolutionView;
 import org.apache.polaris.service.catalog.Profiles;
 import org.apache.polaris.service.catalog.generic.PolarisGenericTableCatalog;
@@ -504,7 +507,33 @@ public abstract class PolarisAuthzTestBase {
 
     @SuppressWarnings("unused") // Required by CDI
     protected TestPolarisLocalCatalogFactory() {
-      this(null, null, null, null, null, null, null, null, null, null);
+      this(
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          unsatisfiedJdbcDataSources(),
+          unsatisfiedDatasourceOperations());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Instance<DataSource> unsatisfiedJdbcDataSources() {
+      Instance<DataSource> mock = Mockito.mock(Instance.class);
+      Mockito.when(mock.isResolvable()).thenReturn(false);
+      return mock;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Instance<DatasourceOperations> unsatisfiedDatasourceOperations() {
+      Instance<DatasourceOperations> mock = Mockito.mock(Instance.class);
+      Mockito.when(mock.isResolvable()).thenReturn(false);
+      return mock;
     }
 
     @Inject
@@ -518,7 +547,9 @@ public abstract class PolarisAuthzTestBase {
         PolarisEventMetadataFactory eventMetadataFactory,
         PolarisMetaStoreManager metaStoreManager,
         CallContext callContext,
-        PolarisPrincipal principal) {
+        PolarisPrincipal principal,
+        Instance<DataSource> jdbcDataSources,
+        Instance<DatasourceOperations> datasourceOperations) {
       super(
           diagnostics,
           resolverFactory,
@@ -529,7 +560,9 @@ public abstract class PolarisAuthzTestBase {
           eventMetadataFactory,
           metaStoreManager,
           callContext,
-          principal);
+          principal,
+          jdbcDataSources,
+          datasourceOperations);
     }
 
     @Override

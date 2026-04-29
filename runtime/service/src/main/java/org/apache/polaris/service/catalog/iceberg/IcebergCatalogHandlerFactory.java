@@ -23,6 +23,7 @@ import jakarta.enterprise.inject.Any;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import java.time.Clock;
+import javax.sql.DataSource;
 import org.apache.polaris.core.PolarisDiagnostics;
 import org.apache.polaris.core.auth.PolarisAuthorizer;
 import org.apache.polaris.core.auth.PolarisPrincipal;
@@ -33,6 +34,7 @@ import org.apache.polaris.core.credentials.PolarisCredentialManager;
 import org.apache.polaris.core.persistence.PolarisMetaStoreManager;
 import org.apache.polaris.core.persistence.resolver.ResolutionManifestFactory;
 import org.apache.polaris.core.persistence.resolver.ResolverFactory;
+import org.apache.polaris.persistence.relational.jdbc.DatasourceOperations;
 import org.apache.polaris.service.catalog.AccessDelegationModeResolver;
 import org.apache.polaris.service.catalog.CatalogPrefixParser;
 import org.apache.polaris.service.catalog.io.StorageAccessConfigProvider;
@@ -60,6 +62,8 @@ public class IcebergCatalogHandlerFactory {
   @Inject PolarisMetricsReporter metricsReporter;
   @Inject Clock clock;
   @Inject AccessDelegationModeResolver accessDelegationModeResolver;
+  @Inject Instance<DataSource> jdbcDataSource;
+  @Inject Instance<DatasourceOperations> datasourceOperations;
 
   public IcebergCatalogHandler createHandler(String catalogName, PolarisPrincipal principal) {
     return ImmutableIcebergCatalogHandler.builder()
@@ -82,6 +86,8 @@ public class IcebergCatalogHandlerFactory {
         .metricsReporter(metricsReporter)
         .clock(clock)
         .accessDelegationModeResolver(accessDelegationModeResolver)
+        .jdbcDataSource(jdbcDataSource)
+        .datasourceOperations(datasourceOperations)
         .build();
   }
 }

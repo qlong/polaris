@@ -91,7 +91,8 @@ public class DatasourceOperations {
     }
   }
 
-  DatabaseType getDatabaseType() {
+  /** Database type detected at construction time (or configured explicitly). */
+  public DatabaseType getDatabaseType() {
     return databaseType;
   }
 

@@ -368,6 +368,8 @@ public class IcebergRestCatalogEventServiceDelegator
       String accessDelegationMode,
       String ifNoneMatchString,
       String snapshots,
+      Long txnSnapshotId,
+      Long txnId,
       RealmContext realmContext,
       SecurityContext securityContext) {
     String catalogName = prefixParser.prefixToCatalogName(prefix);
@@ -394,6 +396,8 @@ public class IcebergRestCatalogEventServiceDelegator
             accessDelegationMode,
             ifNoneMatchString,
             snapshots,
+            txnSnapshotId,
+            txnId,
             realmContext,
             securityContext);
     if (polarisEventDispatcher.hasListeners(PolarisEventType.AFTER_LOAD_TABLE)) {

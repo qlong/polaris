@@ -1,0 +1,755 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+---
+paths:
+
+  # ---------------------------------------------------------------------------
+  # TxnSnapshot: exportable consistent-read handles
+  # ---------------------------------------------------------------------------
+  /polaris/v1/{prefix}/transaction-snapshots:
+    parameters:
+      - $ref: '../iceberg-rest-catalog-open-api.yaml#/components/parameters/prefix'
+
+    post:
+      tags:
+        - Transaction API
+      summary: Acquire a consistent read snapshot
+      description: >
+        Creates a TxnSnapshot capturing (xmin, xmax, xip_list) atomically.
+        The caller can pass txn_snapshot_id on subsequent loadTable calls to
+        get a consistent multi-table view pinned to this snapshot.
+      operationId: createTransactionSnapshot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTransactionSnapshotRequest'
+      responses:
+        200:
+          description: Snapshot acquired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSnapshot'
+        400:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/BadRequestErrorResponse'
+        401:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/UnauthorizedResponse'
+        403:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ForbiddenResponse'
+        503:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ServiceUnavailableResponse'
+        5XX:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ServerErrorResponse'
+
+  /polaris/v1/{prefix}/transaction-snapshots/{txn-snapshot-id}:
+    parameters:
+      - $ref: '../iceberg-rest-catalog-open-api.yaml#/components/parameters/prefix'
+      - name: txn-snapshot-id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+
+    get:
+      tags:
+        - Transaction API
+      summary: Get a transaction snapshot by ID
+      operationId: getTransactionSnapshot
+      responses:
+        200:
+          description: Snapshot details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSnapshot'
+        404:
+          description: Not Found - The requested resource does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '../iceberg-rest-catalog-open-api.yaml#/components/schemas/IcebergErrorResponse'
+        401:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/UnauthorizedResponse'
+        403:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ForbiddenResponse'
+
+    delete:
+      tags:
+        - Transaction API
+      summary: Release a transaction snapshot
+      description: Explicitly releases the snapshot, advancing the watermark sooner.
+      operationId: releaseTransactionSnapshot
+      responses:
+        204:
+          description: Released
+        404:
+          description: Not Found - The requested resource does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '../iceberg-rest-catalog-open-api.yaml#/components/schemas/IcebergErrorResponse'
+        401:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/UnauthorizedResponse'
+        403:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ForbiddenResponse'
+
+  /polaris/v1/{prefix}/transaction-snapshots/{txn-snapshot-id}/renew:
+    parameters:
+      - $ref: '../iceberg-rest-catalog-open-api.yaml#/components/parameters/prefix'
+      - name: txn-snapshot-id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+
+    post:
+      tags:
+        - Transaction API
+      summary: Renew a transaction snapshot lease
+      operationId: renewTransactionSnapshot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenewLeaseRequest'
+      responses:
+        200:
+          description: Renewed snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSnapshot'
+        404:
+          description: Not Found - The requested resource does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '../iceberg-rest-catalog-open-api.yaml#/components/schemas/IcebergErrorResponse'
+        401:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/UnauthorizedResponse'
+        403:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ForbiddenResponse'
+
+  # ---------------------------------------------------------------------------
+  # Transactions: full lifecycle (BEGIN / COMMIT / ABORT)
+  # ---------------------------------------------------------------------------
+  /polaris/v1/{prefix}/transactions:
+    parameters:
+      - $ref: '../iceberg-rest-catalog-open-api.yaml#/components/parameters/prefix'
+
+    post:
+      tags:
+        - Transaction API
+      summary: Begin a new multi-table transaction
+      operationId: beginTransaction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BeginTransactionRequest'
+      responses:
+        200:
+          description: Transaction started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        400:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/BadRequestErrorResponse'
+        401:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/UnauthorizedResponse'
+        403:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ForbiddenResponse'
+        503:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ServiceUnavailableResponse'
+        5XX:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ServerErrorResponse'
+
+  /polaris/v1/{prefix}/transactions/{txn-id}:
+    parameters:
+      - $ref: '../iceberg-rest-catalog-open-api.yaml#/components/parameters/prefix'
+      - name: txn-id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+
+    get:
+      tags:
+        - Transaction API
+      summary: Get transaction status
+      operationId: getTransaction
+      responses:
+        200:
+          description: Transaction status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        404:
+          description: Not Found - The requested resource does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '../iceberg-rest-catalog-open-api.yaml#/components/schemas/IcebergErrorResponse'
+        401:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/UnauthorizedResponse'
+        403:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ForbiddenResponse'
+
+  /polaris/v1/{prefix}/transactions/{txn-id}/commit:
+    parameters:
+      - $ref: '../iceberg-rest-catalog-open-api.yaml#/components/parameters/prefix'
+      - name: txn-id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+
+    post:
+      tags:
+        - Transaction API
+      summary: Commit a transaction (finalize all subtransactions atomically)
+      operationId: commitTransaction
+      parameters:
+        - name: X-Txn-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        204:
+          description: Transaction committed — all tables now visible atomically
+        400:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/BadRequestErrorResponse'
+        401:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/UnauthorizedResponse'
+        403:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ForbiddenResponse'
+        404:
+          description: Not Found - The requested resource does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '../iceberg-rest-catalog-open-api.yaml#/components/schemas/IcebergErrorResponse'
+        409:
+          description: Conflict — concurrent write conflict detected during finalize
+          content:
+            application/json:
+              schema:
+                $ref: '../iceberg-rest-catalog-open-api.yaml#/components/schemas/IcebergErrorResponse'
+        503:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ServiceUnavailableResponse'
+        5XX:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ServerErrorResponse'
+
+  /polaris/v1/{prefix}/transactions/{txn-id}/abort:
+    parameters:
+      - $ref: '../iceberg-rest-catalog-open-api.yaml#/components/parameters/prefix'
+      - name: txn-id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+
+    post:
+      tags:
+        - Transaction API
+      summary: Abort a transaction and release all locks
+      operationId: abortTransaction
+      parameters:
+        - name: X-Txn-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        204:
+          description: Transaction aborted
+        401:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/UnauthorizedResponse'
+        403:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ForbiddenResponse'
+        404:
+          description: Not Found - The requested resource does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '../iceberg-rest-catalog-open-api.yaml#/components/schemas/IcebergErrorResponse'
+
+  /polaris/v1/{prefix}/transactions/{txn-id}/renew:
+    parameters:
+      - $ref: '../iceberg-rest-catalog-open-api.yaml#/components/parameters/prefix'
+      - name: txn-id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+
+    post:
+      tags:
+        - Transaction API
+      summary: Renew a transaction lease
+      operationId: renewTransaction
+      parameters:
+        - name: X-Txn-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenewLeaseRequest'
+      responses:
+        200:
+          description: Renewed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        404:
+          description: Not Found - The requested resource does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '../iceberg-rest-catalog-open-api.yaml#/components/schemas/IcebergErrorResponse'
+        401:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/UnauthorizedResponse'
+        403:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ForbiddenResponse'
+
+  # ---------------------------------------------------------------------------
+  # Subtransactions: per-table units of work inside a transaction
+  # ---------------------------------------------------------------------------
+  /polaris/v1/{prefix}/transactions/{txn-id}/subtransactions:
+    parameters:
+      - $ref: '../iceberg-rest-catalog-open-api.yaml#/components/parameters/prefix'
+      - name: txn-id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+
+    post:
+      tags:
+        - Transaction API
+      summary: Create a subtransaction for a single table
+      description: >
+        Allocates a per-table unit of work inside the parent transaction.
+        Acquires a pessimistic lock if the operation requires one
+        (ROW_DELTA, OVERWRITE, EXCLUSIVE, ACCESS_EXCLUSIVE).
+        Returns a server-assigned staging path for the worker app to write to.
+      operationId: createSubtransaction
+      parameters:
+        - name: X-Txn-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSubtransactionRequest'
+      responses:
+        200:
+          description: Subtransaction created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Subtransaction'
+        400:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/BadRequestErrorResponse'
+        401:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/UnauthorizedResponse'
+        403:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ForbiddenResponse'
+        404:
+          description: Not Found - The requested resource does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '../iceberg-rest-catalog-open-api.yaml#/components/schemas/IcebergErrorResponse'
+        409:
+          description: Lock conflict — cannot acquire lock for this resource right now
+          content:
+            application/json:
+              schema:
+                $ref: '../iceberg-rest-catalog-open-api.yaml#/components/schemas/IcebergErrorResponse'
+
+  /polaris/v1/{prefix}/transactions/{txn-id}/subtransactions/{subtxn-id}/commit:
+    parameters:
+      - $ref: '../iceberg-rest-catalog-open-api.yaml#/components/parameters/prefix'
+      - name: txn-id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: subtxn-id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+
+    post:
+      tags:
+        - Transaction API
+      summary: Stage a subtransaction's metadata for commit
+      description: >
+        Validates that the staged metadata file exists at the server-assigned staging path
+        and marks this subtransaction SUB_COMMITTED. The data is not yet visible; visibility
+        occurs only when the parent transaction is committed.
+      operationId: commitSubtransaction
+      parameters:
+        - name: X-Subtxn-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommitSubtransactionRequest'
+      responses:
+        204:
+          description: Subtransaction staged successfully
+        400:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/BadRequestErrorResponse'
+        401:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/UnauthorizedResponse'
+        403:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ForbiddenResponse'
+        404:
+          description: Not Found - The requested resource does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '../iceberg-rest-catalog-open-api.yaml#/components/schemas/IcebergErrorResponse'
+
+  /polaris/v1/{prefix}/transactions/{txn-id}/subtransactions/{subtxn-id}/abort:
+    parameters:
+      - $ref: '../iceberg-rest-catalog-open-api.yaml#/components/parameters/prefix'
+      - name: txn-id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: subtxn-id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+
+    post:
+      tags:
+        - Transaction API
+      summary: Abort a single subtransaction
+      operationId: abortSubtransaction
+      parameters:
+        - name: X-Subtxn-Token
+          in: header
+          description: Either the subtxn token (worker) or the txn token (orchestrator) is accepted
+          schema:
+            type: string
+        - name: X-Txn-Token
+          in: header
+          schema:
+            type: string
+      responses:
+        204:
+          description: Subtransaction aborted
+        401:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/UnauthorizedResponse'
+        403:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ForbiddenResponse'
+        404:
+          description: Not Found - The requested resource does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '../iceberg-rest-catalog-open-api.yaml#/components/schemas/IcebergErrorResponse'
+
+  /polaris/v1/{prefix}/transactions/{txn-id}/subtransactions/{subtxn-id}/renew:
+    parameters:
+      - $ref: '../iceberg-rest-catalog-open-api.yaml#/components/parameters/prefix'
+      - name: txn-id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: subtxn-id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+
+    post:
+      tags:
+        - Transaction API
+      summary: Renew a subtransaction lease
+      operationId: renewSubtransaction
+      parameters:
+        - name: X-Subtxn-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenewLeaseRequest'
+      responses:
+        200:
+          description: Renewed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Subtransaction'
+        404:
+          description: Not Found - The requested resource does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '../iceberg-rest-catalog-open-api.yaml#/components/schemas/IcebergErrorResponse'
+        401:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/UnauthorizedResponse'
+        403:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ForbiddenResponse'
+
+components:
+  schemas:
+
+    TransactionIsolation:
+      type: string
+      enum:
+        - READ_COMMITTED
+        - REPEATABLE_READ
+      default: REPEATABLE_READ
+
+    TransactionStatus:
+      type: string
+      enum:
+        - IN_PROGRESS
+        - COMMITTED
+        - ABORTED
+
+    SubtransactionStatus:
+      type: string
+      enum:
+        - IN_PROGRESS
+        - SUB_COMMITTED
+        - SUB_ABORTED
+
+    LockMode:
+      type: string
+      enum:
+        - APPEND
+        - ROW_DELTA
+        - OVERWRITE
+        - EXCLUSIVE
+        - ACCESS_EXCLUSIVE
+
+    CreateTransactionSnapshotRequest:
+      type: object
+      properties:
+        lease_seconds:
+          type: integer
+          default: 300
+          description: How long the snapshot remains valid (default 5 minutes)
+
+    TransactionSnapshot:
+      type: object
+      required:
+        - txn_snapshot_id
+        - xmin
+        - xmax
+        - xip_list
+        - expires_at
+      properties:
+        txn_snapshot_id:
+          type: integer
+          format: int64
+        xmin:
+          type: integer
+          format: int64
+          description: Lowest txn_id that may still be in-progress
+        xmax:
+          type: integer
+          format: int64
+          description: First txn_id not yet assigned at snapshot time
+        xip_list:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: Transaction IDs in-progress at snapshot creation time
+        expires_at:
+          type: string
+          format: date-time
+        released_at:
+          type: string
+          format: date-time
+
+    BeginTransactionRequest:
+      type: object
+      properties:
+        isolation:
+          $ref: '#/components/schemas/TransactionIsolation'
+        lease_seconds:
+          type: integer
+          default: 3600
+          description: Transaction lease duration in seconds (default 1 hour)
+
+    Transaction:
+      type: object
+      required:
+        - txn_id
+        - status
+        - expires_at
+      properties:
+        txn_id:
+          type: integer
+          format: int64
+        txn_token:
+          type: string
+          description: >
+            Opaque token held by the orchestrator. Required for commit/abort/renew.
+            Only returned on beginTransaction — subsequent getTransaction calls omit it.
+        status:
+          $ref: '#/components/schemas/TransactionStatus'
+        isolation:
+          $ref: '#/components/schemas/TransactionIsolation'
+        txn_snapshot_id:
+          type: integer
+          format: int64
+          description: Pinned read snapshot ID (set for REPEATABLE_READ transactions)
+        expires_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+        ended_at:
+          type: string
+          format: date-time
+
+    CreateSubtransactionRequest:
+      type: object
+      required:
+        - table_identifier
+        - operation
+      properties:
+        table_identifier:
+          type: string
+          description: "Fully-qualified table name, e.g. 'ns.orders'"
+        operation:
+          $ref: '#/components/schemas/LockMode'
+        lease_seconds:
+          type: integer
+          default: 3600
+        retry_of_subtxn_id:
+          type: integer
+          format: int64
+          description: >
+            If this subtransaction retries a previously aborted one,
+            set this to the old subtxn_id so the server can chain the lineage.
+
+    Subtransaction:
+      type: object
+      required:
+        - subtxn_id
+        - parent_txn_id
+        - table_uuid
+        - operation
+        - assigned_staging_path
+        - status
+        - expires_at
+      properties:
+        subtxn_id:
+          type: integer
+          format: int64
+        subtxn_token:
+          type: string
+          description: >
+            Opaque token for this subtransaction. Given to the worker app.
+            Only returned on createSubtransaction.
+        parent_txn_id:
+          type: integer
+          format: int64
+        table_uuid:
+          type: string
+        operation:
+          $ref: '#/components/schemas/LockMode'
+        base_snapshot_id:
+          type: integer
+          format: int64
+          description: Iceberg snapshot ID at the time this subtransaction was created
+        assigned_staging_path:
+          type: string
+          description: "Server-assigned S3 path for staged metadata, e.g. s3://warehouse/staging/5001/1/"
+        staged_metadata_location:
+          type: string
+          description: Filled in after commitSubtransaction
+        status:
+          $ref: '#/components/schemas/SubtransactionStatus'
+        expires_at:
+          type: string
+          format: date-time
+
+    CommitSubtransactionRequest:
+      type: object
+      required:
+        - staged_metadata_location
+      properties:
+        staged_metadata_location:
+          type: string
+          description: Full path to the staged Iceberg metadata JSON file
+
+    RenewLeaseRequest:
+      type: object
+      properties:
+        lease_seconds:
+          type: integer
+          default: 3600

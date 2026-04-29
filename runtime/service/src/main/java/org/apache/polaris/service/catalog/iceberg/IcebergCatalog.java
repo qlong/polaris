@@ -37,6 +37,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.net.URLEncoder;
 import java.nio.charset.Charset;
+import java.sql.SQLException;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -105,6 +106,7 @@ import org.apache.polaris.core.context.CallContext;
 import org.apache.polaris.core.entity.CatalogEntity;
 import org.apache.polaris.core.entity.LocationBasedEntity;
 import org.apache.polaris.core.entity.NamespaceEntity;
+import org.apache.polaris.core.entity.PolarisBaseEntity;
 import org.apache.polaris.core.entity.PolarisEntity;
 import org.apache.polaris.core.entity.PolarisEntityConstants;
 import org.apache.polaris.core.entity.PolarisEntitySubType;
@@ -115,6 +117,7 @@ import org.apache.polaris.core.entity.table.IcebergTableLikeEntity;
 import org.apache.polaris.core.exceptions.CommitConflictException;
 import org.apache.polaris.core.persistence.PolarisMetaStoreManager;
 import org.apache.polaris.core.persistence.PolarisResolvedPathWrapper;
+import org.apache.polaris.core.persistence.RetryOnConcurrencyException;
 import org.apache.polaris.core.persistence.dao.entity.BaseResult;
 import org.apache.polaris.core.persistence.dao.entity.DropEntityResult;
 import org.apache.polaris.core.persistence.dao.entity.EntityResult;
@@ -131,6 +134,9 @@ import org.apache.polaris.core.storage.PolarisStorageActions;
 import org.apache.polaris.core.storage.StorageAccessConfig;
 import org.apache.polaris.core.storage.StorageLocation;
 import org.apache.polaris.core.storage.StorageUtil;
+import org.apache.polaris.persistence.relational.jdbc.JdbcBasePersistenceImpl;
+import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence;
+import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.CommittedTableSnapshotRow;
 import org.apache.polaris.service.catalog.SupportsNotifications;
 import org.apache.polaris.service.catalog.common.CatalogUtils;
 import org.apache.polaris.service.catalog.common.LocationUtils;
@@ -145,6 +151,7 @@ import org.apache.polaris.service.events.PolarisEventDispatcher;
 import org.apache.polaris.service.events.PolarisEventMetadataFactory;
 import org.apache.polaris.service.events.PolarisEventType;
 import org.apache.polaris.service.task.TaskExecutor;
+import org.apache.polaris.service.transaction.LockManager;
 import org.apache.polaris.service.types.NotificationRequest;
 import org.apache.polaris.service.types.NotificationType;
 import org.slf4j.Logger;
@@ -196,6 +203,12 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
   private final FileIOFactory fileIOFactory;
   private PolarisMetaStoreManager metaStoreManager;
 
+  /** Optional lock manager for pessimistic locking (injected when schema v5 is active). */
+  @Nullable private LockManager lockManager;
+
+  /** Optional JDBC bridge for {@code committed_table_snapshots} (schema v5). */
+  @Nullable private JdbcTransactionPersistence jdbcTransactionPersistence;
+
   /**
    * @param callContext the current CallContext
    * @param resolvedEntityView accessor to resolved entity paths that have been pre-vetted to ensure
@@ -234,6 +247,191 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
   @Override
   public String name() {
     return catalogName;
+  }
+
+  /** Allows injecting a LockManager when the schema-v5 transaction extension is active. */
+  public void setLockManager(@Nullable LockManager lockManager) {
+    this.lockManager = lockManager;
+  }
+
+  /** JDBC persistence for recording committed Iceberg snapshots (schema v5). */
+  public void setJdbcTransactionPersistence(
+      @Nullable JdbcTransactionPersistence jdbcTransactionPersistence) {
+    this.jdbcTransactionPersistence = jdbcTransactionPersistence;
+  }
+
+  /**
+   * Reads table metadata JSON from {@code metadataLocation} using this catalog's configured {@link
+   * FileIO} and resolved storage path (for example, {@code loadTable?txn_snapshot_id=} resolution).
+   */
+  public TableMetadata readTableMetadataAtLocation(
+      TableIdentifier tableIdentifier, String metadataLocation) {
+    validateLocationForTableLike(tableIdentifier, metadataLocation);
+    String locationDir = metadataLocation.substring(0, metadataLocation.lastIndexOf("/"));
+    PolarisResolvedPathWrapper resolvedStorage =
+        CatalogUtils.findResolvedStorageEntity(resolvedEntityView, tableIdentifier);
+    FileIO fileIO =
+        loadFileIOForTableLike(
+            tableIdentifier,
+            Set.of(locationDir),
+            resolvedStorage,
+            new HashMap<>(tableDefaultProperties),
+            Set.of(PolarisStorageActions.READ, PolarisStorageActions.LIST));
+    return TableMetadataParser.read(fileIO, metadataLocation);
+  }
+
+  private void maybeRecordCommittedSnapshot(
+      TableIdentifier tableIdentifier,
+      String tableUuid,
+      TableMetadata metadata,
+      String metadataLocation) {
+    if (jdbcTransactionPersistence == null) {
+      return;
+    }
+    try {
+      long committedTxnId = jdbcTransactionPersistence.nextTxnId();
+      Long icebergSnapshotId =
+          metadata.currentSnapshot() != null ? metadata.currentSnapshot().snapshotId() : null;
+      jdbcTransactionPersistence.insertCommittedTableSnapshotRow(
+          new CommittedTableSnapshotRow(
+              tableUuid, committedTxnId, icebergSnapshotId, metadataLocation));
+    } catch (SQLException e) {
+      throw new ServiceFailureException(
+          e, "Failed to record committed_table_snapshots row for table %s", tableIdentifier);
+    }
+  }
+
+  /**
+   * Builds a {@link CommittedTableSnapshotRow} for a table commit and returns it, or {@code null}
+   * if schema-v5 JDBC persistence is not active.
+   */
+  @Nullable
+  private CommittedTableSnapshotRow buildSnapshotRowIfActive(
+      String tableUuid, TableMetadata metadata, String metadataLocation) {
+    if (jdbcTransactionPersistence == null) {
+      return null;
+    }
+    try {
+      long committedTxnId = jdbcTransactionPersistence.nextTxnId();
+      Long icebergSnapshotId =
+          metadata.currentSnapshot() != null ? metadata.currentSnapshot().snapshotId() : null;
+      return new CommittedTableSnapshotRow(
+          tableUuid, committedTxnId, icebergSnapshotId, metadataLocation);
+    } catch (SQLException e) {
+      throw new ServiceFailureException(
+          e, "Failed to allocate txn_id for committed_table_snapshots for table %s", tableUuid);
+    }
+  }
+
+  /**
+   * Creates a new table entity and inserts the {@code committed_table_snapshots} row in a single
+   * JDBC transaction when schema-v5 persistence is active.
+   *
+   * <p>Falls back to the standard {@link #createTableLike(TableIdentifier, PolarisEntity,
+   * PolarisResolvedPathWrapper)} + {@link #maybeRecordCommittedSnapshot} path when JDBC is
+   * unavailable.
+   */
+  private void createTableLikeWithAtomicSnapshot(
+      TableIdentifier identifier,
+      IcebergTableLikeEntity entity,
+      PolarisResolvedPathWrapper resolvedParent,
+      TableMetadata metadata,
+      String newLocation) {
+    CommittedTableSnapshotRow snapshotRow =
+        buildSnapshotRowIfActive(entity.getId() + "", metadata, newLocation);
+    if (snapshotRow == null
+        || !(getCurrentPolarisContext().getMetaStore() instanceof JdbcBasePersistenceImpl jdbc)) {
+      createTableLike(identifier, entity, resolvedParent);
+      maybeRecordCommittedSnapshot(identifier, entity.getId() + "", metadata, newLocation);
+      return;
+    }
+    // Prepare the entity the same way AtomicOperationMetaStoreManager.persistNewEntity does.
+    long now = Math.max(System.currentTimeMillis(), entity.getCreateTimestamp());
+    IcebergTableLikeEntity prepared =
+        new IcebergTableLikeEntity.Builder(entity)
+            .setParentId(
+                entity.getParentId() > 0
+                    ? entity.getParentId()
+                    : resolvedParent.getRawLeafEntity().getId())
+            .build();
+    prepared =
+        new IcebergTableLikeEntity(
+            new PolarisBaseEntity.Builder(prepared).lastUpdateTimestamp(now).build());
+    try {
+      jdbc.writeEntityWithSnapshotRecord(
+          getCurrentPolarisContext(), prepared, null, snapshotRow, jdbcTransactionPersistence);
+    } catch (RetryOnConcurrencyException e) {
+      throw new CommitConflictException(
+          "Failed to create table %s because it was concurrently modified", identifier);
+    }
+  }
+
+  /**
+   * Updates an existing table entity and inserts the {@code committed_table_snapshots} row in a
+   * single JDBC transaction when schema-v5 persistence is active.
+   *
+   * <p>Falls back to the standard {@link #updateTableLike} + {@link #maybeRecordCommittedSnapshot}
+   * path when JDBC is unavailable.
+   */
+  private void updateTableLikeWithAtomicSnapshot(
+      TableIdentifier identifier,
+      IcebergTableLikeEntity entity,
+      IcebergTableLikeEntity originalEntity,
+      TableMetadata metadata,
+      String newLocation) {
+    String tableUuid = entity.getId() + "";
+    CommittedTableSnapshotRow snapshotRow =
+        buildSnapshotRowIfActive(tableUuid, metadata, newLocation);
+    if (snapshotRow == null
+        || !(getCurrentPolarisContext().getMetaStore() instanceof JdbcBasePersistenceImpl jdbc)) {
+      updateTableLike(identifier, entity);
+      maybeRecordCommittedSnapshot(identifier, tableUuid, metadata, newLocation);
+      return;
+    }
+    // Prepare the entity the same way AtomicOperationMetaStoreManager.persistEntityAfterChange
+    // does: increment the version and update the timestamp.
+    long now = Math.max(System.currentTimeMillis(), entity.getCreateTimestamp());
+    IcebergTableLikeEntity prepared =
+        new IcebergTableLikeEntity(
+            new PolarisBaseEntity.Builder(entity)
+                .lastUpdateTimestamp(now)
+                .entityVersion(entity.getEntityVersion() + 1)
+                .build());
+    try {
+      jdbc.writeEntityWithSnapshotRecord(
+          getCurrentPolarisContext(),
+          prepared,
+          originalEntity,
+          snapshotRow,
+          jdbcTransactionPersistence);
+    } catch (RetryOnConcurrencyException e) {
+      throw new CommitConflictException(
+          "Failed to update table %s because it was concurrently modified", identifier);
+    }
+  }
+
+  @Nullable
+  private LockManager getLockManagerIfPresent() {
+    return lockManager;
+  }
+
+  /**
+   * Derives the Iceberg operation type from the metadata transition for use in lock compatibility
+   * checks. Returns "APPEND" for purely additive changes (no rewritten files), "ROW_DELTA" for
+   * positional-delete or equality-delete additions, and "OVERWRITE" for partition overwrites.
+   */
+  private static String deriveOperationFromMetadata(
+      @Nullable TableMetadata base, TableMetadata metadata) {
+    if (base == null) return "APPEND";
+    var current = metadata.currentSnapshot();
+    if (current == null) return "APPEND";
+    String op = current.operation();
+    if (op == null) return "APPEND";
+    return switch (op.toLowerCase(Locale.ROOT)) {
+      case "delete", "overwrite" -> "OVERWRITE";
+      case "replace" -> "EXCLUSIVE";
+      default -> "APPEND";
+    };
   }
 
   @VisibleForTesting
@@ -1579,6 +1777,7 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
       Map<String, String> storedProperties = buildTableMetadataPropertiesMap(metadata);
       IcebergTableLikeEntity entity =
           IcebergTableLikeEntity.of(resolvedPath == null ? null : resolvedPath.getRawLeafEntity());
+      IcebergTableLikeEntity originalEntityBeforeUpdate = entity;
       String existingLocation;
       if (null == entity) {
         existingLocation = null;
@@ -1631,9 +1830,31 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
       }
 
       if (null == existingLocation) {
-        createTableLike(tableIdentifier, entity);
+        createTableLikeWithAtomicSnapshot(
+            tableIdentifier,
+            entity,
+            resolveParentForCreate(tableIdentifier),
+            metadata,
+            newLocation);
       } else {
-        updateTableLike(tableIdentifier, entity);
+        // Lock check: enforce pessimistic locks from new-API transactions for ALL commits
+        // (old and new clients). This is the only enforcement point because old clients
+        // are invisible to the server until they call doCommit.
+        String tableUuid = entity.getId() + "";
+        String operation = deriveOperationFromMetadata(base, metadata);
+        try {
+          LockManager lockManager = getLockManagerIfPresent();
+          if (lockManager != null) {
+            lockManager.checkConflictAtCommit(tableUuid, operation, -1L);
+          }
+        } catch (CommitFailedException e) {
+          throw e;
+        } catch (SQLException e) {
+          throw new ServiceFailureException(e, "Lock check failed for table %s", tableIdentifier);
+        }
+        IcebergTableLikeEntity originalEntity = originalEntityBeforeUpdate;
+        updateTableLikeWithAtomicSnapshot(
+            tableIdentifier, entity, originalEntity, metadata, newLocation);
       }
     }
 
@@ -2310,6 +2531,20 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
                 new IcebergTableLikeEntity.Builder(returnedEntity).setTableIdentifier(to).build());
       }
     }
+  }
+
+  /**
+   * Resolves the parent namespace path for a new table create, mirroring the logic in {@link
+   * #createTableLike(TableIdentifier, PolarisEntity)}.
+   */
+  private PolarisResolvedPathWrapper resolveParentForCreate(TableIdentifier identifier) {
+    PolarisResolvedPathWrapper resolvedParent =
+        resolvedEntityView.getResolvedPath(ResolvedPathKey.ofNamespace(identifier.namespace()));
+    if (resolvedParent == null) {
+      throw new IllegalStateException(
+          String.format("Failed to fetch resolved parent for TableIdentifier '%s'", identifier));
+    }
+    return resolvedParent;
   }
 
   /**

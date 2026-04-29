@@ -159,6 +159,46 @@ paths:
   /polaris/v1/{prefix}/applicable-policies:
     $ref: './polaris-catalog-apis/policy-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1applicable-policies'
 
+  ##############################
+  # Polaris Transaction API    #
+  ##############################
+
+  /polaris/v1/{prefix}/transaction-snapshots:
+    $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transaction-snapshots'
+
+  /polaris/v1/{prefix}/transaction-snapshots/{txn-snapshot-id}:
+    $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transaction-snapshots~1{txn-snapshot-id}'
+
+  /polaris/v1/{prefix}/transaction-snapshots/{txn-snapshot-id}/renew:
+    $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transaction-snapshots~1{txn-snapshot-id}~1renew'
+
+  /polaris/v1/{prefix}/transactions:
+    $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transactions'
+
+  /polaris/v1/{prefix}/transactions/{txn-id}:
+    $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transactions~1{txn-id}'
+
+  /polaris/v1/{prefix}/transactions/{txn-id}/commit:
+    $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transactions~1{txn-id}~1commit'
+
+  /polaris/v1/{prefix}/transactions/{txn-id}/abort:
+    $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transactions~1{txn-id}~1abort'
+
+  /polaris/v1/{prefix}/transactions/{txn-id}/renew:
+    $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transactions~1{txn-id}~1renew'
+
+  /polaris/v1/{prefix}/transactions/{txn-id}/subtransactions:
+    $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transactions~1{txn-id}~1subtransactions'
+
+  /polaris/v1/{prefix}/transactions/{txn-id}/subtransactions/{subtxn-id}/commit:
+    $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transactions~1{txn-id}~1subtransactions~1{subtxn-id}~1commit'
+
+  /polaris/v1/{prefix}/transactions/{txn-id}/subtransactions/{subtxn-id}/abort:
+    $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transactions~1{txn-id}~1subtransactions~1{subtxn-id}~1abort'
+
+  /polaris/v1/{prefix}/transactions/{txn-id}/subtransactions/{subtxn-id}/renew:
+    $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transactions~1{txn-id}~1subtransactions~1{subtxn-id}~1renew'
+
 
 components:
   securitySchemes:

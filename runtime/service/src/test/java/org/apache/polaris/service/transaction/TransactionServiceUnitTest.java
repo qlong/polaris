@@ -45,7 +45,7 @@ class TransactionServiceUnitTest {
   private static final String REALM = "test-realm";
   private static final long CATALOG_ID = 99L;
   private static final String OWNER = "test-principal";
-  private static final String STAGING_BASE = "s3://test-bucket/staging";
+  private static final String TABLE_METADATA_DIR = "s3://test-bucket/ns/table/metadata";
 
   private JdbcTransactionPersistence persistence;
   private TransactionService service;
@@ -180,12 +180,13 @@ class TransactionServiceUnitTest {
 
     var subtxn =
         service.createSubtransaction(
-            txn.txnId(), txn.txnToken(), "table-uuid-1", "APPEND", null, null, 3600, STAGING_BASE);
+            txn.txnId(), txn.txnToken(), "table-uuid-1", "APPEND", null, null, 3600, TABLE_METADATA_DIR);
 
     assertThat(subtxn.subtxnId()).isGreaterThan(0);
     assertThat(subtxn.subtxnToken()).isNotBlank();
     assertThat(subtxn.status()).isEqualTo(JdbcTransactionPersistence.SUBTXN_STATUS_IN_PROGRESS);
-    assertThat(subtxn.assignedStagingPath()).startsWith(STAGING_BASE);
+    assertThat(subtxn.assignedStagingPath()).startsWith(TABLE_METADATA_DIR);
+    assertThat(subtxn.assignedStagingPath()).endsWith(".metadata.json");
   }
 
   @Test
@@ -193,10 +194,11 @@ class TransactionServiceUnitTest {
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
     var subtxn =
         service.createSubtransaction(
-            txn.txnId(), txn.txnToken(), "table-uuid-2", "APPEND", null, null, 3600, STAGING_BASE);
+            txn.txnId(), txn.txnToken(), "table-uuid-2", "APPEND", null, null, 3600, TABLE_METADATA_DIR);
 
     // metadata location must be under the assigned staging path
-    String metadataLocation = subtxn.assignedStagingPath() + "metadata/v1.metadata.json";
+    // assignedStagingPath is now the exact file path — pass it directly
+    String metadataLocation = subtxn.assignedStagingPath();
     service.commitSubtransaction(
         txn.txnId(), subtxn.subtxnId(), subtxn.subtxnToken(), metadataLocation);
 
@@ -210,7 +212,7 @@ class TransactionServiceUnitTest {
   void prepareCommitFailsWhenSubtxnStillInProgress() throws Exception {
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
     service.createSubtransaction(
-        txn.txnId(), txn.txnToken(), "table-uuid-3", "APPEND", null, null, 3600, STAGING_BASE);
+        txn.txnId(), txn.txnToken(), "table-uuid-3", "APPEND", null, null, 3600, TABLE_METADATA_DIR);
 
     assertThatThrownBy(() -> service.prepareCommit(txn.txnId(), txn.txnToken()))
         .isInstanceOf(BadRequestException.class)

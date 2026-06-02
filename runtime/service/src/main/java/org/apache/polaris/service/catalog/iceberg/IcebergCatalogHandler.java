@@ -986,9 +986,11 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
       try {
         String metadataLocation = null;
         if (txnId.map(id -> id != null && id > 0).orElse(false)) {
-          // RYOW: return staged metadata if this transaction has a SUB_COMMITTED subtxn
+          // RYOW: subtransactions store the table identifier string (e.g. "ns.table"), not the
+          // numeric entity ID. Use the identifier string for this lookup.
+          String ryowKey = tableIdentifier.toString();
           metadataLocation =
-              txnService.resolveRYOWMetadataLocation(tableUuid, txnId.get()).orElse(null);
+              txnService.resolveRYOWMetadataLocation(ryowKey, txnId.get()).orElse(null);
           // No staged write yet — fall back to the transaction's pinned TxnSnapshot (REPEATABLE READ)
           if (metadataLocation == null) {
             Long linkedSnapId = txnService.getTransaction(txnId.get()).txnSnapshotId();

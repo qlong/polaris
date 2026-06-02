@@ -23,6 +23,8 @@
     - [The Server Process Stays Stateless Even Though Transactions Are Stateful](#the-server-process-stays-stateless-even-though-transactions-are-stateful)
     - [Why Transaction Coordination Cannot Be Pushed to the Engine or Client Side](#why-transaction-coordination-cannot-be-pushed-to-the-engine-or-client-side)
 
+> **Implementation status (2026-06-02):** Phase 1 and Phase 2 are implemented. Known open items: (1) `assigned_staging_path` is currently generated as `.polaris-txn-staging/{txn_id}/{subtxn_id}/` outside the table's canonical directory — this must move into the table's metadata directory (see [design correction above](#staged-metadata-trust-boundary)); until fixed, `loadTable?txn_id=T` (RYOW) triggers a credential-vending location check failure. (2) `subtransactions.table_uuid` stores the table identifier string (`ns.table`) not the entity's numeric ID — affects RYOW lookup key in `IcebergCatalogHandler`; workaround in place.
+
 > **Key insight — two kinds of "snapshot"**: The word "snapshot" has two distinct meanings in this system. A **`TxnSnapshot`** `(xmin, xmax, xip_list)` is the MVCC visibility state that determines which transactions a reader can see — a PostgreSQL concept, analogous to `pg_snapshot`. An **Iceberg table snapshot** (`table_snapshot_id`) is the native Iceberg point-in-time state of a table's data files. The catalog server maintains a `committed_table_snapshots` mapping table that translates a `TxnSnapshot` into the specific Iceberg table snapshot to serve for each table. Pure readers acquire a `txn_snapshot_id` — lightweight, lock-free, no CLOG entry — and pass it on every table read; the server resolves the correct Iceberg table snapshot automatically. A query that reads multiple tables **must** use a shared `TxnSnapshot`; without one, successive reads can observe different committed states and produce a torn cross-table view.
 
 ---
@@ -270,7 +272,12 @@ CREATE TABLE subtransactions (
     staged_metadata_location TEXT,
                              -- written by client to object storage; applied on parent commit
     assigned_staging_path    TEXT,
-                             -- server-assigned S3 path the client must write staged metadata to
+                             -- server-assigned path WITHIN the table's canonical metadata
+                             -- directory (e.g. s3://warehouse/ns/table/metadata/<uuid>.metadata.json).
+                             -- Placing the file inside the table's own tree is intentional:
+                             -- the catalog pointer controls visibility (not the file's location),
+                             -- so the file is invisible until commitTransaction swaps the pointer,
+                             -- and credential vending / location validation work without special-casing.
     subtxn_token             BYTEA NOT NULL,
                              -- opaque per-subtxn bearer secret (gen_random_bytes(32));
                              -- authorizes only this subtxn's operations; does NOT allow
@@ -759,7 +766,7 @@ The protocol is conceptually two-phase, but the "prepare" phase happens on the c
 
 | Phase | Who | What |
 |---|---|---|
-| **Prepare** | Client | Write data files to S3; stage new metadata JSON to S3 at a unique path; call `POST /subtxn/Sn/commit` per table → server records `staged_metadata_location`, marks `SUB_COMMITTED` |
+| **Prepare** | Client | Write data files to S3; write new metadata JSON to the server-assigned path within the table's canonical metadata directory; call `POST /subtxn/Sn/commit` per table → server records `staged_metadata_location`, marks `SUB_COMMITTED` |
 | **Finalize** | Catalog server (single DB txn) | Conflict-check + pointer swap + CLOG update + lock release |
 
 The prepare phase is parallelizable across tables. The finalize phase is a single short catalog DB transaction and is the only serialization point.
@@ -1496,14 +1503,21 @@ The client writes staged metadata JSON to object storage and passes the `staged_
 
 **Mitigations:**
 
-1. **Server-assigned staging paths.** Rather than letting the client choose where to stage metadata, the server assigns a staging path at subtransaction creation time:
+1. **Server-assigned staging paths within the table's canonical metadata directory.**
+   Rather than letting the client choose where to stage metadata, the server assigns a path at subtransaction creation time:
 
    ```
    POST /v1/transactions/T1/subtxn
-   ← { subtxn_id, staging_path: "s3://catalog-bucket/staging/T1/Sn/metadata.json" }
+   ← { subtxn_id, staging_path: "s3://warehouse/ns/table/metadata/<txn_id>-<subtxn_id>-<uuid>.metadata.json" }
    ```
 
-   The client must write to exactly that path. The server validates `staged_metadata_location == expected_staging_path` at subtxn commit time. This prevents path traversal to arbitrary catalog metadata locations.
+   The assigned path lives **inside the table's own metadata directory** — not in a separate global staging area. This is correct because:
+   - Iceberg visibility is pointer-based: the file is unreachable to all readers until `commitTransaction` updates the catalog pointer. Its physical location is irrelevant to visibility.
+   - Credential vending and location validation work without special-casing: the path is already within the table's declared storage boundary.
+   - Orphan cleanup on abort uses standard Iceberg `DeleteOrphanFiles` — the same mechanism that handles failed single-table commits today.
+   - Collision between concurrent transactions is prevented by including `txn_id` and `subtxn_id` in the filename.
+
+   The client must write to exactly that path. The server validates `staged_metadata_location` starts with `assigned_staging_path` at subtxn commit time. This prevents path traversal to arbitrary catalog metadata locations.
 
 2. **Server-side metadata validation.** Before accepting a subtxn commit, the server reads and parses the staged metadata JSON and verifies:
    - It is valid Iceberg table metadata.

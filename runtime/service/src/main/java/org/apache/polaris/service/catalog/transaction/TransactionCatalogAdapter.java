@@ -26,7 +26,10 @@ import java.sql.SQLException;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.Arrays;
 import org.apache.iceberg.catalog.Namespace;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.util.LocationUtil;
 import org.apache.iceberg.rest.responses.ErrorResponse;
 import org.apache.iceberg.util.LocationUtil;
 import org.apache.polaris.core.auth.PolarisPrincipal;
@@ -95,12 +98,38 @@ public class TransactionCatalogAdapter
     }
   }
 
-  private static String stagingBaseFor(IcebergCatalogHandler handler) {
-    String base = handler.getResolvedCatalogEntity().getBaseLocation();
-    if (base == null || base.isBlank()) {
-      throw new IllegalStateException("Catalog has no base location for transaction staging");
+  /**
+   * Resolves the canonical metadata directory for the given table by loading it through a fresh
+   * handler instance. Returns e.g. {@code s3://warehouse/ns/table/metadata}.
+   *
+   * <p>A fresh handler is required because each handler's resolution manifest is scoped to the
+   * specific operation that initialized it; reusing the existing {@code listNamespaces} handler
+   * would fail to resolve the table path.
+   */
+  private String resolveTableMetadataDir(
+      IcebergCatalogHandlerFactory factory,
+      String catalogName,
+      PolarisPrincipal principal,
+      String tableIdentifierStr) {
+    String[] parts = tableIdentifierStr.split("\\.");
+    if (parts.length < 2) {
+      throw new jakarta.ws.rs.BadRequestException(
+          "Invalid table_identifier '" + tableIdentifierStr + "': expected 'namespace.table'");
     }
-    return LocationUtil.stripTrailingSlash(base) + "/.polaris-txn-staging";
+    TableIdentifier tableId =
+        TableIdentifier.of(
+            Namespace.of(Arrays.copyOf(parts, parts.length - 1)), parts[parts.length - 1]);
+    IcebergCatalogHandler tableHandler = factory.createHandler(catalogName, principal);
+    try {
+      String metadataLocation = tableHandler.loadTable(tableId, null).metadataLocation();
+      int lastSlash = metadataLocation.lastIndexOf('/');
+      return LocationUtil.stripTrailingSlash(metadataLocation.substring(0, lastSlash));
+    } finally {
+      try {
+        tableHandler.close();
+      } catch (Exception ignored) {
+      }
+    }
   }
 
   @Override
@@ -304,7 +333,9 @@ public class TransactionCatalogAdapter
     try {
       handler.listNamespaces(Namespace.of());
       TransactionService txnService = handler.newTransactionServiceForCatalog();
-      String stagingBase = stagingBaseFor(handler);
+      String tableMetadataDir = resolveTableMetadataDir(
+          handlerFactory, catalogName, principal,
+          createSubtransactionRequest.getTableIdentifier());
       LockMode op = createSubtransactionRequest.getOperation();
       String operation = (op != null ? op : LockMode.APPEND).name();
       SubtransactionRow subtxn =
@@ -316,7 +347,7 @@ public class TransactionCatalogAdapter
               null,
               createSubtransactionRequest.getRetryOfSubtxnId(),
               createSubtransactionRequest.getLeaseSeconds(),
-              stagingBase);
+              tableMetadataDir);
       return Response.ok(toSubtransaction(subtxn, true)).build();
     } catch (jakarta.ws.rs.BadRequestException | jakarta.ws.rs.ForbiddenException e) {
       return Response.status(e instanceof jakarta.ws.rs.ForbiddenException ? 403 : 400)

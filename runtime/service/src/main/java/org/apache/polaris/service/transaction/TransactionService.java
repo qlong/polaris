@@ -26,10 +26,12 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
+import java.util.UUID;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import org.apache.iceberg.util.LocationUtil;
 import java.util.stream.Collectors;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.CommittedTableSnapshotRow;
@@ -241,8 +243,11 @@ public class TransactionService {
    * (ROW_DELTA, OVERWRITE, EXCLUSIVE, ACCESS_EXCLUSIVE). APPEND operations skip locking; they rely
    * on merge-and-retry at finalize time.
    *
-   * @param tableUuid stable UUID of the target Iceberg table entity
-   * @param stagingBase base S3 path for the catalog's staging area
+   * @param tableUuid stable identifier of the target table (identifier string, e.g. "ns.table")
+   * @param tableMetadataDir the table's canonical metadata directory (e.g.
+   *     "s3://warehouse/ns/table/metadata"). The assigned staging path is a specific file inside
+   *     this directory, keeping staged metadata within the table's own storage tree so that
+   *     credential vending and location validation require no special-casing.
    * @return the new subtransaction with {@code subtxnToken} and {@code assignedStagingPath}
    */
   public SubtransactionRow createSubtransaction(
@@ -253,7 +258,7 @@ public class TransactionService {
       Long baseSnapshotId,
       Long retryOfSubtxnId,
       int leaseSeconds,
-      String stagingBase)
+      String tableMetadataDir)
       throws SQLException, LockWaitTimeoutException {
 
     TransactionRow txn = validateTxnToken(txnId, txnToken);
@@ -270,7 +275,15 @@ public class TransactionService {
     String subtxnToken = generateToken();
     int effective = leaseSeconds > 0 ? leaseSeconds : DEFAULT_TXN_LEASE_SECONDS;
     Instant now = Instant.now();
-    String stagingPath = stagingBase + "/" + txnId + "/" + subtxnId + "/";
+    String stagingPath =
+        LocationUtil.stripTrailingSlash(tableMetadataDir)
+            + "/"
+            + txnId
+            + "-"
+            + subtxnId
+            + "-"
+            + UUID.randomUUID()
+            + ".metadata.json";
 
     SubtransactionRow row =
         new SubtransactionRow(
@@ -310,11 +323,11 @@ public class TransactionService {
     if (subtxn.status() != JdbcTransactionPersistence.SUBTXN_STATUS_IN_PROGRESS) {
       throw new BadRequestException("Subtransaction already finalized: " + subtxnId);
     }
-    if (!stagedMetadataLocation.startsWith(subtxn.assignedStagingPath())) {
+    if (!stagedMetadataLocation.equals(subtxn.assignedStagingPath())) {
       throw new BadRequestException(
           "staged_metadata_location '"
               + stagedMetadataLocation
-              + "' is not under the assigned staging path '"
+              + "' does not match the assigned staging path '"
               + subtxn.assignedStagingPath()
               + "'");
     }

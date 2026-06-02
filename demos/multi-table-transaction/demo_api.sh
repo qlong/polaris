@@ -25,8 +25,8 @@ NAMESPACE="${NAMESPACE:-demo_ns}"
 TABLE_ORDERS="${TABLE_ORDERS:-orders}"
 TABLE_CUSTOMERS="${TABLE_CUSTOMERS:-customers}"
 
-# Staging base (server uses this for subtransaction staging paths)
-STAGING_BASE="${STAGING_BASE:-s3://my-warehouse/staging}"
+# STAGING_BASE is no longer used — the server assigns a specific file path
+# within each table's own metadata directory (e.g. s3://warehouse/ns/table/metadata/T-S-uuid.metadata.json).
 
 POLARIS_BASE="${POLARIS}/api/catalog/polaris/v1/${CATALOG}"
 ICEBERG_BASE="${POLARIS}/api/catalog/v1/${CATALOG}"
@@ -55,7 +55,7 @@ polaris_delete() {
   curl -s -X DELETE \
     -H "${AUTH_HEADER}" \
     "${POLARIS_BASE}${path}"
-}
+}a
 
 polaris_get() {
   local path="$1"
@@ -157,8 +157,8 @@ echo "Response: ${SUBTXN1_RESP}"
 
 SUBTXN1_ID=$(json_get "${SUBTXN1_RESP}" "subtxn_id")
 SUBTXN1_TOKEN=$(json_get "${SUBTXN1_RESP}" "subtxn_token")
-STAGING1=$(json_get "${SUBTXN1_RESP}" "assigned_staging_path")
-ok "Subtransaction 1 (orders): subtxn_id=${SUBTXN1_ID}  staging=${STAGING1}"
+STAGED_PATH1=$(json_get "${SUBTXN1_RESP}" "assigned_staging_path")
+ok "Subtransaction 1 (orders): subtxn_id=${SUBTXN1_ID}  staged_path=${STAGED_PATH1}"
 
 info "Create subtransaction for customers (APPEND)"
 SUBTXN2_RESP=$(polaris_post "/transactions/${TXN_ID}/subtransactions" \
@@ -168,27 +168,29 @@ echo "Response: ${SUBTXN2_RESP}"
 
 SUBTXN2_ID=$(json_get "${SUBTXN2_RESP}" "subtxn_id")
 SUBTXN2_TOKEN=$(json_get "${SUBTXN2_RESP}" "subtxn_token")
-STAGING2=$(json_get "${SUBTXN2_RESP}" "assigned_staging_path")
-ok "Subtransaction 2 (customers): subtxn_id=${SUBTXN2_ID}  staging=${STAGING2}"
+STAGED_PATH2=$(json_get "${SUBTXN2_RESP}" "assigned_staging_path")
+ok "Subtransaction 2 (customers): subtxn_id=${SUBTXN2_ID}  staged_path=${STAGED_PATH2}"
 
 echo ""
-echo "  In a real workload, Spark/PyIceberg apps would now write data files"
-echo "  to ${STAGING1} and ${STAGING2}."
+echo "  In a real workload, Spark/PyIceberg apps would now write data files and"
+echo "  the new Iceberg metadata JSON to the server-assigned path:"
+echo "    orders:    ${STAGED_PATH1}"
+echo "    customers: ${STAGED_PATH2}"
+echo "  (Each path is a specific .metadata.json file inside the table's own"
+echo "   metadata directory — invisible until commitTransaction swaps the pointer.)"
 echo "  For this curl demo, we simulate the commit step directly."
 
-info "Commit subtransaction 1 (orders) — pretend staged metadata exists"
-STAGED_META1="${STAGING1}metadata/00001-$(uuidgen 2>/dev/null || echo 'test-uuid').metadata.json"
+info "Commit subtransaction 1 (orders) — pass the server-assigned path as staged_metadata_location"
 polaris_post "/transactions/${TXN_ID}/subtransactions/${SUBTXN1_ID}/commit" \
   -H "X-Subtxn-Token: ${SUBTXN1_TOKEN}" \
-  -d "{\"staged_metadata_location\": \"${STAGED_META1}\"}"
-ok "Subtransaction 1 staged: ${STAGED_META1}"
+  -d "{\"staged_metadata_location\": \"${STAGED_PATH1}\"}"
+ok "Subtransaction 1 staged: ${STAGED_PATH1}"
 
 info "Commit subtransaction 2 (customers)"
-STAGED_META2="${STAGING2}metadata/00001-$(uuidgen 2>/dev/null || echo 'test-uuid').metadata.json"
 polaris_post "/transactions/${TXN_ID}/subtransactions/${SUBTXN2_ID}/commit" \
   -H "X-Subtxn-Token: ${SUBTXN2_TOKEN}" \
-  -d "{\"staged_metadata_location\": \"${STAGED_META2}\"}"
-ok "Subtransaction 2 staged: ${STAGED_META2}"
+  -d "{\"staged_metadata_location\": \"${STAGED_PATH2}\"}"
+ok "Subtransaction 2 staged: ${STAGED_PATH2}"
 
 info "Commit the parent transaction (atomic publish)"
 COMMIT_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \

@@ -142,4 +142,54 @@ class TxnSnapshotIntegrationTest {
     assertThatThrownBy(() -> service.resolveTableMetadataLocation(TABLE_UUID, snap.txnSnapshotId()))
         .isInstanceOf(BadRequestException.class);
   }
+
+  // ---------------------------------------------------------------------------
+  // beginTransaction(REPEATABLE_READ) linked snapshot visibility
+  // ---------------------------------------------------------------------------
+
+  @Test
+  void transactionLinkedSnapshotSeesCommitBeforeBeginNotAfter() throws Exception {
+    // Commit a row BEFORE beginning the transaction
+    long preTxnCommit = persistence.nextTxnId();
+    persistence.insertCommittedTableSnapshotRow(
+        new CommittedTableSnapshotRow(TABLE_UUID, preTxnCommit, null, "s3://bucket/pre-begin.json"));
+
+    // Begin a REPEATABLE_READ transaction — captures TxnSnapshot at this moment
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, "owner");
+    assertThat(txn.txnSnapshotId()).isNotNull();
+
+    // Commit a row AFTER the transaction began
+    long postTxnCommit = persistence.nextTxnId();
+    persistence.insertCommittedTableSnapshotRow(
+        new CommittedTableSnapshotRow(
+            TABLE_UUID, postTxnCommit, null, "s3://bucket/post-begin.json"));
+
+    // The linked snapshot must see the pre-begin commit but not the post-begin one
+    Optional<String> resolved =
+        service.resolveTableMetadataLocation(TABLE_UUID, txn.txnSnapshotId());
+    assertThat(resolved).isPresent();
+    assertThat(resolved.get()).isEqualTo("s3://bucket/pre-begin.json");
+  }
+
+  @Test
+  void twoTransactionsGetDistinctLinkedSnapshots() throws Exception {
+    var txn1 = service.beginTransaction("REPEATABLE_READ", 3600, "owner1");
+    var txn2 = service.beginTransaction("REPEATABLE_READ", 3600, "owner2");
+
+    assertThat(txn1.txnSnapshotId()).isNotNull();
+    assertThat(txn2.txnSnapshotId()).isNotNull();
+    assertThat(txn1.txnSnapshotId()).isNotEqualTo(txn2.txnSnapshotId());
+  }
+
+  @Test
+  void transactionLinkedSnapshotReleasedOnAbort() throws Exception {
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, "owner");
+    long snapId = txn.txnSnapshotId();
+
+    service.abortTransaction(txn.txnId(), txn.txnToken());
+
+    // After abort, resolving the snapshot should fail (released)
+    assertThatThrownBy(() -> service.resolveTableMetadataLocation(TABLE_UUID, snapId))
+        .isInstanceOf(BadRequestException.class);
+  }
 }

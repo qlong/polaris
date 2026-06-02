@@ -112,6 +112,7 @@ class TransactionReaperTest {
             null,
             null,
             null,
+            null, // txnSnapshotId
             now,
             now.minus(1, ChronoUnit.MINUTES), // already expired
             null);
@@ -144,6 +145,7 @@ class TransactionReaperTest {
             null,
             null,
             null,
+            null, // txnSnapshotId
             now,
             now.plus(1, ChronoUnit.HOURS), // not yet expired
             null);

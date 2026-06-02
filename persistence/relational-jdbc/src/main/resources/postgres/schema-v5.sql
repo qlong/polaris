@@ -335,6 +335,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     snap_xmin       BIGINT,                  -- populated for REPEATABLE_READ
     snap_xmax       BIGINT,
     snap_xip_list   TEXT,                    -- comma-separated in-progress txn IDs at BEGIN
+    txn_snapshot_id BIGINT,                  -- ID of the txn_snapshots row created at BEGIN (REPEATABLE_READ only)
     started_at      TIMESTAMP NOT NULL DEFAULT now(),
     expires_at      TIMESTAMP NOT NULL,
     ended_at        TIMESTAMP

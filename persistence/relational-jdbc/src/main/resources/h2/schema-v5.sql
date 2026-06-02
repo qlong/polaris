@@ -318,6 +318,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     snap_xmin       BIGINT,
     snap_xmax       BIGINT,
     snap_xip_list   TEXT,
+    txn_snapshot_id BIGINT,
     started_at      TIMESTAMP NOT NULL DEFAULT now(),
     expires_at      TIMESTAMP NOT NULL,
     ended_at        TIMESTAMP

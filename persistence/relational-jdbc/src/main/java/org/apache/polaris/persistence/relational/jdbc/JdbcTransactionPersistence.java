@@ -154,6 +154,7 @@ public class JdbcTransactionPersistence {
       @Nullable Long snapXmin,
       @Nullable Long snapXmax,
       @Nullable String snapXipList,
+      @Nullable Long txnSnapshotId,
       Instant startedAt,
       Instant expiresAt,
       @Nullable Instant endedAt) {}
@@ -162,8 +163,8 @@ public class JdbcTransactionPersistence {
     String sql =
         "INSERT INTO POLARIS_SCHEMA.transactions "
             + "(txn_id, realm_id, catalog_id, txn_token, owner_principal, status, isolation, "
-            + " snap_xmin, snap_xmax, snap_xip_list, started_at, expires_at) "
-            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            + " snap_xmin, snap_xmax, snap_xip_list, txn_snapshot_id, started_at, expires_at) "
+            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
       conn.setAutoCommit(true);
@@ -177,8 +178,9 @@ public class JdbcTransactionPersistence {
       setNullableLong(ps, 8, row.snapXmin());
       setNullableLong(ps, 9, row.snapXmax());
       ps.setString(10, row.snapXipList());
-      ps.setTimestamp(11, Timestamp.from(row.startedAt()));
-      ps.setTimestamp(12, Timestamp.from(row.expiresAt()));
+      setNullableLong(ps, 11, row.txnSnapshotId());
+      ps.setTimestamp(12, Timestamp.from(row.startedAt()));
+      ps.setTimestamp(13, Timestamp.from(row.expiresAt()));
       ps.executeUpdate();
     }
   }
@@ -186,7 +188,7 @@ public class JdbcTransactionPersistence {
   public Optional<TransactionRow> findTransaction(long txnId) throws SQLException {
     String sql =
         "SELECT txn_id, realm_id, catalog_id, txn_token, owner_principal, status, isolation, "
-            + "snap_xmin, snap_xmax, snap_xip_list, started_at, expires_at, ended_at "
+            + "snap_xmin, snap_xmax, snap_xip_list, txn_snapshot_id, started_at, expires_at, ended_at "
             + "FROM POLARIS_SCHEMA.transactions WHERE txn_id = ? AND realm_id = ?";
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -275,6 +277,7 @@ public class JdbcTransactionPersistence {
         getNullableLong(rs, "snap_xmin"),
         getNullableLong(rs, "snap_xmax"),
         rs.getString("snap_xip_list"),
+        getNullableLong(rs, "txn_snapshot_id"),
         toInstant(rs.getTimestamp("started_at")),
         toInstant(rs.getTimestamp("expires_at")),
         toInstant(rs.getTimestamp("ended_at")));

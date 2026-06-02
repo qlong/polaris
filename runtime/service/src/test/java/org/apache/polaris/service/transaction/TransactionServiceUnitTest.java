@@ -216,4 +216,61 @@ class TransactionServiceUnitTest {
         .isInstanceOf(BadRequestException.class)
         .hasMessageContaining("IN_PROGRESS");
   }
+
+  // ---------------------------------------------------------------------------
+  // Linked TxnSnapshot (REPEATABLE_READ creates a real txn_snapshots row)
+  // ---------------------------------------------------------------------------
+
+  @Test
+  void beginRepeatableReadCreatesLinkedTxnSnapshot() throws Exception {
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
+
+    assertThat(txn.txnSnapshotId()).isNotNull();
+    // The linked snapshot row must exist in txn_snapshots
+    var snap = persistence.findTxnSnapshot(txn.txnSnapshotId());
+    assertThat(snap).isPresent();
+    assertThat(snap.get().txnSnapshotId()).isEqualTo(txn.txnSnapshotId());
+    assertThat(snap.get().xmax()).isGreaterThan(0);
+    assertThat(snap.get().releasedAt()).isNull();
+  }
+
+  @Test
+  void beginReadCommittedHasNoLinkedTxnSnapshot() throws Exception {
+    var txn = service.beginTransaction("READ_COMMITTED", 3600, OWNER);
+
+    assertThat(txn.txnSnapshotId()).isNull();
+  }
+
+  @Test
+  void commitReleasesLinkedTxnSnapshot() throws Exception {
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
+    long snapId = txn.txnSnapshotId();
+
+    service.prepareCommit(txn.txnId(), txn.txnToken());
+    service.finalizeCommit(txn.txnId());
+
+    var snap = persistence.findTxnSnapshot(snapId);
+    assertThat(snap).isPresent();
+    assertThat(snap.get().releasedAt()).isNotNull();
+  }
+
+  @Test
+  void abortReleasesLinkedTxnSnapshot() throws Exception {
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
+    long snapId = txn.txnSnapshotId();
+
+    service.abortTransaction(txn.txnId(), txn.txnToken());
+
+    var snap = persistence.findTxnSnapshot(snapId);
+    assertThat(snap).isPresent();
+    assertThat(snap.get().releasedAt()).isNotNull();
+  }
+
+  @Test
+  void linkedSnapshotIdIsDistinctFromTxnId() throws Exception {
+    // txn_id and txn_snapshot_id both come from the same sequence, so they must differ
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
+
+    assertThat(txn.txnSnapshotId()).isNotEqualTo(txn.txnId());
+  }
 }

@@ -432,7 +432,7 @@ public class TransactionCatalogAdapter
         includeToken ? txn.txnToken() : null,
         toTransactionStatus(txn.status()),
         parseIsolation(txn.isolation()),
-        txn.snapXmax(),
+        txn.txnSnapshotId(),
         Date.from(txn.expiresAt()),
         Date.from(txn.startedAt()),
         txn.endedAt() != null ? Date.from(txn.endedAt()) : null);

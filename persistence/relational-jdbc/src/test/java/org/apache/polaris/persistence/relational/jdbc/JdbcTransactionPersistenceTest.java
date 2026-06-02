@@ -99,6 +99,7 @@ class JdbcTransactionPersistenceTest {
             null,
             null,
             null,
+            null,
             now,
             expires,
             null);
@@ -167,6 +168,7 @@ class JdbcTransactionPersistenceTest {
             null,
             null,
             null,
+            null,
             Instant.now().minusSeconds(600),
             Instant.now().minusSeconds(1), // already expired
             null);
@@ -182,6 +184,7 @@ class JdbcTransactionPersistenceTest {
             "carol",
             JdbcTransactionPersistence.TXN_STATUS_IN_PROGRESS,
             "REPEATABLE_READ",
+            null,
             null,
             null,
             null,
@@ -582,6 +585,7 @@ class JdbcTransactionPersistenceTest {
             "test-user",
             JdbcTransactionPersistence.TXN_STATUS_IN_PROGRESS,
             "REPEATABLE_READ",
+            null,
             null,
             null,
             null,

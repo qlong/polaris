@@ -164,8 +164,17 @@ public class TransactionReaper {
   private static void reapTransaction(
       JdbcTransactionPersistence persistence, LockManager lockManager, long txnId)
       throws SQLException {
+    var txnRow = persistence.findTransaction(txnId).orElse(null);
+    Long snapId = txnRow != null ? txnRow.txnSnapshotId() : null;
     persistence.updateTransactionStatus(txnId, JdbcTransactionPersistence.TXN_STATUS_ABORTED);
     lockManager.releaseAll(txnId);
+    if (snapId != null) {
+      try {
+        persistence.releaseTxnSnapshot(snapId);
+      } catch (Exception e) {
+        LOGGER.warn("Reaper: failed to release txn_snapshot {} for txn {}: {}", snapId, txnId, e.getMessage());
+      }
+    }
     LOGGER.info("Reaper: aborted expired transaction txn_id={}", txnId);
   }
 

@@ -158,12 +158,31 @@ public class TransactionService {
 
     Long snapXmin = null, snapXmax = null;
     String snapXipList = null;
+    Long linkedTxnSnapshotId = null;
     if ("REPEATABLE_READ".equalsIgnoreCase(isolation)) {
       long[] xs = persistence.captureXminXmax();
       snapXmin = xs[0];
       snapXmax = xs[1];
       long[] xipArr = Arrays.copyOfRange(xs, 2, xs.length);
       snapXipList = Arrays.stream(xipArr).mapToObj(Long::toString).collect(Collectors.joining(","));
+
+      // Create a real txn_snapshots row so the orchestrator can use txn_snapshot_id for
+      // consistent reads (loadTable?txn_snapshot_id=X) with the same pinned view.
+      long snapId = persistence.nextTxnId();
+      String xipListForSnap = snapXipList;
+      TxnSnapshotRow snapRow =
+          new TxnSnapshotRow(
+              snapId,
+              persistence.getRealmId(),
+              persistence.getCatalogId(),
+              snapXmin,
+              snapXmax,
+              xipListForSnap != null ? xipListForSnap : "",
+              now,
+              expiresAt,
+              null);
+      persistence.insertTxnSnapshot(snapRow);
+      linkedTxnSnapshotId = snapId;
     }
 
     TransactionRow row =
@@ -178,9 +197,10 @@ public class TransactionService {
             snapXmin,
             snapXmax,
             snapXipList,
+            linkedTxnSnapshotId,
             now,
             expiresAt,
-            null);
+            (Instant) null);
     persistence.insertTransaction(row);
     LOGGER.info(
         "Transaction started: txn_id={} isolation={} expires={}", txnId, isolation, expiresAt);
@@ -200,6 +220,7 @@ public class TransactionService {
     }
     persistence.updateTransactionStatus(txnId, JdbcTransactionPersistence.TXN_STATUS_ABORTED);
     lockManager.releaseAll(txnId);
+    releaseTxnSnapshot(txn);
     LOGGER.info("Transaction aborted: txn_id={}", txnId);
   }
 
@@ -369,9 +390,27 @@ public class TransactionService {
    * successfully persisted entity updates and inserted {@code committed_table_snapshots} rows.
    */
   public void finalizeCommit(long txnId) throws SQLException {
+    TransactionRow txn = getTransaction(txnId);
     persistence.updateTransactionStatus(txnId, JdbcTransactionPersistence.TXN_STATUS_COMMITTED);
     lockManager.releaseAll(txnId);
+    releaseTxnSnapshot(txn);
     LOGGER.info("Transaction committed: txn_id={}", txnId);
+  }
+
+  /** Releases the linked {@code txn_snapshots} row when a transaction terminates. */
+  private void releaseTxnSnapshot(TransactionRow txn) {
+    if (txn.txnSnapshotId() == null) {
+      return;
+    }
+    try {
+      persistence.releaseTxnSnapshot(txn.txnSnapshotId());
+    } catch (Exception e) {
+      LOGGER.warn(
+          "Failed to release txn_snapshots row {} for transaction {}: {}",
+          txn.txnSnapshotId(),
+          txn.txnId(),
+          e.getMessage());
+    }
   }
 
   // ---------------------------------------------------------------------------

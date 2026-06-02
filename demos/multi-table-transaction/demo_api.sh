@@ -28,8 +28,8 @@ TABLE_CUSTOMERS="${TABLE_CUSTOMERS:-customers}"
 # Staging base (server uses this for subtransaction staging paths)
 STAGING_BASE="${STAGING_BASE:-s3://my-warehouse/staging}"
 
-POLARIS_BASE="${POLARIS}/polaris/v1/${CATALOG}"
-ICEBERG_BASE="${POLARIS}/v1/${CATALOG}"
+POLARIS_BASE="${POLARIS}/api/catalog/polaris/v1/${CATALOG}"
+ICEBERG_BASE="${POLARIS}/api/catalog/v1/${CATALOG}"
 
 AUTH_HEADER="Authorization: Bearer ${TOKEN}"
 CONTENT_TYPE="Content-Type: application/json"
@@ -75,7 +75,7 @@ iceberg_get() {
 json_get() {
   local json="$1"; local key="$2"
   if command -v jq &>/dev/null; then
-    echo "${json}" | jq -r ".${key}"
+    echo "${json}" | jq -r ".[\"${key}\"]"
   else
     echo "${json}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('${key}',''))"
   fi
@@ -132,7 +132,22 @@ echo "Response: ${TXN_RESP}"
 
 TXN_ID=$(json_get "${TXN_RESP}" "txn_id")
 TXN_TOKEN=$(json_get "${TXN_RESP}" "txn_token")
-ok "Transaction started: txn_id=${TXN_ID}"
+TXN_SNAP_ID=$(json_get "${TXN_RESP}" "txn_snapshot_id")
+ok "Transaction started: txn_id=${TXN_ID}  linked_txn_snapshot_id=${TXN_SNAP_ID}"
+
+echo ""
+echo "  The server pinned a TxnSnapshot at BEGIN time (txn_snapshot_id=${TXN_SNAP_ID})."
+echo "  All reads within this transaction see a consistent view as of that moment."
+
+info "Read both tables at the transaction's pinned snapshot (REPEATABLE READ)"
+ORDERS_IN_TXN=$(iceberg_get "/namespaces/${NAMESPACE}/tables/${TABLE_ORDERS}?txn_id=${TXN_ID}")
+CUSTOMERS_IN_TXN=$(iceberg_get "/namespaces/${NAMESPACE}/tables/${TABLE_CUSTOMERS}?txn_id=${TXN_ID}")
+ok "orders   @ txn_id=${TXN_ID}: $(json_get "${ORDERS_IN_TXN}" "metadata-location")"
+ok "customers@ txn_id=${TXN_ID}: $(json_get "${CUSTOMERS_IN_TXN}" "metadata-location")"
+
+echo ""
+echo "  Both reads use the same pinned snapshot — consistent across the transaction."
+echo "  Once subtransactions are staged, ?txn_id reads will return the staged metadata (RYOW)."
 
 info "Create subtransaction for orders (APPEND)"
 SUBTXN1_RESP=$(polaris_post "/transactions/${TXN_ID}/subtransactions" \

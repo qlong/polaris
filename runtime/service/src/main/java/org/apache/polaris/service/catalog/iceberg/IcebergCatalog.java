@@ -116,6 +116,7 @@ import org.apache.polaris.core.entity.table.GenericTableEntity;
 import org.apache.polaris.core.entity.table.IcebergTableLikeEntity;
 import org.apache.polaris.core.exceptions.CommitConflictException;
 import org.apache.polaris.core.persistence.PolarisMetaStoreManager;
+import org.apache.polaris.core.persistence.TransactionWorkspaceMetaStoreManager;
 import org.apache.polaris.core.persistence.PolarisResolvedPathWrapper;
 import org.apache.polaris.core.persistence.RetryOnConcurrencyException;
 import org.apache.polaris.core.persistence.dao.entity.BaseResult;
@@ -339,10 +340,14 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
       String newLocation) {
     CommittedTableSnapshotRow snapshotRow =
         buildSnapshotRowIfActive(entity.getId() + "", metadata, newLocation);
+    boolean inWorkspace = getMetaStoreManager() instanceof TransactionWorkspaceMetaStoreManager;
     if (snapshotRow == null
-        || !(getCurrentPolarisContext().getMetaStore() instanceof JdbcBasePersistenceImpl jdbc)) {
+        || !(getCurrentPolarisContext().getMetaStore() instanceof JdbcBasePersistenceImpl jdbc)
+        || inWorkspace) {
       createTableLike(identifier, entity, resolvedParent);
-      maybeRecordCommittedSnapshot(identifier, entity.getId() + "", metadata, newLocation);
+      if (!inWorkspace) {
+        maybeRecordCommittedSnapshot(identifier, entity.getId() + "", metadata, newLocation);
+      }
       return;
     }
     // Prepare the entity the same way AtomicOperationMetaStoreManager.persistNewEntity does.
@@ -382,10 +387,14 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
     String tableUuid = entity.getId() + "";
     CommittedTableSnapshotRow snapshotRow =
         buildSnapshotRowIfActive(tableUuid, metadata, newLocation);
+    boolean inWorkspace = getMetaStoreManager() instanceof TransactionWorkspaceMetaStoreManager;
     if (snapshotRow == null
-        || !(getCurrentPolarisContext().getMetaStore() instanceof JdbcBasePersistenceImpl jdbc)) {
+        || !(getCurrentPolarisContext().getMetaStore() instanceof JdbcBasePersistenceImpl jdbc)
+        || inWorkspace) {
       updateTableLike(identifier, entity);
-      maybeRecordCommittedSnapshot(identifier, tableUuid, metadata, newLocation);
+      if (!inWorkspace) {
+        maybeRecordCommittedSnapshot(identifier, tableUuid, metadata, newLocation);
+      }
       return;
     }
     // Prepare the entity the same way AtomicOperationMetaStoreManager.persistEntityAfterChange

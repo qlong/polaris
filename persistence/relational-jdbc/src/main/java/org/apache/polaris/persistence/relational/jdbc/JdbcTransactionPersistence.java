@@ -430,7 +430,7 @@ public class JdbcTransactionPersistence {
   public void insertTxnSnapshot(@Nonnull TxnSnapshotRow row) throws SQLException {
     String sql =
         "INSERT INTO POLARIS_SCHEMA.txn_snapshots "
-            + "(txn_snapshot_id, realm_id, catalog_id, xmin, xmax, xip_list, created_at, expires_at) "
+            + "(txn_snapshot_id, realm_id, catalog_id, snap_xmin, snap_xmax, snap_xip_list, created_at, expires_at) "
             + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -449,7 +449,7 @@ public class JdbcTransactionPersistence {
 
   public Optional<TxnSnapshotRow> findTxnSnapshot(long txnSnapshotId) throws SQLException {
     String sql =
-        "SELECT txn_snapshot_id, realm_id, catalog_id, xmin, xmax, xip_list, "
+        "SELECT txn_snapshot_id, realm_id, catalog_id, snap_xmin, snap_xmax, snap_xip_list, "
             + "created_at, expires_at, released_at "
             + "FROM POLARIS_SCHEMA.txn_snapshots "
             + "WHERE txn_snapshot_id = ? AND realm_id = ?";
@@ -566,9 +566,9 @@ public class JdbcTransactionPersistence {
         rs.getLong("txn_snapshot_id"),
         rs.getString("realm_id"),
         rs.getLong("catalog_id"),
-        rs.getLong("xmin"),
-        rs.getLong("xmax"),
-        rs.getString("xip_list"),
+        rs.getLong("snap_xmin"),
+        rs.getLong("snap_xmax"),
+        rs.getString("snap_xip_list"),
         toInstant(rs.getTimestamp("created_at")),
         toInstant(rs.getTimestamp("expires_at")),
         toInstant(rs.getTimestamp("released_at")));

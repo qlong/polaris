@@ -357,9 +357,9 @@ CREATE TABLE IF NOT EXISTS txn_snapshots (
     txn_snapshot_id BIGINT PRIMARY KEY,
     realm_id        TEXT NOT NULL,
     catalog_id      BIGINT NOT NULL,
-    xmin            BIGINT NOT NULL,
-    xmax            BIGINT NOT NULL,
-    xip_list        TEXT NOT NULL,
+    snap_xmin       BIGINT NOT NULL,
+    snap_xmax       BIGINT NOT NULL,
+    snap_xip_list   TEXT NOT NULL,
     created_at      TIMESTAMP NOT NULL DEFAULT now(),
     expires_at      TIMESTAMP NOT NULL,
     released_at     TIMESTAMP

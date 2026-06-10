@@ -78,4 +78,35 @@ public class PolarisResourcePaths {
         "generic-tables",
         RESTUtil.encodeString(ident.name()));
   }
+
+  public String table(TableIdentifier ident) {
+    return SLASH.join(
+        "v1",
+        prefix,
+        "namespaces",
+        RESTUtil.encodeNamespace(ident.namespace()),
+        "tables",
+        RESTUtil.encodeString(ident.name()));
+  }
+
+  public String transactions() {
+    return SLASH.join("polaris", "v1", prefix, "transactions");
+  }
+
+  public String transactionCommit(long txnId) {
+    return SLASH.join("polaris", "v1", prefix, "transactions", txnId, "commit");
+  }
+
+  public String transactionAbort(long txnId) {
+    return SLASH.join("polaris", "v1", prefix, "transactions", txnId, "abort");
+  }
+
+  public String subtransactions(long txnId) {
+    return SLASH.join("polaris", "v1", prefix, "transactions", txnId, "subtransactions");
+  }
+
+  public String subtransactionCommit(long txnId, long subtxnId) {
+    return SLASH.join(
+        "polaris", "v1", prefix, "transactions", txnId, "subtransactions", subtxnId, "commit");
+  }
 }

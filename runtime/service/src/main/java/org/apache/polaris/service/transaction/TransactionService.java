@@ -25,6 +25,7 @@ import java.security.SecureRandom;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.UUID;
 import java.util.HexFormat;
@@ -285,6 +286,11 @@ public class TransactionService {
             + UUID.randomUUID()
             + ".metadata.json";
 
+    // Capture the table's current committed metadata-location so we can detect concurrent commits
+    // at finalization time (conflict detection for merge-and-retry / serialization failure).
+    String serverBase =
+        persistence.findLatestCommittedMetadataLocation(tableUuid).orElse(null);
+
     SubtransactionRow row =
         new SubtransactionRow(
             subtxnId,
@@ -294,6 +300,7 @@ public class TransactionService {
             tableUuid,
             operation.toUpperCase(Locale.ROOT),
             baseSnapshotId,
+            serverBase,
             stagingPath,
             null,
             subtxnToken,
@@ -365,19 +372,121 @@ public class TransactionService {
     return persistence.findSubtransaction(subtxnId).orElseThrow();
   }
 
+  // ---------------------------------------------------------------------------
+  // Inline commit (Use Case 1 — single-session staged writes)
+  // ---------------------------------------------------------------------------
+
   /**
-   * Commits a transaction. All SUB_COMMITTED subtransactions are finalized atomically — the
-   * metadata pointer for each table is swapped and a {@code committed_table_snapshots} record is
-   * inserted in the same DB transaction. Locks are released on success.
+   * One table's contribution to an inline commit. Built by {@link #prepareInlineCommit}; consumed
+   * by {@code IcebergCatalogHandler.finalizeInlineTables}.
    *
-   * <p>The actual entity persistence (swapping {@code metadata-location} in the {@code entities}
-   * table) is delegated to the caller (the REST adapter / {@code IcebergCatalog}) which already
-   * holds the correct entity handles. This method validates state and records finalization in the
-   * transaction tables; the adapter drives the entity update loop.
-   *
-   * @return list of SUB_COMMITTED subtransactions to finalize
+   * @param tableIdentifier dot-separated name, e.g. {@code "ns.orders"}
+   * @param stagedMetadataLocation path to the client-written staged metadata JSON
+   * @param serverBaseMetadataLocation the latest committed metadata location at prepare time;
+   *     {@code null} when no prior commit exists or this entry is on the merge-retry path
+   * @param operation {@code "APPEND"} or {@code "ROW_DELTA"}
    */
-  public List<SubtransactionRow> prepareCommit(long txnId, String txnToken) throws SQLException {
+  public record StagedTableInfo(
+      String tableIdentifier,
+      String stagedMetadataLocation,
+      String serverBaseMetadataLocation,
+      String operation) {}
+
+  /** Parallel to {@link PrepareCommitResult} but for the inline path. */
+  public record PrepareInlineResult(
+      List<StagedTableInfo> direct, List<StagedTableInfo> mergeRetry) {}
+
+  /**
+   * Validates and classifies the inline staged tables provided by the client (Use Case 1).
+   *
+   * <p>Conflict detection mirrors {@link #prepareCommit}: for REPEATABLE_READ transactions the
+   * snapshot-time metadata location is compared against the current committed location. A
+   * difference means a concurrent commit occurred:
+   * <ul>
+   *   <li>APPEND → merge-and-retry
+   *   <li>ROW_DELTA → first-committer-wins; aborts the transaction and throws
+   *       {@link SerializationFailureException}
+   * </ul>
+   * For READ_COMMITTED all tables are routed directly (no snapshot baseline).
+   */
+  public PrepareInlineResult prepareInlineCommit(
+      long txnId, String txnToken, List<StagedTableInfo> inputTables) throws SQLException {
+    TransactionRow txn = validateTxnToken(txnId, txnToken);
+    requireInProgress(txn);
+
+    List<StagedTableInfo> direct = new ArrayList<>();
+    List<StagedTableInfo> mergeRetry = new ArrayList<>();
+
+    for (StagedTableInfo info : inputTables) {
+      String currentMeta =
+          persistence.findLatestCommittedMetadataLocation(info.tableIdentifier()).orElse(null);
+
+      // Determine the baseline visible at transaction-begin time (REPEATABLE_READ only).
+      String baselineMeta = null;
+      if (txn.txnSnapshotId() != null) {
+        baselineMeta =
+            resolveTableMetadataLocation(info.tableIdentifier(), txn.txnSnapshotId()).orElse(null);
+      }
+
+      boolean conflict = baselineMeta != null && !baselineMeta.equals(currentMeta);
+      if (!conflict) {
+        direct.add(
+            new StagedTableInfo(
+                info.tableIdentifier(),
+                info.stagedMetadataLocation(),
+                currentMeta,
+                info.operation()));
+      } else if (LockManager.MODE_APPEND.equalsIgnoreCase(info.operation())) {
+        LOGGER.info(
+            "APPEND conflict detected for table {} in inline txn {}: scheduling merge-and-retry",
+            info.tableIdentifier(), txnId);
+        mergeRetry.add(
+            new StagedTableInfo(
+                info.tableIdentifier(), info.stagedMetadataLocation(), null, info.operation()));
+      } else {
+        persistence.updateTransactionStatus(txnId, JdbcTransactionPersistence.TXN_STATUS_ABORTED);
+        lockManager.releaseAll(txnId);
+        LOGGER.info(
+            "Serialization failure (inline): txn={} table={} op={} base={} current={}",
+            txnId, info.tableIdentifier(), info.operation(), baselineMeta, currentMeta);
+        throw new SerializationFailureException(
+            "could not serialize access due to concurrent update on table "
+                + info.tableIdentifier());
+      }
+    }
+    return new PrepareInlineResult(direct, mergeRetry);
+  }
+
+  /** Thrown by {@link #prepareCommit} when a non-APPEND subtransaction detects a concurrent write. */
+  public static class SerializationFailureException extends RuntimeException {
+    public SerializationFailureException(String message) {
+      super(message);
+    }
+  }
+
+  /**
+   * Result of {@link #prepareCommit}. Subtransactions are split by required finalization action:
+   * <ul>
+   *   <li>{@code direct} — no concurrent write detected; do a straightforward pointer swap.
+   *   <li>{@code mergeRetry} — APPEND with a concurrent commit; server must re-parent data files.
+   * </ul>
+   */
+  public record PrepareCommitResult(
+      List<SubtransactionRow> direct, List<SubtransactionRow> mergeRetry) {}
+
+  /**
+   * Validates and classifies all SUB_COMMITTED subtransactions for finalization.
+   *
+   * <p>For each subtransaction, compares {@code server_base_metadata_location} (captured at
+   * creation time) against the latest entry in {@code committed_table_snapshots}. A difference
+   * means another writer committed to the same table since this subtransaction started:
+   * <ul>
+   *   <li>APPEND: routed to {@link PrepareCommitResult#mergeRetry()} for server-side re-parenting.
+   *   <li>ROW_DELTA / OVERWRITE / EXCLUSIVE: transaction is aborted immediately and a
+   *       {@link SerializationFailureException} is thrown (HTTP 409, first-committer-wins).
+   * </ul>
+   */
+  public PrepareCommitResult prepareCommit(long txnId, String txnToken) throws SQLException {
     TransactionRow txn = validateTxnToken(txnId, txnToken);
     requireInProgress(txn);
 
@@ -393,9 +502,37 @@ public class TransactionService {
               + txnId
               + ". Commit or abort them before committing the transaction.");
     }
-    return subtxns.stream()
-        .filter(s -> s.status() == JdbcTransactionPersistence.SUBTXN_STATUS_SUB_COMMITTED)
-        .toList();
+
+    List<SubtransactionRow> direct = new ArrayList<>();
+    List<SubtransactionRow> mergeRetry = new ArrayList<>();
+    for (SubtransactionRow s :
+        subtxns.stream()
+            .filter(s -> s.status() == JdbcTransactionPersistence.SUBTXN_STATUS_SUB_COMMITTED)
+            .toList()) {
+      String currentMeta =
+          persistence.findLatestCommittedMetadataLocation(s.tableUuid()).orElse(null);
+      boolean conflict =
+          s.serverBaseMetadataLocation() != null
+              && !s.serverBaseMetadataLocation().equals(currentMeta);
+      if (!conflict) {
+        direct.add(s);
+      } else if (LockManager.MODE_APPEND.equalsIgnoreCase(s.operation())) {
+        LOGGER.info(
+            "APPEND conflict detected for table {} in txn {}: scheduling merge-and-retry",
+            s.tableUuid(), txnId);
+        mergeRetry.add(s);
+      } else {
+        // First-committer-wins: abort transaction and signal 409.
+        persistence.updateTransactionStatus(txnId, JdbcTransactionPersistence.TXN_STATUS_ABORTED);
+        lockManager.releaseAll(txnId);
+        LOGGER.info(
+            "Serialization failure: txn={} table={} op={} base={} current={}",
+            txnId, s.tableUuid(), s.operation(), s.serverBaseMetadataLocation(), currentMeta);
+        throw new SerializationFailureException(
+            "could not serialize access due to concurrent update on table " + s.tableUuid());
+      }
+    }
+    return new PrepareCommitResult(direct, mergeRetry);
   }
 
   /**

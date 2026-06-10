@@ -183,8 +183,15 @@ public class JdbcMetaStoreManagerFactory implements MetaStoreManagerFactory {
             createSession(realm, bootstrapOptions.rootCredentialsSet(), true);
         PolarisCallContext polarisContext = new PolarisCallContext(realmContext, metaStore);
 
-        PrincipalSecretsResult secretsResult =
-            createPolarisPrincipalForRealm(metaStoreManager, polarisContext);
+        PrincipalSecretsResult secretsResult;
+        try {
+          secretsResult = createPolarisPrincipalForRealm(metaStoreManager, polarisContext);
+        } catch (IllegalArgumentException e) {
+          // Already bootstrapped — treat as a no-op so restart with auto-bootstrap-types is safe.
+          LOGGER.info("Realm '{}' is already bootstrapped, skipping principal creation.", realm);
+          verifiedRealms.add(realm);
+          continue;
+        }
         results.put(realm, secretsResult);
         verifiedRealms.add(realm);
       }

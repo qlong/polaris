@@ -42,15 +42,23 @@ import org.apache.iceberg.rest.RESTClient;
 import org.apache.iceberg.rest.ResourcePaths;
 import org.apache.iceberg.rest.auth.OAuth2Util;
 import org.apache.iceberg.rest.responses.ConfigResponse;
+import org.apache.iceberg.rest.responses.LoadTableResponse;
 import org.apache.iceberg.util.EnvironmentUtil;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.polaris.core.rest.PolarisEndpoints;
 import org.apache.polaris.core.rest.PolarisResourcePaths;
+import org.apache.polaris.spark.rest.BeginTransactionRESTRequest;
+import org.apache.polaris.spark.rest.CommitSubtransactionRESTRequest;
+import org.apache.polaris.spark.rest.CommitTransactionRESTRequest;
 import org.apache.polaris.spark.rest.CreateGenericTableRESTRequest;
 import org.apache.polaris.spark.rest.CreateGenericTableRequest;
+import org.apache.polaris.spark.rest.CreateSubtransactionRESTRequest;
 import org.apache.polaris.spark.rest.GenericTable;
 import org.apache.polaris.spark.rest.ListGenericTablesRESTResponse;
 import org.apache.polaris.spark.rest.LoadGenericTableRESTResponse;
+import org.apache.polaris.spark.rest.StagedTableCommitRESTRequest;
+import org.apache.polaris.spark.rest.SubtransactionRESTResponse;
+import org.apache.polaris.spark.rest.TransactionRESTResponse;
 
 /**
  * [[PolarisRESTCatalog]] talks to Polaris REST APIs, and implements the PolarisCatalog interfaces,
@@ -243,5 +251,107 @@ public class PolarisRESTCatalog implements PolarisCatalog, Closeable {
                 ErrorHandlers.tableErrorHandler());
 
     return response.getTable();
+  }
+
+  /**
+   * POST /polaris/v1/{prefix}/transactions — begins a new transaction.
+   *
+   * @param isolation "REPEATABLE_READ" or "READ_COMMITTED"
+   * @param leaseSeconds transaction lease duration
+   * @return parsed Transaction response containing txn_id, txn_token, txn_snapshot_id
+   */
+  public TransactionRESTResponse beginTransaction(String isolation, int leaseSeconds) {
+    return restClient
+        .withAuthSession(this.catalogAuth)
+        .post(
+            pathGenerator.transactions(),
+            new BeginTransactionRESTRequest(isolation, leaseSeconds),
+            TransactionRESTResponse.class,
+            Map.of(),
+            ErrorHandlers.defaultErrorHandler());
+  }
+
+  /**
+   * POST /polaris/v1/{prefix}/transactions/{txnId}/commit — commits the transaction.
+   *
+   * <p>When {@code tables} is non-empty the server uses the inline single-session path; when empty
+   * the server reads pre-registered subtransactions (multi-app path).
+   */
+  public void commitTransaction(long txnId, String txnToken, List<StagedTableCommitRESTRequest> tables) {
+    CommitTransactionRESTRequest body =
+        tables.isEmpty() ? null : new CommitTransactionRESTRequest(tables);
+    restClient
+        .withAuthSession(this.catalogAuth)
+        .post(
+            pathGenerator.transactionCommit(txnId),
+            body,
+            TransactionRESTResponse.class,
+            Map.of("X-Txn-Token", txnToken),
+            ErrorHandlers.defaultErrorHandler());
+  }
+
+  /**
+   * POST /polaris/v1/{prefix}/transactions/{txnId}/subtransactions — allocates a staging path and
+   * lock for one table. Returns subtxn_id, subtxn_token, and assigned_staging_path.
+   */
+  public SubtransactionRESTResponse createSubtransaction(
+      long txnId, String txnToken, String tableIdentifier, String operation, int leaseSeconds) {
+    return restClient
+        .withAuthSession(this.catalogAuth)
+        .post(
+            pathGenerator.subtransactions(txnId),
+            new CreateSubtransactionRESTRequest(tableIdentifier, operation, leaseSeconds),
+            SubtransactionRESTResponse.class,
+            Map.of("X-Txn-Token", txnToken),
+            ErrorHandlers.defaultErrorHandler());
+  }
+
+  /**
+   * POST /polaris/v1/{prefix}/transactions/{txnId}/subtransactions/{subtxnId}/commit — registers
+   * the staged metadata location for a worker subtransaction. Requires X-Subtxn-Token header.
+   */
+  public void commitSubtransaction(
+      long txnId, long subtxnId, String subtxnToken, String stagedMetadataLocation) {
+    restClient
+        .withAuthSession(this.catalogAuth)
+        .post(
+            pathGenerator.subtransactionCommit(txnId, subtxnId),
+            new CommitSubtransactionRESTRequest(stagedMetadataLocation),
+            TransactionRESTResponse.class,
+            Map.of("X-Subtxn-Token", subtxnToken),
+            ErrorHandlers.defaultErrorHandler());
+  }
+
+  /**
+   * POST /polaris/v1/{prefix}/transactions/{txnId}/abort — aborts the transaction.
+   * Requires X-Txn-Token header to prove ownership.
+   */
+  public void abortTransaction(long txnId, String txnToken) {
+    restClient
+        .withAuthSession(this.catalogAuth)
+        .post(
+            pathGenerator.transactionAbort(txnId),
+            null,
+            TransactionRESTResponse.class,
+            Map.of("X-Txn-Token", txnToken),
+            ErrorHandlers.defaultErrorHandler());
+  }
+
+  /**
+   * GET /v1/{prefix}/namespaces/{ns}/tables/{table}?txn_snapshot_id={id}
+   * Calls the standard Iceberg loadTable endpoint with a Polaris extension query param.
+   * Returns the metadata-location pinned to the given transaction snapshot.
+   */
+  public String resolveTableMetadataLocation(TableIdentifier identifier, long txnSnapshotId) {
+    LoadTableResponse response =
+        restClient
+            .withAuthSession(this.catalogAuth)
+            .get(
+                pathGenerator.table(identifier),
+                Map.of("txn_snapshot_id", String.valueOf(txnSnapshotId)),
+                LoadTableResponse.class,
+                Map.of(),
+                ErrorHandlers.tableErrorHandler());
+    return response.metadataLocation();
   }
 }

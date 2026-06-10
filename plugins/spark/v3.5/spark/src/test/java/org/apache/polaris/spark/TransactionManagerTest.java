@@ -1,0 +1,278 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.polaris.spark;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+import org.apache.iceberg.catalog.Namespace;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.polaris.spark.rest.TransactionRESTResponse;
+import org.apache.spark.sql.RuntimeConfig;
+import org.apache.spark.sql.SparkSession;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import scala.Option;
+
+public class TransactionManagerTest {
+
+  private PolarisRESTCatalog mockRestCatalog;
+  private SparkSession mockSpark;
+  private RuntimeConfig mockConf;
+  private TransactionManager txnManager;
+
+  /** Simple in-memory conf store backed by a Map. */
+  private final Map<String, String> confStore = new HashMap<>();
+
+  private static final String CATALOG = "polaris";
+
+  @BeforeEach
+  public void setup() {
+    mockRestCatalog = mock(PolarisRESTCatalog.class);
+    mockSpark = mock(SparkSession.class);
+    mockConf = mock(RuntimeConfig.class);
+    when(mockSpark.conf()).thenReturn(mockConf);
+
+    // Wire conf mock to use confStore
+    when(mockConf.getOption(anyString()))
+        .thenAnswer(
+            inv -> {
+              String key = inv.getArgument(0);
+              String val = confStore.get(key);
+              return val != null ? Option.apply(val) : Option.empty();
+            });
+    org.mockito.Mockito.doAnswer(
+            inv -> {
+              confStore.put(inv.getArgument(0), inv.getArgument(1));
+              return null;
+            })
+        .when(mockConf)
+        .set(anyString(), anyString());
+    org.mockito.Mockito.doAnswer(
+            inv -> {
+              confStore.remove(inv.getArgument(0));
+              return null;
+            })
+        .when(mockConf)
+        .unset(anyString());
+
+    txnManager = new TransactionManager(mockRestCatalog, CATALOG);
+    confStore.clear();
+  }
+
+  // -------------------------------------------------------------------------
+  // begin()
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void testBeginSetsPendingIsolation() {
+    txnManager.begin(mockSpark, "REPEATABLE_READ");
+
+    String key = String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG);
+    assertThat(confStore.get(key)).isEqualTo("REPEATABLE_READ");
+  }
+
+  @Test
+  public void testBeginThrowsIfAlreadyInProgress() {
+    txnManager.begin(mockSpark, "REPEATABLE_READ");
+
+    assertThatThrownBy(() -> txnManager.begin(mockSpark, "READ_COMMITTED"))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("Transaction already in progress");
+  }
+
+  @Test
+  public void testBeginDoesNotCallRestYet() {
+    txnManager.begin(mockSpark, "REPEATABLE_READ");
+
+    verify(mockRestCatalog, never()).beginTransaction(anyString(), anyInt());
+  }
+
+  // -------------------------------------------------------------------------
+  // setIsolationLevel()
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void testSetIsolationLevelUpdatesConf() {
+    txnManager.begin(mockSpark, "REPEATABLE_READ");
+    txnManager.setIsolationLevel(mockSpark, "READ_COMMITTED");
+
+    String key = String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG);
+    assertThat(confStore.get(key)).isEqualTo("READ_COMMITTED");
+  }
+
+  @Test
+  public void testSetIsolationLevelThrowsIfNoTransaction() {
+    assertThatThrownBy(() -> txnManager.setIsolationLevel(mockSpark, "REPEATABLE_READ"))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("No transaction in progress");
+  }
+
+  @Test
+  public void testSetIsolationLevelThrowsIfActive() {
+    // Simulate ACTIVE state: both pending and txn_id are set
+    confStore.put(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG), "REPEATABLE_READ");
+    confStore.put(String.format(TransactionManager.CONF_TXN_ID, CATALOG), "42");
+
+    assertThatThrownBy(() -> txnManager.setIsolationLevel(mockSpark, "READ_COMMITTED"))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("already ACTIVE");
+  }
+
+  // -------------------------------------------------------------------------
+  // resolveMetadataLocation() — lazy-BEGIN trigger
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void testResolveReturnsEmptyWhenNoTransaction() {
+    TableIdentifier ident = TableIdentifier.of(Namespace.of("ns"), "orders");
+    Optional<String> result = txnManager.resolveMetadataLocation(mockSpark, ident);
+
+    assertThat(result).isEmpty();
+    verify(mockRestCatalog, never()).beginTransaction(anyString(), anyInt());
+  }
+
+  @Test
+  public void testResolveCallsBeginTransactionOnFirstQuery_RepeatableRead() {
+    TransactionRESTResponse txnResp = mock(TransactionRESTResponse.class);
+    when(txnResp.txnId()).thenReturn(123L);
+    when(txnResp.txnToken()).thenReturn("tok");
+    when(txnResp.txnSnapshotId()).thenReturn(47L);
+    when(mockRestCatalog.beginTransaction(eq("REPEATABLE_READ"), anyInt())).thenReturn(txnResp);
+    when(mockRestCatalog.resolveTableMetadataLocation(any(), anyLong()))
+        .thenReturn("file:///tmp/metadata/v5.metadata.json");
+
+    txnManager.begin(mockSpark, "REPEATABLE_READ");
+    TableIdentifier ident = TableIdentifier.of(Namespace.of("ns"), "orders");
+    Optional<String> result = txnManager.resolveMetadataLocation(mockSpark, ident);
+
+    verify(mockRestCatalog).beginTransaction("REPEATABLE_READ", TransactionManager.DEFAULT_LEASE_SECONDS);
+    assertThat(result).hasValue("file:///tmp/metadata/v5.metadata.json");
+    // txn_id and token should be stored in conf
+    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_ID, CATALOG))).isEqualTo("123");
+    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG))).isEqualTo("tok");
+    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_SNAPSHOT_ID, CATALOG))).isEqualTo("47");
+  }
+
+  @Test
+  public void testResolveReturnsEmptyForReadCommitted() {
+    TransactionRESTResponse txnResp = mock(TransactionRESTResponse.class);
+    when(txnResp.txnId()).thenReturn(99L);
+    when(txnResp.txnToken()).thenReturn("tok");
+    when(txnResp.txnSnapshotId()).thenReturn(null); // READ_COMMITTED has no snapshot
+    when(mockRestCatalog.beginTransaction(eq("READ_COMMITTED"), anyInt())).thenReturn(txnResp);
+
+    txnManager.begin(mockSpark, "READ_COMMITTED");
+    TableIdentifier ident = TableIdentifier.of(Namespace.of("ns"), "orders");
+    Optional<String> result = txnManager.resolveMetadataLocation(mockSpark, ident);
+
+    assertThat(result).isEmpty();
+    verify(mockRestCatalog, never()).resolveTableMetadataLocation(any(), anyLong());
+  }
+
+  @Test
+  public void testResolveDoesNotCallBeginAgainOnSecondQuery() {
+    TransactionRESTResponse txnResp = mock(TransactionRESTResponse.class);
+    when(txnResp.txnId()).thenReturn(123L);
+    when(txnResp.txnToken()).thenReturn("tok");
+    when(txnResp.txnSnapshotId()).thenReturn(47L);
+    when(mockRestCatalog.beginTransaction(anyString(), anyInt())).thenReturn(txnResp);
+    when(mockRestCatalog.resolveTableMetadataLocation(any(), anyLong()))
+        .thenReturn("file:///tmp/v5.metadata.json");
+
+    txnManager.begin(mockSpark, "REPEATABLE_READ");
+    TableIdentifier ident = TableIdentifier.of(Namespace.of("ns"), "orders");
+    txnManager.resolveMetadataLocation(mockSpark, ident); // first query — triggers begin
+    txnManager.resolveMetadataLocation(mockSpark, ident); // second query — should NOT re-begin
+
+    verify(mockRestCatalog, org.mockito.Mockito.times(1)).beginTransaction(anyString(), anyInt());
+  }
+
+  // -------------------------------------------------------------------------
+  // commit()
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void testCommitCallsRestWhenActive() {
+    confStore.put(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG), "REPEATABLE_READ");
+    confStore.put(String.format(TransactionManager.CONF_TXN_ID, CATALOG), "42");
+    confStore.put(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG), "secret");
+    confStore.put(String.format(TransactionManager.CONF_TXN_SNAPSHOT_ID, CATALOG), "7");
+
+    txnManager.commit(mockSpark);
+
+    verify(mockRestCatalog).commitTransaction(eq(42L), eq("secret"), anyList());
+    // conf should be cleared
+    assertThat(confStore.get(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG))).isNull();
+    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_ID, CATALOG))).isNull();
+  }
+
+  @Test
+  public void testCommitNoOpWhenPending() {
+    txnManager.begin(mockSpark, "REPEATABLE_READ"); // PENDING state
+
+    txnManager.commit(mockSpark);
+
+    verify(mockRestCatalog, never()).commitTransaction(anyLong(), anyString(), anyList());
+    assertThat(confStore.get(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG))).isNull();
+  }
+
+  @Test
+  public void testCommitNoOpWhenNoTransaction() {
+    txnManager.commit(mockSpark); // nothing to commit
+
+    verify(mockRestCatalog, never()).commitTransaction(anyLong(), anyString(), anyList());
+  }
+
+  // -------------------------------------------------------------------------
+  // rollback()
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void testRollbackCallsAbortWhenActive() {
+    confStore.put(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG), "REPEATABLE_READ");
+    confStore.put(String.format(TransactionManager.CONF_TXN_ID, CATALOG), "55");
+    confStore.put(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG), "tok55");
+
+    txnManager.rollback(mockSpark);
+
+    verify(mockRestCatalog).abortTransaction(55L, "tok55");
+    assertThat(confStore.get(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG))).isNull();
+  }
+
+  // -------------------------------------------------------------------------
+  // Helper
+  // -------------------------------------------------------------------------
+
+  private static <T> T any() {
+    return org.mockito.ArgumentMatchers.any();
+  }
+}

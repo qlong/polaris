@@ -51,9 +51,16 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import javax.sql.DataSource;
+import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.BaseMetadataTable;
 import org.apache.iceberg.BaseTable;
+import org.apache.iceberg.DataFile;
+import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.ManifestFiles;
+import org.apache.iceberg.ManifestReader;
 import org.apache.iceberg.MetadataUpdate;
+import org.apache.iceberg.TableMetadataParser;
+import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.SortOrder;
@@ -915,6 +922,17 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
     }
   }
 
+  /** Returns the raw Iceberg {@link Table} for use during transaction finalization. */
+  public org.apache.iceberg.Table loadRawTable(
+      org.apache.iceberg.catalog.TableIdentifier tableId) {
+    return baseCatalog.loadTable(tableId);
+  }
+
+  /** Redirects entity writes from this handler's catalog into the given workspace. */
+  public void setWorkspaceMetaStoreManager(TransactionWorkspaceMetaStoreManager workspace) {
+    ((IcebergCatalog) baseCatalog).setMetaStoreManager(workspace);
+  }
+
   public TransactionService newTransactionServiceForCatalog() {
     if (!jdbcDataSource().isResolvable() || !datasourceOperations().isResolvable()) {
       throw new ServiceUnavailableException(
@@ -1387,6 +1405,221 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
     }
 
     eventAttributeMap().put(EventAttributes.TABLE_METADATAS, tableMetadataObjs);
+  }
+
+  /**
+   * Finalizes a multi-table extension transaction atomically:
+   *
+   * <ol>
+   *   <li>Buffers all entity updates in a {@link TransactionWorkspaceMetaStoreManager} (same
+   *       pattern as {@link #commitTransaction}).
+   *   <li>Applies direct pointer swaps and APPEND merge-and-retry commits.
+   *   <li>Commits every entity update in a single {@code updateEntitiesPropertiesIfNotChanged} call.
+   *   <li>Inserts all {@code committed_table_snapshots} rows with a shared {@code committed_txn_id}
+   *       in one JDBC transaction — giving MVCC readers an atomic commit point.
+   * </ol>
+   *
+   * @param direct subtransactions whose staged metadata can be applied as-is (no conflict)
+   * @param mergeRetry APPEND subtransactions that had a conflict and need merge-and-retry
+   */
+  public void finalizeExtensionTransaction(
+      List<JdbcTransactionPersistence.SubtransactionRow> direct,
+      List<JdbcTransactionPersistence.SubtransactionRow> mergeRetry) {
+
+    TransactionWorkspaceMetaStoreManager workspace =
+        new TransactionWorkspaceMetaStoreManager(diagnostics(), metaStoreManager());
+    ((IcebergCatalog) baseCatalog).setMetaStoreManager(workspace);
+    try {
+      for (JdbcTransactionPersistence.SubtransactionRow sub : direct) {
+        TableIdentifier tableId = extensionTableId(sub.tableUuid());
+        Table table = baseCatalog.loadTable(tableId);
+        TableOperations ops = ((BaseTable) table).operations();
+        FileIO io = ops.io();
+        TableMetadata base =
+            sub.serverBaseMetadataLocation() != null
+                ? TableMetadataParser.read(io, sub.serverBaseMetadataLocation())
+                : ops.current();
+        TableMetadata staged = TableMetadataParser.read(io, sub.stagedMetadataLocation());
+        ops.commit(base, staged); // entity update buffered; CTS skipped while inWorkspace=true
+      }
+      for (JdbcTransactionPersistence.SubtransactionRow sub : mergeRetry) {
+        TableIdentifier tableId = extensionTableId(sub.tableUuid());
+        Table liveTable = baseCatalog.loadTable(tableId);
+        FileIO io = ((BaseTable) liveTable).operations().io();
+        TableMetadata staged = TableMetadataParser.read(io, sub.stagedMetadataLocation());
+        List<DataFile> addedFiles = extractAddedDataFiles(staged, io);
+        AppendFiles append = liveTable.newAppend();
+        addedFiles.forEach(append::appendFile);
+        append.commit(); // entity update buffered; CTS skipped while inWorkspace=true
+      }
+    } finally {
+      ((IcebergCatalog) baseCatalog).setMetaStoreManager(metaStoreManager());
+    }
+
+    // Commit all entity updates atomically (one DB transaction).
+    List<EntityWithPath> pending = workspace.getPendingUpdates();
+    EntitiesResult entityResult =
+        metaStoreManager()
+            .updateEntitiesPropertiesIfNotChanged(callContext().getPolarisCallContext(), pending);
+    if (!entityResult.isSuccess()) {
+      throw new CommitFailedException(
+          "Extension transaction entity batch commit failed: %s", entityResult.getReturnStatus());
+    }
+
+    // Insert all committed_table_snapshots rows in one transaction with a shared committed_txn_id.
+    // This gives MVCC readers a single atomic visibility point for all tables, improving on the
+    // standard commitTransaction path which uses a separate nextTxnId() per table.
+    JdbcTransactionPersistence jdbcTxn = buildJdbcTransactionPersistenceIfActive();
+    if (jdbcTxn != null && !pending.isEmpty()) {
+      List<JdbcTransactionPersistence.CommittedTableSnapshotRow> ctsRows = new ArrayList<>();
+      for (EntityWithPath ewp : pending) {
+        if (ewp.entity().getSubTypeCode() == PolarisEntitySubType.ICEBERG_TABLE.getCode()) {
+          IcebergTableLikeEntity tableEntity = new IcebergTableLikeEntity(ewp.entity());
+          String metadataLocation = tableEntity.getMetadataLocation();
+          if (metadataLocation != null) {
+            ctsRows.add(
+                new JdbcTransactionPersistence.CommittedTableSnapshotRow(
+                    tableEntity.getId() + "", 0L, null, metadataLocation));
+          }
+        }
+      }
+      try {
+        jdbcTxn.insertBatchCommittedTableSnapshots(ctsRows);
+      } catch (java.sql.SQLException e) {
+        LOGGER.warn(
+            "Failed to batch-insert committed_table_snapshots during extension txn finalize;"
+                + " MVCC snapshot reads may see stale state: {}",
+            e.getMessage());
+      }
+    }
+  }
+
+  /**
+   * Finalizes the inline single-session commit path (Use Case 1). Mirrors
+   * {@link #finalizeExtensionTransaction} but receives {@link TransactionService.StagedTableInfo}
+   * records built from the client-provided staged metadata paths.
+   *
+   * @param direct tables with no concurrent conflict — apply staged pointer swap
+   * @param mergeRetry APPEND tables that had a concurrent commit — re-parent data files onto live
+   *     head
+   */
+  public void finalizeInlineTables(
+      List<TransactionService.StagedTableInfo> direct,
+      List<TransactionService.StagedTableInfo> mergeRetry,
+      IcebergCatalogHandlerFactory handlerFactory,
+      String catalogName,
+      org.apache.polaris.core.auth.PolarisPrincipal principal) {
+
+    // Each table needs its own handler initialized via loadTable so that the resolution manifest
+    // has the table's passthrough path registered. We inject a shared workspace metastore so that
+    // all ops.commit() calls buffer their entity updates in one place for atomic batch commit.
+    TransactionWorkspaceMetaStoreManager workspace =
+        new TransactionWorkspaceMetaStoreManager(diagnostics(), metaStoreManager());
+
+    List<IcebergCatalogHandler> openHandlers = new java.util.ArrayList<>();
+    try {
+      for (TransactionService.StagedTableInfo info : direct) {
+        TableIdentifier tableId = extensionTableId(info.tableIdentifier());
+        IcebergCatalogHandler tableHandler = handlerFactory.createHandler(catalogName, principal);
+        openHandlers.add(tableHandler);
+        // loadTable registers the table in the manifest. Load the raw table first (while the real
+        // metastore is still active so FileIO is initialized with proper credentials), then swap
+        // to the workspace so ops.commit() buffers entity writes there.
+        tableHandler.loadTable(tableId, null);
+        Table table = tableHandler.loadRawTable(tableId);
+        tableHandler.setWorkspaceMetaStoreManager(workspace);
+        TableOperations ops = ((BaseTable) table).operations();
+        FileIO io = ops.io();
+        TableMetadata base =
+            info.serverBaseMetadataLocation() != null
+                ? TableMetadataParser.read(io, info.serverBaseMetadataLocation())
+                : ops.current();
+        TableMetadata staged = TableMetadataParser.read(io, info.stagedMetadataLocation());
+        ops.commit(base, staged);
+      }
+      for (TransactionService.StagedTableInfo info : mergeRetry) {
+        TableIdentifier tableId = extensionTableId(info.tableIdentifier());
+        IcebergCatalogHandler tableHandler = handlerFactory.createHandler(catalogName, principal);
+        openHandlers.add(tableHandler);
+        tableHandler.loadTable(tableId, null);
+        Table liveTable = tableHandler.loadRawTable(tableId);
+        tableHandler.setWorkspaceMetaStoreManager(workspace);
+        FileIO io = ((BaseTable) liveTable).operations().io();
+        TableMetadata staged = TableMetadataParser.read(io, info.stagedMetadataLocation());
+        List<DataFile> addedFiles = extractAddedDataFiles(staged, io);
+        AppendFiles append = liveTable.newAppend();
+        addedFiles.forEach(append::appendFile);
+        append.commit();
+      }
+    } finally {
+      for (IcebergCatalogHandler h : openHandlers) {
+        try { h.close(); } catch (Exception ignored) {}
+      }
+    }
+
+    // Commit all entity updates atomically and insert committed_table_snapshots rows.
+    List<EntityWithPath> pending = workspace.getPendingUpdates();
+    EntitiesResult entityResult =
+        metaStoreManager()
+            .updateEntitiesPropertiesIfNotChanged(callContext().getPolarisCallContext(), pending);
+    if (!entityResult.isSuccess()) {
+      throw new CommitFailedException(
+          "Inline transaction entity batch commit failed: %s", entityResult.getReturnStatus());
+    }
+
+    JdbcTransactionPersistence jdbcTxn = buildJdbcTransactionPersistenceIfActive();
+    if (jdbcTxn != null && !pending.isEmpty()) {
+      List<JdbcTransactionPersistence.CommittedTableSnapshotRow> ctsRows = new ArrayList<>();
+      for (EntityWithPath ewp : pending) {
+        if (ewp.entity().getSubTypeCode() == PolarisEntitySubType.ICEBERG_TABLE.getCode()) {
+          IcebergTableLikeEntity tableEntity = new IcebergTableLikeEntity(ewp.entity());
+          String metadataLocation = tableEntity.getMetadataLocation();
+          if (metadataLocation != null) {
+            ctsRows.add(
+                new JdbcTransactionPersistence.CommittedTableSnapshotRow(
+                    tableEntity.getId() + "", 0L, null, metadataLocation));
+          }
+        }
+      }
+      try {
+        jdbcTxn.insertBatchCommittedTableSnapshots(ctsRows);
+      } catch (java.sql.SQLException e) {
+        LOGGER.warn(
+            "Failed to batch-insert committed_table_snapshots during inline txn finalize;"
+                + " MVCC snapshot reads may see stale state: {}",
+            e.getMessage());
+      }
+    }
+  }
+
+  /** Parses a dot-separated subtransaction tableUuid into an Iceberg {@link TableIdentifier}. */
+  private static TableIdentifier extensionTableId(String tableUuid) {
+    String[] parts = tableUuid.split("\\.");
+    return TableIdentifier.of(
+        Namespace.of(Arrays.copyOf(parts, parts.length - 1)), parts[parts.length - 1]);
+  }
+
+  /** Extracts the data files added by the current snapshot in {@code meta}. */
+  private static List<DataFile> extractAddedDataFiles(TableMetadata meta, FileIO io) {
+    org.apache.iceberg.Snapshot snap = meta.currentSnapshot();
+    if (snap == null) {
+      return List.of();
+    }
+    List<DataFile> out = new ArrayList<>();
+    for (ManifestFile mf : snap.dataManifests(io)) {
+      if (mf.snapshotId() == null || mf.snapshotId() != snap.snapshotId()) {
+        continue;
+      }
+      // Manifests whose snapshotId matches were written by this snapshot — every entry is ADDED.
+      try (ManifestReader<DataFile> reader = ManifestFiles.read(mf, io, meta.specsById())) {
+        for (DataFile file : reader) {
+          out.add(file.copy());
+        }
+      } catch (java.io.IOException e) {
+        throw new RuntimeException("Failed to read manifest " + mf.path(), e);
+      }
+    }
+    return out;
   }
 
   public ListTablesResponse listViews(Namespace namespace, String pageToken, Integer pageSize) {

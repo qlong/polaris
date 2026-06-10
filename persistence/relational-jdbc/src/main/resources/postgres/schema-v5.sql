@@ -359,6 +359,7 @@ CREATE TABLE IF NOT EXISTS subtransactions (
     table_uuid              TEXT NOT NULL,   -- stable UUID of the Iceberg table entity
     operation               TEXT NOT NULL,
     base_snapshot_id        BIGINT,          -- Iceberg snapshot ID at subtxn creation time
+    server_base_metadata_location TEXT,      -- table's committed metadata-location at subtxn creation (server-captured)
     assigned_staging_path   TEXT NOT NULL,   -- server-assigned s3://…/staging/{txn_id}/{subtxn_id}/
     staged_metadata_location TEXT,           -- filled in by commitSubtransaction
     subtxn_token            TEXT NOT NULL,   -- random 32-byte hex; given to worker app

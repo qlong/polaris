@@ -1661,6 +1661,9 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
                       .put(EventAttributes.CATALOG_NAME, catalogName)
                       .put(EventAttributes.TABLE_IDENTIFIER, tableIdentifier)));
         }
+        // Capture the FileIO used during refresh so that io() returns a usable instance.
+        java.util.concurrent.atomic.AtomicReference<FileIO> capturedIO =
+            new java.util.concurrent.atomic.AtomicReference<>();
         refreshFromMetadataLocation(
             latestLocation,
             SHOULD_RETRY_REFRESH_PREDICATE,
@@ -1678,8 +1681,12 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
                       resolvedEntities,
                       new HashMap<>(tableDefaultProperties),
                       Set.of(PolarisStorageActions.READ, PolarisStorageActions.LIST));
+              capturedIO.set(fileIO);
               return TableMetadataParser.read(fileIO, metadataLocation);
             });
+        if (capturedIO.get() != null) {
+          tableFileIO = capturedIO.get();
+        }
         if (polarisEventDispatcher.hasListeners(PolarisEventType.AFTER_REFRESH_TABLE)) {
           polarisEventDispatcher.dispatch(
               new PolarisEvent(

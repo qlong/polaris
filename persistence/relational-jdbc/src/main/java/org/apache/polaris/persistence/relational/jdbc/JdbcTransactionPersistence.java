@@ -295,6 +295,7 @@ public class JdbcTransactionPersistence {
       String tableUuid,
       String operation,
       @Nullable Long baseSnapshotId,
+      @Nullable String serverBaseMetadataLocation,
       String assignedStagingPath,
       @Nullable String stagedMetadataLocation,
       String subtxnToken,
@@ -308,9 +309,9 @@ public class JdbcTransactionPersistence {
     String sql =
         "INSERT INTO POLARIS_SCHEMA.subtransactions "
             + "(subtxn_id, parent_txn_id, realm_id, catalog_id, table_uuid, operation, "
-            + " base_snapshot_id, assigned_staging_path, subtxn_token, status, "
-            + " retry_of_subtxn_id, created_at, expires_at) "
-            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            + " base_snapshot_id, server_base_metadata_location, assigned_staging_path, "
+            + " subtxn_token, status, retry_of_subtxn_id, created_at, expires_at) "
+            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
       conn.setAutoCommit(true);
@@ -321,12 +322,13 @@ public class JdbcTransactionPersistence {
       ps.setString(5, row.tableUuid());
       ps.setString(6, row.operation());
       setNullableLong(ps, 7, row.baseSnapshotId());
-      ps.setString(8, row.assignedStagingPath());
-      ps.setString(9, row.subtxnToken());
-      ps.setInt(10, row.status());
-      setNullableLong(ps, 11, row.retryOfSubtxnId());
-      ps.setTimestamp(12, Timestamp.from(row.createdAt()));
-      ps.setTimestamp(13, Timestamp.from(row.expiresAt()));
+      ps.setString(8, row.serverBaseMetadataLocation());
+      ps.setString(9, row.assignedStagingPath());
+      ps.setString(10, row.subtxnToken());
+      ps.setInt(11, row.status());
+      setNullableLong(ps, 12, row.retryOfSubtxnId());
+      ps.setTimestamp(13, Timestamp.from(row.createdAt()));
+      ps.setTimestamp(14, Timestamp.from(row.expiresAt()));
       ps.executeUpdate();
     }
   }
@@ -334,8 +336,9 @@ public class JdbcTransactionPersistence {
   public Optional<SubtransactionRow> findSubtransaction(long subtxnId) throws SQLException {
     String sql =
         "SELECT subtxn_id, parent_txn_id, realm_id, catalog_id, table_uuid, operation, "
-            + "base_snapshot_id, assigned_staging_path, staged_metadata_location, "
-            + "subtxn_token, status, retry_of_subtxn_id, created_at, expires_at, ended_at "
+            + "base_snapshot_id, server_base_metadata_location, assigned_staging_path, "
+            + "staged_metadata_location, subtxn_token, status, retry_of_subtxn_id, "
+            + "created_at, expires_at, ended_at "
             + "FROM POLARIS_SCHEMA.subtransactions WHERE subtxn_id = ? AND realm_id = ?";
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -350,8 +353,9 @@ public class JdbcTransactionPersistence {
   public List<SubtransactionRow> findSubtransactionsForTransaction(long txnId) throws SQLException {
     String sql =
         "SELECT subtxn_id, parent_txn_id, realm_id, catalog_id, table_uuid, operation, "
-            + "base_snapshot_id, assigned_staging_path, staged_metadata_location, "
-            + "subtxn_token, status, retry_of_subtxn_id, created_at, expires_at, ended_at "
+            + "base_snapshot_id, server_base_metadata_location, assigned_staging_path, "
+            + "staged_metadata_location, subtxn_token, status, retry_of_subtxn_id, "
+            + "created_at, expires_at, ended_at "
             + "FROM POLARIS_SCHEMA.subtransactions WHERE parent_txn_id = ? AND realm_id = ?";
     List<SubtransactionRow> rows = new ArrayList<>();
     try (Connection conn = dataSource.getConnection();
@@ -405,6 +409,7 @@ public class JdbcTransactionPersistence {
         rs.getString("table_uuid"),
         rs.getString("operation"),
         getNullableLong(rs, "base_snapshot_id"),
+        rs.getString("server_base_metadata_location"),
         rs.getString("assigned_staging_path"),
         rs.getString("staged_metadata_location"),
         rs.getString("subtxn_token"),
@@ -627,6 +632,35 @@ public class JdbcTransactionPersistence {
   }
 
   /**
+   * Inserts all CTS rows for a multi-table transaction atomically: one {@code nextTxnId()} call
+   * shared across every row, all rows inserted in a single JDBC transaction. This ensures an MVCC
+   * snapshot taken before this call sees none of the tables' new states, and a snapshot taken after
+   * sees all of them.
+   */
+  public void insertBatchCommittedTableSnapshots(@Nonnull List<CommittedTableSnapshotRow> rows)
+      throws SQLException {
+    if (rows.isEmpty()) {
+      return;
+    }
+    long sharedTxnId = nextTxnId();
+    try (Connection conn = dataSource.getConnection()) {
+      conn.setAutoCommit(false);
+      try {
+        for (CommittedTableSnapshotRow row : rows) {
+          insertCommittedTableSnapshot(
+              conn,
+              new CommittedTableSnapshotRow(
+                  row.tableUuid(), sharedTxnId, row.icebergSnapshotId(), row.metadataLocation()));
+        }
+        conn.commit();
+      } catch (SQLException e) {
+        conn.rollback();
+        throw e;
+      }
+    }
+  }
+
+  /**
    * Resolves a TxnSnapshot to the per-table metadata location visible under {@code snapshot}.
    *
    * <p>Visibility rule: {@code committed_txn_id >= xmin AND < xmax AND NOT IN (xip_list)}.
@@ -638,11 +672,14 @@ public class JdbcTransactionPersistence {
     String notInClause =
         xip.isEmpty() ? "" : " AND committed_txn_id NOT IN (" + placeholders(xip.size()) + ")";
 
+    // MVCC visibility: a commit is visible if committed_txn_id < xmax and not in xip_list.
+    // The xmin lower-bound is NOT used as a filter — it would incorrectly exclude rows committed
+    // before any transaction was in-flight at snapshot time.
     String sql =
         "SELECT table_uuid, committed_txn_id, iceberg_snapshot_id, metadata_location "
             + "FROM POLARIS_SCHEMA.committed_table_snapshots "
             + "WHERE realm_id = ? AND catalog_id = ? AND table_uuid = ? "
-            + "AND committed_txn_id >= ? AND committed_txn_id < ?"
+            + "AND committed_txn_id < ?"
             + notInClause
             + " ORDER BY committed_txn_id DESC LIMIT 1";
 
@@ -652,7 +689,6 @@ public class JdbcTransactionPersistence {
       ps.setString(idx++, realmId);
       ps.setLong(idx++, catalogId);
       ps.setString(idx++, tableUuid);
-      ps.setLong(idx++, snapshot.xmin());
       ps.setLong(idx++, snapshot.xmax());
       for (long xipId : xip) ps.setLong(idx++, xipId);
 
@@ -666,6 +702,27 @@ public class JdbcTransactionPersistence {
                   rs.getString("metadata_location")));
         }
         return Optional.empty();
+      }
+    }
+  }
+
+  /**
+   * Returns the most-recently-committed {@code metadata_location} for {@code tableUuid}, or {@link
+   * Optional#empty()} if the table has no committed history yet.
+   */
+  public Optional<String> findLatestCommittedMetadataLocation(String tableUuid)
+      throws SQLException {
+    String sql =
+        "SELECT metadata_location FROM POLARIS_SCHEMA.committed_table_snapshots "
+            + "WHERE realm_id = ? AND catalog_id = ? AND table_uuid = ? "
+            + "ORDER BY committed_txn_id DESC LIMIT 1";
+    try (Connection conn = dataSource.getConnection();
+        PreparedStatement ps = conn.prepareStatement(sql)) {
+      ps.setString(1, realmId);
+      ps.setLong(2, catalogId);
+      ps.setString(3, tableUuid);
+      try (ResultSet rs = ps.executeQuery()) {
+        return rs.next() ? Optional.of(rs.getString("metadata_location")) : Optional.empty();
       }
     }
   }

@@ -42,14 +42,14 @@ import requests
 # Configuration
 # ---------------------------------------------------------------------------
 POLARIS     = os.environ.get("POLARIS_HOST",    "http://localhost:8181")
-CATALOG     = os.environ.get("POLARIS_CATALOG", "quickstart_catalog")
+CATALOG     = os.environ.get("POLARIS_CATALOG", "demo_catalog")
 TOKEN       = os.environ.get("POLARIS_TOKEN",   "")
 NAMESPACE   = os.environ.get("NAMESPACE",       "demo_ns")
 T_ORDERS    = os.environ.get("TABLE_ORDERS",    "orders")
 T_CUSTOMERS = os.environ.get("TABLE_CUSTOMERS", "customers")
 
-POLARIS_BASE  = f"{POLARIS}/polaris/v1/{CATALOG}"
-ICEBERG_BASE  = f"{POLARIS}/v1/{CATALOG}"
+POLARIS_BASE  = f"{POLARIS}/api/catalog/polaris/v1/{CATALOG}"
+ICEBERG_BASE  = f"{POLARIS}/api/catalog/v1/{CATALOG}"
 
 HEADERS = {
     "Authorization": f"Bearer {TOKEN}",

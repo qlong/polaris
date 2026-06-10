@@ -19,7 +19,7 @@ set -euo pipefail
 # CONFIGURATION — override with environment variables
 # ---------------------------------------------------------------------------
 POLARIS="${POLARIS_HOST:-http://localhost:8181}"
-CATALOG="${POLARIS_CATALOG:-quickstart_catalog}"
+CATALOG="${POLARIS_CATALOG:-demo_catalog}"
 TOKEN="${POLARIS_TOKEN:-}"         # Bearer token for OAuth2
 NAMESPACE="${NAMESPACE:-demo_ns}"
 TABLE_ORDERS="${TABLE_ORDERS:-orders}"
@@ -55,7 +55,7 @@ polaris_delete() {
   curl -s -X DELETE \
     -H "${AUTH_HEADER}" \
     "${POLARIS_BASE}${path}"
-}a
+}
 
 polaris_get() {
   local path="$1"

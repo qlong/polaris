@@ -22,12 +22,27 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;
 import java.util.Arrays;
 import java.util.Map;
+import java.util.UUID;
 import java.util.stream.Stream;
 import org.apache.arrow.util.VisibleForTesting;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.CatalogUtil;
+import org.apache.iceberg.LocationProviders;
+import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableMetadataParser;
+import org.apache.iceberg.StaticTableOperations;
+import org.apache.iceberg.TableOperations;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.encryption.EncryptionManager;
+import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.LocationProvider;
+import org.apache.iceberg.hadoop.HadoopFileIO;
 import org.apache.iceberg.rest.auth.OAuth2Util;
+import org.apache.iceberg.spark.SparkUtil;
 import org.apache.iceberg.spark.SupportsReplaceView;
+import org.apache.iceberg.spark.source.SparkTable;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.polaris.spark.utils.DeltaHelper;
 import org.apache.polaris.spark.utils.HudiHelper;
@@ -73,6 +88,7 @@ public class SparkCatalog
   @VisibleForTesting protected DeltaHelper deltaHelper = null;
   @VisibleForTesting protected HudiHelper hudiHelper = null;
   @VisibleForTesting protected PaimonHelper paimonHelper = null;
+  @VisibleForTesting TransactionManager txnManager = null;
 
   @Override
   public String name() {
@@ -125,6 +141,7 @@ public class SparkCatalog
         PolarisCatalogUtils.getAuthSession(this.icebergsSparkCatalog);
     PolarisRESTCatalog restCatalog = new PolarisRESTCatalog();
     restCatalog.initialize(options, catalogAuth);
+    this.txnManager = new TransactionManager(restCatalog, name);
     this.polarisSparkCatalog = new PolarisSparkCatalog(restCatalog);
     this.polarisSparkCatalog.initialize(name, resolvedOptions);
   }
@@ -140,10 +157,188 @@ public class SparkCatalog
 
   @Override
   public Table loadTable(Identifier ident) throws NoSuchTableException {
+    org.apache.spark.sql.SparkSession spark = org.apache.spark.sql.SparkSession.active();
+    java.util.Optional<String> metadataLocation =
+        txnManager.resolveMetadataLocation(spark, toIcebergIdentifier(ident));
+
+    if (metadataLocation.isPresent()) {
+      Configuration conf = SparkUtil.hadoopConfCatalogOverrides(spark, catalogName);
+      HadoopFileIO fileIO = new HadoopFileIO(conf);
+      TableMetadata pinnedMetadata = TableMetadataParser.read(fileIO, metadataLocation.get());
+      LocationProvider locationProvider =
+          LocationProviders.locationsFor(pinnedMetadata.location(), pinnedMetadata.properties());
+
+      // txnId is always set here because resolveMetadataLocation transitions PENDING → ACTIVE
+      // before returning a present value.
+      String txnIdStr = txnManager.getConf(spark, TransactionManager.CONF_TXN_ID);
+      long txnId = txnIdStr != null ? Long.parseLong(txnIdStr) : 0L;
+      TableIdentifier icebergIdent = toIcebergIdentifier(ident);
+
+      // Use PinnedTableOperations: reads see the pinned snapshot (REPEATABLE_READ), writes
+      // are staged locally and sent to the server inline at COMMIT time.
+      // Fall back to read-only StaticTableOperations only if the live table cannot be loaded.
+      try {
+        Table liveSparkTable = this.icebergsSparkCatalog.loadTable(ident);
+        if (liveSparkTable instanceof SparkTable sparkTable) {
+          org.apache.iceberg.Table liveIceberg = sparkTable.table();
+          if (liveIceberg instanceof BaseTable baseTable) {
+            TableOperations liveOps = baseTable.operations();
+            TableOperations ops =
+                new PinnedTableOperations(
+                    pinnedMetadata, fileIO, locationProvider, liveOps,
+                    txnManager, spark, icebergIdent, txnId);
+            org.apache.iceberg.Table icebergTable =
+                new BaseTable(
+                    ops,
+                    ident.namespace()[ident.namespace().length - 1] + "." + ident.name());
+            return newSparkTable(icebergTable);
+          }
+        }
+      } catch (Exception ignored) {
+        // fall through to static fallback
+      }
+
+      StaticTableOperations ops =
+          new StaticTableOperations(pinnedMetadata, fileIO, locationProvider);
+      org.apache.iceberg.Table icebergTable =
+          new BaseTable(
+              ops, ident.namespace()[ident.namespace().length - 1] + "." + ident.name());
+      return newSparkTable(icebergTable);
+    }
+
     try {
       return this.icebergsSparkCatalog.loadTable(ident);
     } catch (NoSuchTableException e) {
       return this.polarisSparkCatalog.loadTable(ident);
+    }
+  }
+
+  /**
+   * Constructs a SparkTable from an Iceberg Table, handling both Iceberg 1.10 (compile-time,
+   * SparkTable(Table, boolean)) and 1.12+ (runtime, SparkTable(Table)).
+   */
+  private static Table newSparkTable(org.apache.iceberg.Table icebergTable) {
+    try {
+      // Iceberg 1.12+: single-arg constructor
+      return SparkTable.class.getConstructor(org.apache.iceberg.Table.class).newInstance(icebergTable);
+    } catch (java.lang.NoSuchMethodException e) {
+      // Iceberg 1.10: SparkTable(Table, boolean refreshEagerly)
+      try {
+        return SparkTable.class
+            .getConstructor(org.apache.iceberg.Table.class, boolean.class)
+            .newInstance(icebergTable, true);
+      } catch (ReflectiveOperationException ex) {
+        throw new RuntimeException("Cannot instantiate SparkTable — no compatible constructor", ex);
+      }
+    } catch (ReflectiveOperationException e) {
+      throw new RuntimeException("Cannot instantiate SparkTable", e);
+    }
+  }
+
+  private static TableIdentifier toIcebergIdentifier(Identifier ident) {
+    return TableIdentifier.of(
+        org.apache.iceberg.catalog.Namespace.of(ident.namespace()), ident.name());
+  }
+
+  /**
+   * TableOperations that pins reads to a specific metadata snapshot (REPEATABLE_READ consistency)
+   * while staging writes locally — so they are invisible to other sessions until COMMIT. Writes are
+   * NOT forwarded to liveOps; instead the staged metadata file is sent inline to the server at
+   * commitTransaction time.
+   */
+  private static final class PinnedTableOperations implements TableOperations {
+    private final TableMetadata pinnedMetadata;
+    private final FileIO fileIO;
+    private final LocationProvider locationProvider;
+    private final TableOperations liveOps;
+    private final TransactionManager txnManager;
+    private final org.apache.spark.sql.SparkSession spark;
+    private final TableIdentifier tableIdent;
+    private final long txnId;
+
+    PinnedTableOperations(
+        TableMetadata pinnedMetadata,
+        FileIO fileIO,
+        LocationProvider locationProvider,
+        TableOperations liveOps,
+        TransactionManager txnManager,
+        org.apache.spark.sql.SparkSession spark,
+        TableIdentifier tableIdent,
+        long txnId) {
+      this.pinnedMetadata = pinnedMetadata;
+      this.fileIO = fileIO;
+      this.locationProvider = locationProvider;
+      this.liveOps = liveOps;
+      this.txnManager = txnManager;
+      this.spark = spark;
+      this.tableIdent = tableIdent;
+      this.txnId = txnId;
+    }
+
+    @Override
+    public TableMetadata current() {
+      return pinnedMetadata;
+    }
+
+    @Override
+    public TableMetadata refresh() {
+      return pinnedMetadata;
+    }
+
+    @Override
+    public void commit(TableMetadata base, TableMetadata metadata) {
+      // Worker mode guard: prevent writing to a table other than the assigned one
+      if (txnManager.isWorkerMode(spark)) {
+        String assignedTable = txnManager.getWorkerTable(spark);
+        if (!TransactionManager.identToKey(tableIdent).equals(assignedTable)) {
+          throw new IllegalStateException(
+              "Worker session is assigned to table '"
+                  + assignedTable
+                  + "' — cannot write to '"
+                  + TransactionManager.identToKey(tableIdent)
+                  + "'");
+        }
+      }
+
+      // Allocate a new staging file path on each write (new UUID keeps savepoint history intact)
+      String stagingPath =
+          liveOps.metadataFileLocation(
+              txnId + "-" + UUID.randomUUID().toString().replace("-", "").substring(0, 12)
+                  + ".metadata.json");
+
+      // Write the staged metadata file
+      TableMetadataParser.write(metadata, fileIO.newOutputFile(stagingPath));
+
+      // Determine lock mode from the new snapshot's operation
+      String operation = "APPEND";
+      if (metadata.currentSnapshot() != null) {
+        String snapOp = metadata.currentSnapshot().operation();
+        if (!"append".equalsIgnoreCase(snapOp)) {
+          operation = "ROW_DELTA";
+        }
+      }
+
+      txnManager.stageWrite(spark, tableIdent, stagingPath, operation);
+    }
+
+    @Override
+    public FileIO io() {
+      return fileIO;
+    }
+
+    @Override
+    public EncryptionManager encryption() {
+      return liveOps.encryption();
+    }
+
+    @Override
+    public String metadataFileLocation(String fileName) {
+      return liveOps.metadataFileLocation(fileName);
+    }
+
+    @Override
+    public LocationProvider locationProvider() {
+      return locationProvider;
     }
   }
 

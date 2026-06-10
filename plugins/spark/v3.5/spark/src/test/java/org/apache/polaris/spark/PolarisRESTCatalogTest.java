@@ -321,6 +321,105 @@ public class PolarisRESTCatalogTest {
         .containsEntry(CatalogProperties.WAREHOUSE_LOCATION, "s3://warehouse");
   }
 
+  // -------------------------------------------------------------------------
+  // Transaction REST method tests
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void testBeginTransactionCallsCorrectEndpoint() {
+    initializeCatalog();
+
+    org.apache.polaris.spark.rest.TransactionRESTResponse mockTxnResp =
+        mock(org.apache.polaris.spark.rest.TransactionRESTResponse.class);
+    when(mockTxnResp.txnId()).thenReturn(42L);
+    when(mockTxnResp.txnToken()).thenReturn("tok");
+    when(mockTxnResp.txnSnapshotId()).thenReturn(7L);
+
+    when(mockClient.post(
+            any(), any(), eq(org.apache.polaris.spark.rest.TransactionRESTResponse.class),
+            anyMap(), any()))
+        .thenReturn(mockTxnResp);
+
+    org.apache.polaris.spark.rest.TransactionRESTResponse resp =
+        catalog.beginTransaction("REPEATABLE_READ", 3600);
+
+    assertThat(resp.txnId()).isEqualTo(42L);
+    assertThat(resp.txnToken()).isEqualTo("tok");
+    assertThat(resp.txnSnapshotId()).isEqualTo(7L);
+
+    @SuppressWarnings("unchecked")
+    ArgumentCaptor<String> pathCaptor = ArgumentCaptor.forClass(String.class);
+    verify(mockClient)
+        .post(
+            pathCaptor.capture(),
+            any(),
+            eq(org.apache.polaris.spark.rest.TransactionRESTResponse.class),
+            anyMap(),
+            any());
+    assertThat(pathCaptor.getValue()).endsWith("/transactions");
+  }
+
+  @Test
+  public void testCommitTransactionPassesTxnTokenHeader() {
+    initializeCatalog();
+
+    when(mockClient.post(any(), any(), any(), anyMap(), any())).thenReturn(null);
+
+    catalog.commitTransaction(42L, "secret-token", java.util.Collections.emptyList());
+
+    @SuppressWarnings("unchecked")
+    ArgumentCaptor<Map<String, String>> headersCaptor = ArgumentCaptor.forClass(Map.class);
+    verify(mockClient).post(any(), any(), any(), headersCaptor.capture(), any());
+    assertThat(headersCaptor.getValue()).containsEntry("X-Txn-Token", "secret-token");
+  }
+
+  @Test
+  public void testAbortTransactionPassesTxnTokenHeader() {
+    initializeCatalog();
+
+    when(mockClient.post(any(), any(), any(), anyMap(), any())).thenReturn(null);
+
+    catalog.abortTransaction(99L, "abort-token");
+
+    @SuppressWarnings("unchecked")
+    ArgumentCaptor<Map<String, String>> headersCaptor = ArgumentCaptor.forClass(Map.class);
+    verify(mockClient).post(any(), any(), any(), headersCaptor.capture(), any());
+    assertThat(headersCaptor.getValue()).containsEntry("X-Txn-Token", "abort-token");
+  }
+
+  @Test
+  public void testResolveTableMetadataLocationCallsCorrectEndpointWithSnapshotId() {
+    initializeCatalog();
+
+    org.apache.iceberg.rest.responses.LoadTableResponse mockLoadResp =
+        mock(org.apache.iceberg.rest.responses.LoadTableResponse.class);
+    when(mockLoadResp.metadataLocation()).thenReturn("file:///tmp/v5.metadata.json");
+
+    when(mockClient.get(
+            any(),
+            anyMap(),
+            eq(org.apache.iceberg.rest.responses.LoadTableResponse.class),
+            anyMap(),
+            any()))
+        .thenReturn(mockLoadResp);
+
+    TableIdentifier ident = TableIdentifier.of(org.apache.iceberg.catalog.Namespace.of("ns"), "orders");
+    String location = catalog.resolveTableMetadataLocation(ident, 47L);
+
+    assertThat(location).isEqualTo("file:///tmp/v5.metadata.json");
+
+    @SuppressWarnings("unchecked")
+    ArgumentCaptor<Map<String, String>> queryCaptor = ArgumentCaptor.forClass(Map.class);
+    verify(mockClient)
+        .get(
+            any(),
+            queryCaptor.capture(),
+            eq(org.apache.iceberg.rest.responses.LoadTableResponse.class),
+            anyMap(),
+            any());
+    assertThat(queryCaptor.getValue()).containsEntry("txn_snapshot_id", "47");
+  }
+
   private void initializeCatalog() {
     ConfigResponse configResponse =
         ConfigResponse.builder()

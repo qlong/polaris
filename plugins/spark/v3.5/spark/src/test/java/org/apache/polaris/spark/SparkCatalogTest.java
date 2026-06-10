@@ -20,13 +20,26 @@ package org.apache.polaris.spark;
 
 import static org.apache.iceberg.CatalogProperties.CATALOG_IMPL;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.google.common.collect.Maps;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.iceberg.BaseTable;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
+import org.apache.iceberg.SortOrder;
+import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableMetadataParser;
+import org.apache.iceberg.TableOperations;
+import org.apache.iceberg.hadoop.HadoopFileIO;
+import org.apache.iceberg.types.Types;
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.actions.DeleteReachableFiles;
 import org.apache.iceberg.catalog.Catalog;
@@ -169,6 +182,12 @@ public class SparkCatalogTest {
       catalog.initialize(catalogName, new CaseInsensitiveStringMap(catalogConfig));
       catalog.createNamespace(defaultNS, Maps.newHashMap());
     }
+
+    // loadTable calls txnManager.resolveMetadataLocation; initialize to a no-op mock so
+    // tests that don't exercise the transaction path don't NPE. Individual tests override this.
+    catalog.txnManager = Mockito.mock(TransactionManager.class);
+    Mockito.when(catalog.txnManager.resolveMetadataLocation(Mockito.any(), Mockito.any()))
+        .thenReturn(Optional.empty());
   }
 
   @AfterEach
@@ -622,6 +641,156 @@ public class SparkCatalogTest {
       catalog.purgeTable(icebergIdent);
     }
     assertThat(catalog.listTables(defaultNS).length).isEqualTo(0);
+  }
+
+  // ---------------------------------------------------------------------------
+  // PinnedTableOperations tests (transaction path in loadTable)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Regression test for the "Cannot modify a static table" bug. When a REPEATABLE_READ transaction
+   * is active, loadTable must return a table backed by PinnedTableOperations (which delegates
+   * writes to the live OCC ops), not StaticTableOperations (which throws on any write attempt).
+   */
+  @Test
+  void testLoadTableInTransactionUsesPinnedOpsAllowingWrites() throws Exception {
+    // Create a live table in the in-memory catalog so the live-ops lookup succeeds.
+    Identifier ident = Identifier.of(defaultNS, "txn-write-test");
+    Map<String, String> props = Maps.newHashMap();
+    props.put(TableCatalog.PROP_LOCATION, "file:///tmp/polaris-txn-write-test/");
+    catalog.createTable(ident, defaultSchema, new Transform[0], props);
+
+    // Write a standalone metadata file to disk — this is the "pinned" snapshot the txn sees.
+    Path tempDir = Files.createTempDirectory("polaris-pinned-ops-");
+    String pinnedMetaPath = tempDir.resolve("v1.metadata.json").toUri().toString();
+    Schema pinnedSchema =
+        new Schema(Types.NestedField.required(1, "id", Types.LongType.get()));
+    TableMetadata pinnedMeta =
+        TableMetadata.newTableMetadata(
+            pinnedSchema,
+            PartitionSpec.unpartitioned(),
+            SortOrder.unsorted(),
+            "file:///tmp/polaris-txn-write-test/",
+            Maps.newHashMap());
+    HadoopFileIO fio = new HadoopFileIO(new Configuration());
+    TableMetadataParser.write(pinnedMeta, fio.newOutputFile(pinnedMetaPath));
+
+    // Simulate an active REPEATABLE_READ transaction.
+    Mockito.when(catalog.txnManager.resolveMetadataLocation(Mockito.any(), Mockito.any()))
+        .thenReturn(Optional.of(pinnedMetaPath));
+
+    try (MockedStatic<SparkUtil> su = Mockito.mockStatic(SparkUtil.class)) {
+      su.when(() -> SparkUtil.hadoopConfCatalogOverrides(Mockito.any(), Mockito.any()))
+          .thenReturn(new Configuration());
+
+      Table txnTable = catalog.loadTable(ident);
+
+      assertThat(txnTable).isInstanceOf(SparkTable.class);
+      TableOperations ops = ((BaseTable) ((SparkTable) txnTable).table()).operations();
+
+      // PinnedTableOperations delegates metadataFileLocation to liveOps — no throw.
+      // StaticTableOperations always throws UnsupportedOperationException here.
+      assertThatCode(() -> ops.metadataFileLocation("00001.metadata.json"))
+          .as("metadataFileLocation must not throw; StaticTableOperations would throw here")
+          .doesNotThrowAnyException();
+    }
+  }
+
+  /**
+   * When inside a transaction, current() and refresh() must return the PINNED snapshot's metadata
+   * — not the live table's current state. This guarantees REPEATABLE_READ semantics.
+   */
+  @Test
+  void testLoadTableInTransactionPinsReadsToSpecifiedSnapshot() throws Exception {
+    Identifier ident = Identifier.of(defaultNS, "txn-pin-read-test");
+    Map<String, String> props = Maps.newHashMap();
+    props.put(TableCatalog.PROP_LOCATION, "file:///tmp/polaris-txn-pin-read-test/");
+    // Live table uses defaultSchema (id: long, name: string).
+    catalog.createTable(ident, defaultSchema, new Transform[0], props);
+
+    // Pinned metadata has a completely different schema with a sentinel column.
+    Path tempDir = Files.createTempDirectory("polaris-pinned-read-");
+    String pinnedMetaPath = tempDir.resolve("v1.metadata.json").toUri().toString();
+    Schema pinnedSchema =
+        new Schema(
+            Types.NestedField.required(99, "txn_pinned_sentinel", Types.IntegerType.get()));
+    TableMetadata pinnedMeta =
+        TableMetadata.newTableMetadata(
+            pinnedSchema,
+            PartitionSpec.unpartitioned(),
+            SortOrder.unsorted(),
+            "file:///tmp/polaris-txn-pin-read-test/",
+            Maps.newHashMap());
+    HadoopFileIO fio = new HadoopFileIO(new Configuration());
+    TableMetadataParser.write(pinnedMeta, fio.newOutputFile(pinnedMetaPath));
+
+    Mockito.when(catalog.txnManager.resolveMetadataLocation(Mockito.any(), Mockito.any()))
+        .thenReturn(Optional.of(pinnedMetaPath));
+
+    try (MockedStatic<SparkUtil> su = Mockito.mockStatic(SparkUtil.class)) {
+      su.when(() -> SparkUtil.hadoopConfCatalogOverrides(Mockito.any(), Mockito.any()))
+          .thenReturn(new Configuration());
+
+      Table txnTable = catalog.loadTable(ident);
+      TableOperations ops = ((BaseTable) ((SparkTable) txnTable).table()).operations();
+
+      // Both current() and refresh() must return the PINNED metadata, not the live table's.
+      assertThat(ops.current().schema().findField("txn_pinned_sentinel"))
+          .as("current() must return pinned metadata with sentinel column")
+          .isNotNull();
+      assertThat(ops.refresh().schema().findField("txn_pinned_sentinel"))
+          .as("refresh() must also return pinned metadata — no live re-fetch")
+          .isNotNull();
+      // Live table column must NOT be visible through the pinned view.
+      assertThat(ops.current().schema().findField("name"))
+          .as("live table column 'name' must not bleed into pinned view")
+          .isNull();
+    }
+  }
+
+  /**
+   * When the live table cannot be loaded (e.g., catalog is temporarily unavailable), loadTable
+   * falls back to StaticTableOperations. The fallback is read-only: metadataFileLocation() throws,
+   * matching the original StaticTableOperations contract.
+   */
+  @Test
+  void testLoadTableInTransactionFallsBackToStaticOpsWhenLiveUnreachable() throws Exception {
+    // No table created in the catalog — icebergsSparkCatalog.loadTable will throw NoSuchTableException.
+    Identifier ident = Identifier.of(defaultNS, "txn-fallback-test");
+
+    Path tempDir = Files.createTempDirectory("polaris-fallback-");
+    String pinnedMetaPath = tempDir.resolve("v1.metadata.json").toUri().toString();
+    Schema schema =
+        new Schema(Types.NestedField.required(1, "id", Types.LongType.get()));
+    TableMetadata pinnedMeta =
+        TableMetadata.newTableMetadata(
+            schema,
+            PartitionSpec.unpartitioned(),
+            SortOrder.unsorted(),
+            "file:///tmp/polaris-txn-fallback/",
+            Maps.newHashMap());
+    HadoopFileIO fio = new HadoopFileIO(new Configuration());
+    TableMetadataParser.write(pinnedMeta, fio.newOutputFile(pinnedMetaPath));
+
+    Mockito.when(catalog.txnManager.resolveMetadataLocation(Mockito.any(), Mockito.any()))
+        .thenReturn(Optional.of(pinnedMetaPath));
+
+    try (MockedStatic<SparkUtil> su = Mockito.mockStatic(SparkUtil.class)) {
+      su.when(() -> SparkUtil.hadoopConfCatalogOverrides(Mockito.any(), Mockito.any()))
+          .thenReturn(new Configuration());
+
+      // loadTable: live lookup throws → catch → fall back to StaticTableOperations.
+      Table txnTable = catalog.loadTable(ident);
+
+      assertThat(txnTable).isInstanceOf(SparkTable.class);
+      TableOperations ops = ((BaseTable) ((SparkTable) txnTable).table()).operations();
+
+      // StaticTableOperations throws on write helpers — confirms the fallback path is taken.
+      assertThatThrownBy(() -> ops.metadataFileLocation("00001.metadata.json"))
+          .as("Fallback StaticTableOperations must throw UnsupportedOperationException on writes")
+          .isInstanceOf(UnsupportedOperationException.class)
+          .hasMessageContaining("static table");
+    }
   }
 
   private void createAndValidateGenericTableWithLoad(

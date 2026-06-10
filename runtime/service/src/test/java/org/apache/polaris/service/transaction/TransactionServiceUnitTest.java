@@ -24,7 +24,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import jakarta.ws.rs.BadRequestException;
 import jakarta.ws.rs.ForbiddenException;
 import java.io.InputStream;
-import java.util.List;
 import java.util.UUID;
 import javax.sql.DataSource;
 import org.apache.polaris.persistence.relational.jdbc.DatabaseType;
@@ -108,9 +107,9 @@ class TransactionServiceUnitTest {
   void prepareAndFinalizeCommitTransitionsToCommitted() throws Exception {
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
 
-    List<JdbcTransactionPersistence.SubtransactionRow> subtxns =
-        service.prepareCommit(txn.txnId(), txn.txnToken());
-    assertThat(subtxns).isEmpty();
+    var result = service.prepareCommit(txn.txnId(), txn.txnToken());
+    assertThat(result.direct()).isEmpty();
+    assertThat(result.mergeRetry()).isEmpty();
 
     service.finalizeCommit(txn.txnId());
 
@@ -202,9 +201,9 @@ class TransactionServiceUnitTest {
     service.commitSubtransaction(
         txn.txnId(), subtxn.subtxnId(), subtxn.subtxnToken(), metadataLocation);
 
-    var subtxns = service.prepareCommit(txn.txnId(), txn.txnToken());
-    assertThat(subtxns).hasSize(1);
-    assertThat(subtxns.get(0).status())
+    var result = service.prepareCommit(txn.txnId(), txn.txnToken());
+    assertThat(result.direct()).hasSize(1);
+    assertThat(result.direct().get(0).status())
         .isEqualTo(JdbcTransactionPersistence.SUBTXN_STATUS_SUB_COMMITTED);
   }
 

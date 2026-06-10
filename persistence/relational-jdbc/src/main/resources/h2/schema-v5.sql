@@ -337,6 +337,7 @@ CREATE TABLE IF NOT EXISTS subtransactions (
     table_uuid              TEXT NOT NULL,
     operation               TEXT NOT NULL,
     base_snapshot_id        BIGINT,
+    server_base_metadata_location TEXT,
     assigned_staging_path   TEXT NOT NULL,
     staged_metadata_location TEXT,
     subtxn_token            TEXT NOT NULL,

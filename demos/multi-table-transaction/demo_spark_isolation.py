@@ -44,19 +44,29 @@ import time
 import requests
 
 POLARIS_HOST = os.environ.get("POLARIS_HOST", "http://localhost:8181")
-POLARIS_CATALOG = os.environ.get("POLARIS_CATALOG", "quickstart_catalog")
+POLARIS_CATALOG = os.environ.get("POLARIS_CATALOG", "demo_catalog")
 TOKEN = os.environ.get("POLARIS_TOKEN", "")
 NAMESPACE = os.environ.get("NAMESPACE", "demo_ns")
 TABLE_ORDERS = os.environ.get("TABLE_ORDERS", "orders")
 TABLE_CUSTOMERS = os.environ.get("TABLE_CUSTOMERS", "customers")
 USE_SPARK = os.environ.get("USE_SPARK", "0") == "1"
 
-BASE = f"{POLARIS_HOST}/v1/{POLARIS_CATALOG}"
+POLARIS_BASE = f"{POLARIS_HOST}/api/catalog/polaris/v1/{POLARIS_CATALOG}"
+BASE = f"{POLARIS_HOST}/api/catalog/v1/{POLARIS_CATALOG}"
 HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
 
 def api(method, path, params=None, **kwargs):
     url = f"{BASE}/{path}"
+    resp = getattr(requests, method)(url, headers=HEADERS, params=params, **kwargs)
+    if not resp.ok:
+        print(f"  [ERROR] {method.upper()} {url} → {resp.status_code}: {resp.text}")
+        resp.raise_for_status()
+    return resp.json() if resp.content else {}
+
+
+def polaris_api(method, path, params=None, **kwargs):
+    url = f"{POLARIS_BASE}/{path}"
     resp = getattr(requests, method)(url, headers=HEADERS, params=params, **kwargs)
     if not resp.ok:
         print(f"  [ERROR] {method.upper()} {url} → {resp.status_code}: {resp.text}")
@@ -87,7 +97,7 @@ def resolve_table_at_snapshot(table_name, txn_snapshot_id):
 
 def demo_consistent_reads():
     separator("Step 1: Acquire a consistent read snapshot")
-    snap = api("post", "transaction-snapshots", json={"lease_seconds": 300})
+    snap = polaris_api("post", "transaction-snapshots", json={"lease_seconds": 300})
     txn_snapshot_id = snap["txn_snapshot_id"]
     print(f"  txn_snapshot_id={txn_snapshot_id}  xmin={snap['xmin']}  xmax={snap['xmax']}")
     print(f"  expires={snap['expires_at']}")
@@ -118,7 +128,7 @@ def demo_consistent_reads():
         print("  No torn reads possible even if a writer commits between the two read calls. ✓")
 
     separator("Step 4: Release snapshot (cleanup)")
-    api("delete", f"transaction-snapshots/{txn_snapshot_id}")
+    polaris_api("delete", f"transaction-snapshots/{txn_snapshot_id}")
     print(f"  txn_snapshot_id={txn_snapshot_id} released ✓")
 
 
@@ -133,9 +143,16 @@ def _read_with_spark(orders_iceberg_snap, customers_iceberg_snap):
     spark = (
         SparkSession.builder.appName("polaris-snapshot-demo")
         .config("spark.sql.catalog.polaris", "org.apache.iceberg.spark.SparkCatalog")
-        .config("spark.sql.catalog.polaris.type", "rest")
-        .config("spark.sql.catalog.polaris.uri", POLARIS_HOST)
-        .config("spark.sql.catalog.polaris.token", TOKEN)
+        .config("spark.sql.catalog.polaris.catalog-impl", "org.apache.iceberg.rest.RESTCatalog")
+        .config("spark.sql.catalog.polaris.uri", f"{POLARIS_HOST}/api/catalog")
+        .config("spark.sql.catalog.polaris.warehouse", POLARIS_CATALOG)
+        .config("spark.sql.catalog.polaris.credential", "root:s3cr3t")
+        .config("spark.sql.catalog.polaris.scope", "PRINCIPAL_ROLE:ALL")
+        .config("spark.sql.catalog.polaris.token-refresh-enabled", "true")
+        .config(
+            "spark.sql.extensions",
+            "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+        )
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")

@@ -23,13 +23,12 @@ import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.SecurityContext;
 import java.sql.SQLException;
-import java.util.Date;
-import java.util.List;
-import java.util.Locale;
 import java.util.Arrays;
+import java.util.List;
+import java.util.Date;
+import java.util.Locale;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.util.LocationUtil;
 import org.apache.iceberg.rest.responses.ErrorResponse;
 import org.apache.iceberg.util.LocationUtil;
 import org.apache.polaris.core.auth.PolarisPrincipal;
@@ -47,7 +46,9 @@ import org.apache.polaris.service.transaction.LockManager.LockWaitTimeoutExcepti
 import org.apache.polaris.service.transaction.TransactionService;
 import org.apache.polaris.service.types.BeginTransactionRequest;
 import org.apache.polaris.service.types.CommitSubtransactionRequest;
+import org.apache.polaris.service.types.CommitTransactionRequest;
 import org.apache.polaris.service.types.CreateSubtransactionRequest;
+import org.apache.polaris.service.types.StagedTableCommit;
 import org.apache.polaris.service.types.CreateTransactionSnapshotRequest;
 import org.apache.polaris.service.types.LockMode;
 import org.apache.polaris.service.types.RenewLeaseRequest;
@@ -242,6 +243,7 @@ public class TransactionCatalogAdapter
       String prefix,
       Long txnId,
       String xTxnToken,
+      CommitTransactionRequest commitTransactionRequest,
       RealmContext realmContext,
       SecurityContext securityContext) {
     if (xTxnToken == null || xTxnToken.isBlank()) {
@@ -254,12 +256,63 @@ public class TransactionCatalogAdapter
                   .build())
           .build();
     }
+    PolarisPrincipal principal = validatePrincipal(securityContext);
+    String catalogName = prefixParser.prefixToCatalogName(prefix);
+
+    boolean inlinePath =
+        commitTransactionRequest != null
+            && commitTransactionRequest.getTables() != null
+            && !commitTransactionRequest.getTables().isEmpty();
+
     try {
       TransactionService txnService = openTxnService(securityContext, prefix);
-      List<SubtransactionRow> toFinalize = txnService.prepareCommit(txnId, xTxnToken);
-      LOGGER.info("Committing txn={} with {} subtransaction(s)", txnId, toFinalize.size());
+      IcebergCatalogHandler handler = handlerFactory.createHandler(catalogName, principal);
+      try {
+        handler.listNamespaces(org.apache.iceberg.catalog.Namespace.of());
+        if (inlinePath) {
+          // Use Case 1: single-session inline staged writes
+          List<TransactionService.StagedTableInfo> inputTables =
+              commitTransactionRequest.getTables().stream()
+                  .map(
+                      t ->
+                          new TransactionService.StagedTableInfo(
+                              t.getTableIdentifier(),
+                              t.getStagedMetadataLocation(),
+                              null,
+                              t.getOperation() != null ? t.getOperation().name() : "APPEND"))
+                  .toList();
+          TransactionService.PrepareInlineResult result =
+              txnService.prepareInlineCommit(txnId, xTxnToken, inputTables);
+          LOGGER.info(
+              "Committing txn={} (inline): {} direct, {} merge-and-retry",
+              txnId, result.direct().size(), result.mergeRetry().size());
+          handler.finalizeInlineTables(
+              result.direct(), result.mergeRetry(), handlerFactory, catalogName, principal);
+        } else {
+          // Use Case 2: multi-app subtransaction path
+          TransactionService.PrepareCommitResult result =
+              txnService.prepareCommit(txnId, xTxnToken);
+          LOGGER.info(
+              "Committing txn={} (subtxn): {} direct, {} merge-and-retry",
+              txnId, result.direct().size(), result.mergeRetry().size());
+          handler.finalizeExtensionTransaction(result.direct(), result.mergeRetry());
+        }
+      } finally {
+        closeQuietly(handler);
+      }
+
       txnService.finalizeCommit(txnId);
       return Response.noContent().build();
+    } catch (TransactionService.SerializationFailureException e) {
+      LOGGER.info("Serialization failure for txn={}: {}", txnId, e.getMessage());
+      return Response.status(409)
+          .entity(
+              ErrorResponse.builder()
+                  .responseCode(409)
+                  .withType("SerializationFailure")
+                  .withMessage(e.getMessage())
+                  .build())
+          .build();
     } catch (jakarta.ws.rs.BadRequestException e) {
       return Response.status(400).entity(simpleError(e.getMessage())).build();
     } catch (jakarta.ws.rs.ForbiddenException e) {
@@ -268,6 +321,13 @@ public class TransactionCatalogAdapter
       return notFound(e.getMessage());
     } catch (SQLException e) {
       return serverError("commitTransaction failed", e);
+    }
+  }
+
+  private static void closeQuietly(IcebergCatalogHandler handler) {
+    try {
+      handler.close();
+    } catch (Exception ignored) {
     }
   }
 

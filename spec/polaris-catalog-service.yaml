@@ -187,6 +187,9 @@ paths:
   /polaris/v1/{prefix}/transactions/{txn-id}/renew:
     $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transactions~1{txn-id}~1renew'
 
+  /polaris/v1/{prefix}/transactions/subtransactions/{subtxn-id}:
+    $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transactions~1subtransactions~1{subtxn-id}'
+
   /polaris/v1/{prefix}/transactions/{txn-id}/subtransactions:
     $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transactions~1{txn-id}~1subtransactions'
 

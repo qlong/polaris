@@ -23,6 +23,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import jakarta.ws.rs.BadRequestException;
 import jakarta.ws.rs.ForbiddenException;
+import jakarta.ws.rs.NotFoundException;
 import java.io.InputStream;
 import java.util.UUID;
 import javax.sql.DataSource;
@@ -216,6 +217,40 @@ class TransactionServiceUnitTest {
     assertThatThrownBy(() -> service.prepareCommit(txn.txnId(), txn.txnToken()))
         .isInstanceOf(BadRequestException.class)
         .hasMessageContaining("IN_PROGRESS");
+  }
+
+  @Test
+  void getSubtransactionReturnsParentTxnAndStagingPath() throws Exception {
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
+    var subtxn =
+        service.createSubtransaction(
+            txn.txnId(), txn.txnToken(), "ns.orders", "APPEND", null, null, 3600, TABLE_METADATA_DIR);
+
+    var info = service.getSubtransaction(subtxn.subtxnId(), subtxn.subtxnToken());
+
+    assertThat(info.txnId()).isEqualTo(txn.txnId());
+    assertThat(info.txnSnapshotId()).isEqualTo(txn.txnSnapshotId());
+    assertThat(info.assignedStagingPath()).isEqualTo(subtxn.assignedStagingPath());
+    assertThat(info.tableUuid()).isEqualTo("ns.orders");
+  }
+
+  @Test
+  void getSubtransactionWithWrongTokenThrowsForbidden() throws Exception {
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
+    var subtxn =
+        service.createSubtransaction(
+            txn.txnId(), txn.txnToken(), "ns.orders", "APPEND", null, null, 3600, TABLE_METADATA_DIR);
+
+    assertThatThrownBy(() -> service.getSubtransaction(subtxn.subtxnId(), "wrong-token"))
+        .isInstanceOf(ForbiddenException.class)
+        .hasMessageContaining("subtxn_token");
+  }
+
+  @Test
+  void getSubtransactionWithUnknownIdThrowsNotFound() {
+    assertThatThrownBy(() -> service.getSubtransaction(99999L, "any-token"))
+        .isInstanceOf(NotFoundException.class)
+        .hasMessageContaining("99999");
   }
 
   // ---------------------------------------------------------------------------

@@ -363,6 +363,23 @@ public class TransactionService {
     persistence.markSubtransactionAborted(subtxnId);
   }
 
+  /**
+   * Looks up a subtransaction by ID + token. Returns the parent transaction's ID,
+   * snapshot ID (REPEATABLE_READ only), the assigned staging path, and the table UUID.
+   * Used by the worker's {@code BEGIN SUBTRANSACTION} command to avoid passing those
+   * values through the orchestrator's SQL output.
+   */
+  public record SubtransactionInfo(
+      long txnId, Long txnSnapshotId, String assignedStagingPath, String tableUuid) {}
+
+  public SubtransactionInfo getSubtransaction(long subtxnId, String subtxnToken)
+      throws SQLException {
+    SubtransactionRow subtxn = validateSubtxnToken(subtxnId, subtxnToken);
+    TransactionRow txn = getTransaction(subtxn.parentTxnId());
+    return new SubtransactionInfo(
+        txn.txnId(), txn.txnSnapshotId(), subtxn.assignedStagingPath(), subtxn.tableUuid());
+  }
+
   public SubtransactionRow renewSubtransaction(
       long txnId, long subtxnId, String subtxnToken, int leaseSeconds) throws SQLException {
     validateSubtxnToken(subtxnId, subtxnToken);

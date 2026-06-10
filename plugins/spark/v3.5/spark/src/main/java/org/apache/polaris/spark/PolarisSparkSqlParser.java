@@ -155,55 +155,56 @@ public class PolarisSparkSqlParser implements ParserInterface {
       String msg =
           "Subtransaction created  subtxn_id="
               + resp.subtxnId()
-              + "  subtxn_token="
+              + ", subtxn_token="
               + resp.subtxnToken()
-              + "  staging_path="
+              + ", staging_path="
               + resp.assignedStagingPath();
       return delegate.parsePlan(statusSql(msg));
     }
 
-    // BEGIN WORKER SUBTRANSACTION <table> TXN_ID=<n>, SUBTXN_ID=<n>,
-    //   SUBTXN_TOKEN='<s>', SNAPSHOT_ID=<n>, STAGING_PATH='<s>'
-    if (normalized.startsWith("BEGIN WORKER SUBTRANSACTION ")) {
+    // BEGIN SUBTRANSACTION <table> SUBTXN_ID=<n>, SUBTXN_TOKEN='<s>'
+    //
+    // Minimal worker syntax: only subtxn_id and subtxn_token are required.
+    // The server fetches txn_id, txn_snapshot_id, and staging_path automatically.
+    // Parameter names are case-insensitive. Whitespace (spaces, tabs, newlines) and commas
+    // between parameters are all treated as equivalent separators.
+    if (normalized.startsWith("BEGIN SUBTRANSACTION ")) {
       SparkSession spark = SparkSession.active();
-      // Use the original sql (not normalized) so quoted string values survive
+      // rawRest preserves quoted string values exactly.
       String rawRest = sql.trim();
       if (rawRest.endsWith(";")) rawRest = rawRest.substring(0, rawRest.length() - 1).trim();
-      String rawUpper = rawRest.toUpperCase(Locale.ROOT);
-      int after = "BEGIN WORKER SUBTRANSACTION ".length();
-      // Extract table name (ends at first whitespace before TXN_ID=).
-      // Search for " TXN_ID=" (space prefix) to avoid matching inside "SUBTXN_ID=".
-      int txnIdIdx = rawUpper.indexOf(" TXN_ID=");
-      if (txnIdIdx < 0) {
-        throw new IllegalArgumentException(
-            "BEGIN WORKER SUBTRANSACTION: missing TXN_ID=<n>");
+
+      // normUpper: uppercase + collapse any run of [,\s]+ to a single space so that
+      // newlines, tabs, and comma-separated params all look the same to indexOf.
+      String normUpper = rawRest.toUpperCase(Locale.ROOT).replaceAll("[,\\s]+", " ").trim();
+
+      // normRest mirrors normUpper but preserves original case (for quoted value extraction).
+      String normRest = rawRest.replaceAll("[,\\s]+", " ").trim();
+
+      int after = "BEGIN SUBTRANSACTION ".length();
+      // Extract table name — everything between the command prefix and " SUBTXN_ID=".
+      int subtxnIdIdx = normUpper.indexOf(" SUBTXN_ID=");
+      if (subtxnIdIdx < 0) {
+        throw new IllegalArgumentException("BEGIN SUBTRANSACTION: missing SUBTXN_ID=<n>");
       }
-      String tableStr = rawRest.substring(after, txnIdIdx).trim();
+      String tableStr = normRest.substring(after, subtxnIdIdx).trim();
       if (tableStr.endsWith(",")) tableStr = tableStr.substring(0, tableStr.length() - 1).trim();
-      // Preserve original case — identToKey uses this for the lock guard in PinnedTableOperations,
-      // which must match the lowercase key produced from the Spark catalog's loadTable ident.
       org.apache.iceberg.catalog.TableIdentifier ident = parseTableIdentifierPolaris(tableStr);
 
-      long txnId = parseLongParam(rawRest, rawUpper, "TXN_ID");
-      long subtxnId = parseLongParam(rawRest, rawUpper, "SUBTXN_ID");
-      String subtxnToken = parseStringParam(rawRest, rawUpper, "SUBTXN_TOKEN");
-      long snapshotId = parseLongParam(rawRest, rawUpper, "SNAPSHOT_ID");
-      String stagingPath = parseStringParam(rawRest, rawUpper, "STAGING_PATH");
+      long subtxnId = parseLongParam(normRest, normUpper, "SUBTXN_ID");
+      String subtxnToken = parseStringParam(normRest, normUpper, "SUBTXN_TOKEN");
       String operation = "APPEND";
-      int opIdx = rawUpper.indexOf("OPERATION=");
+      int opIdx = normUpper.indexOf(" OPERATION=");
       if (opIdx >= 0) {
-        String opToken = rawRest.substring(opIdx + "OPERATION=".length()).trim();
-        if (opToken.startsWith(",")) opToken = opToken.substring(1).trim();
-        int end = opToken.indexOf(',');
+        String opToken = normRest.substring(opIdx + " OPERATION=".length()).trim();
+        int end = opToken.indexOf(' ');
         opToken = (end >= 0 ? opToken.substring(0, end) : opToken).trim().toUpperCase(Locale.ROOT);
         if (opToken.equals("ROW_DELTA")) operation = "ROW_DELTA";
       }
 
-      txnManager(spark)
-          .beginWorkerSubtransaction(
-              spark, txnId, snapshotId, subtxnId, subtxnToken, ident, stagingPath, operation);
+      txnManager(spark).beginWorkerSubtransaction(spark, subtxnId, subtxnToken, ident, operation);
       return delegate.parsePlan(
-          statusSql("Worker subtransaction started  txn_id=" + txnId + "  subtxn_id=" + subtxnId));
+          statusSql("Worker subtransaction started, subtxn_id=" + subtxnId));
     }
 
     // -------------------------------------------------------------------------
@@ -282,36 +283,45 @@ public class PolarisSparkSqlParser implements ParserInterface {
     String keyEq = " " + key + "=";
     int idx = upperSql.indexOf(keyEq);
     if (idx < 0) {
-      throw new IllegalArgumentException("BEGIN WORKER SUBTRANSACTION: missing " + key + "=<n>");
+      throw new IllegalArgumentException("BEGIN SUBTRANSACTION: missing " + key + "=<n>");
     }
     String rest = sql.substring(idx + keyEq.length()).trim();
     Matcher m = LEADING_DIGITS.matcher(rest);
     if (!m.find()) {
       throw new IllegalArgumentException(
-          "BEGIN WORKER SUBTRANSACTION: expected integer after " + key + "=");
+          "BEGIN SUBTRANSACTION: expected integer after " + key + "=");
     }
     return Long.parseLong(m.group(1));
   }
 
   /**
-   * Extracts a single-quoted string value from a key='value' token.
-   * Searches case-insensitively using {@code upperSql} for the key position.
+   * Extracts a string value from a {@code KEY='value'} or {@code KEY=value} token.
+   * The key search is case-insensitive (via {@code upperSql}). Single quotes are optional;
+   * an unquoted value ends at the next space.
    */
   private static String parseStringParam(String sql, String upperSql, String key) {
-    // Use " KEY='" (space prefix) to avoid matching subkey collisions.
-    String keyEq = " " + key + "='";
-    int idx = upperSql.indexOf(keyEq);
-    if (idx < 0) {
-      throw new IllegalArgumentException(
-          "BEGIN WORKER SUBTRANSACTION: missing " + key + "='<value>'");
+    // Try quoted form first: " KEY='"
+    String keyEqQuoted = " " + key + "='";
+    int idx = upperSql.indexOf(keyEqQuoted);
+    if (idx >= 0) {
+      int start = idx + keyEqQuoted.length();
+      int end = sql.indexOf('\'', start);
+      if (end < 0) {
+        throw new IllegalArgumentException(
+            "BEGIN SUBTRANSACTION: unterminated quote for " + key);
+      }
+      return sql.substring(start, end);
     }
-    int start = idx + keyEq.length();
-    int end = sql.indexOf('\'', start);
-    if (end < 0) {
+    // Fall back to unquoted form: " KEY=value" (value ends at next space)
+    String keyEq = " " + key + "=";
+    int idx2 = upperSql.indexOf(keyEq);
+    if (idx2 < 0) {
       throw new IllegalArgumentException(
-          "BEGIN WORKER SUBTRANSACTION: unterminated quote for " + key);
+          "BEGIN SUBTRANSACTION: missing " + key + "=<value>");
     }
-    return sql.substring(start, end);
+    int start = idx2 + keyEq.length();
+    int end = sql.indexOf(' ', start);
+    return end < 0 ? sql.substring(start) : sql.substring(start, end);
   }
 
   /** Returns a SELECT statement that produces a one-row status result. */

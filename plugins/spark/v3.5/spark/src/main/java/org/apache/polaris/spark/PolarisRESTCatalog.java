@@ -48,6 +48,7 @@ import org.apache.iceberg.util.PropertyUtil;
 import org.apache.polaris.core.rest.PolarisEndpoints;
 import org.apache.polaris.core.rest.PolarisResourcePaths;
 import org.apache.polaris.spark.rest.BeginTransactionRESTRequest;
+import org.apache.polaris.spark.rest.GetSubtransactionRESTResponse;
 import org.apache.polaris.spark.rest.CommitSubtransactionRESTRequest;
 import org.apache.polaris.spark.rest.CommitTransactionRESTRequest;
 import org.apache.polaris.spark.rest.CreateGenericTableRESTRequest;
@@ -318,6 +319,37 @@ public class PolarisRESTCatalog implements PolarisCatalog, Closeable {
             pathGenerator.subtransactionCommit(txnId, subtxnId),
             new CommitSubtransactionRESTRequest(stagedMetadataLocation),
             TransactionRESTResponse.class,
+            Map.of("X-Subtxn-Token", subtxnToken),
+            ErrorHandlers.defaultErrorHandler());
+  }
+
+  /**
+   * POST /polaris/v1/{prefix}/transactions/{txnId}/subtransactions/{subtxnId}/abort — marks the
+   * subtransaction as aborted so the orchestrator can commit without it. Requires X-Subtxn-Token.
+   */
+  public void abortSubtransaction(long txnId, long subtxnId, String subtxnToken) {
+    restClient
+        .withAuthSession(this.catalogAuth)
+        .post(
+            pathGenerator.subtransactionAbort(txnId, subtxnId),
+            null,
+            TransactionRESTResponse.class,
+            Map.of("X-Subtxn-Token", subtxnToken),
+            ErrorHandlers.defaultErrorHandler());
+  }
+
+  /**
+   * GET /polaris/v1/{prefix}/transactions/subtransactions/{subtxnId} — looks up a subtransaction by
+   * ID and validates ownership via the subtxn_token. Returns the parent txn_id,
+   * txn_snapshot_id, assigned_staging_path, and table_uuid needed by the worker to enter worker mode.
+   */
+  public GetSubtransactionRESTResponse getSubtransaction(long subtxnId, String subtxnToken) {
+    return restClient
+        .withAuthSession(this.catalogAuth)
+        .get(
+            pathGenerator.subtransactionGet(subtxnId),
+            Map.of(),
+            GetSubtransactionRESTResponse.class,
             Map.of("X-Subtxn-Token", subtxnToken),
             ErrorHandlers.defaultErrorHandler());
   }

@@ -18,11 +18,8 @@
  */
 package org.apache.polaris.spark;
 
-import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -311,35 +308,71 @@ public class PolarisSparkSqlParserTest {
   }
 
   // -------------------------------------------------------------------------
-  // BEGIN WORKER SUBTRANSACTION
+  // BEGIN SUBTRANSACTION
   // -------------------------------------------------------------------------
 
   @Test
-  public void testBeginWorkerSubtransactionParsesAllParams() throws Exception {
+  public void testBeginSubtransactionParsesMinimalParams() throws Exception {
     try (org.mockito.MockedStatic<SparkSession> staticMock =
         org.mockito.Mockito.mockStatic(SparkSession.class)) {
       staticMock.when(SparkSession::active).thenReturn(mockSpark);
 
       parser.parsePlan(
-          "BEGIN WORKER SUBTRANSACTION ns.orders TXN_ID=42, SUBTXN_ID=100,"
-              + " SUBTXN_TOKEN='secret-tok', SNAPSHOT_ID=7,"
-              + " STAGING_PATH='s3://bucket/staging.json'");
+          "BEGIN SUBTRANSACTION ns.orders SUBTXN_ID=100, SUBTXN_TOKEN='secret-tok'");
 
       verify(mockTxnManager)
           .beginWorkerSubtransaction(
               eq(mockSpark),
-              eq(42L),
-              eq(7L),
               eq(100L),
               eq("secret-tok"),
               eq(TableIdentifier.of(Namespace.of("ns"), "orders")),
-              eq("s3://bucket/staging.json"),
               eq("APPEND"));
     }
   }
 
   @Test
-  public void testBeginWorkerSubtransactionMissingTxnIdThrows() throws Exception {
+  public void testBeginSubtransactionNewlinesAndMixedCase() throws Exception {
+    try (org.mockito.MockedStatic<SparkSession> staticMock =
+        org.mockito.Mockito.mockStatic(SparkSession.class)) {
+      staticMock.when(SparkSession::active).thenReturn(mockSpark);
+
+      // newlines between params, lowercase param names
+      parser.parsePlan(
+          "BEGIN SUBTRANSACTION ns.orders\n"
+              + "  subtxn_id=100,\n"
+              + "  subtxn_token='secret-tok'");
+
+      verify(mockTxnManager)
+          .beginWorkerSubtransaction(
+              eq(mockSpark),
+              eq(100L),
+              eq("secret-tok"),
+              eq(TableIdentifier.of(Namespace.of("ns"), "orders")),
+              eq("APPEND"));
+    }
+  }
+
+  @Test
+  public void testBeginSubtransactionTabsAndDoubleSpaces() throws Exception {
+    try (org.mockito.MockedStatic<SparkSession> staticMock =
+        org.mockito.Mockito.mockStatic(SparkSession.class)) {
+      staticMock.when(SparkSession::active).thenReturn(mockSpark);
+
+      parser.parsePlan(
+          "BEGIN SUBTRANSACTION ns.orders\t" + "SUBTXN_ID=100  SUBTXN_TOKEN='tok'");
+
+      verify(mockTxnManager)
+          .beginWorkerSubtransaction(
+              eq(mockSpark),
+              eq(100L),
+              eq("tok"),
+              eq(TableIdentifier.of(Namespace.of("ns"), "orders")),
+              eq("APPEND"));
+    }
+  }
+
+  @Test
+  public void testBeginSubtransactionMissingSubtxnIdThrows() throws Exception {
     try (org.mockito.MockedStatic<SparkSession> staticMock =
         org.mockito.Mockito.mockStatic(SparkSession.class)) {
       staticMock.when(SparkSession::active).thenReturn(mockSpark);
@@ -347,10 +380,9 @@ public class PolarisSparkSqlParserTest {
       assertThatThrownBy(
               () ->
                   parser.parsePlan(
-                      "BEGIN WORKER SUBTRANSACTION ns.orders SUBTXN_ID=100"
-                          + " SUBTXN_TOKEN='tok' SNAPSHOT_ID=7 STAGING_PATH='s3://p'"))
+                      "BEGIN SUBTRANSACTION ns.orders SUBTXN_TOKEN='tok'"))
           .isInstanceOf(IllegalArgumentException.class)
-          .hasMessageContaining("TXN_ID");
+          .hasMessageContaining("SUBTXN_ID");
     }
   }
 

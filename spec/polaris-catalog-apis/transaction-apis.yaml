@@ -363,6 +363,50 @@ paths:
   # ---------------------------------------------------------------------------
   # Subtransactions: per-table units of work inside a transaction
   # ---------------------------------------------------------------------------
+  /polaris/v1/{prefix}/transactions/subtransactions/{subtxn-id}:
+    parameters:
+      - $ref: '../iceberg-rest-catalog-open-api.yaml#/components/parameters/prefix'
+      - name: subtxn-id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+
+    get:
+      tags:
+        - Transaction API
+      summary: Get a subtransaction by ID
+      description: >
+        Looks up a subtransaction by its ID and validates ownership via X-Subtxn-Token.
+        Returns the parent txn_id, txn_snapshot_id, assigned_staging_path, and table_uuid
+        so that a worker session can enter worker mode without the orchestrator passing
+        those values explicitly.
+      operationId: getSubtransaction
+      parameters:
+        - name: X-Subtxn-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        200:
+          description: Subtransaction details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetSubtransactionResponse'
+        401:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/UnauthorizedResponse'
+        403:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ForbiddenResponse'
+        404:
+          description: Not Found - The requested resource does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '../iceberg-rest-catalog-open-api.yaml#/components/schemas/IcebergErrorResponse'
+
   /polaris/v1/{prefix}/transactions/{txn-id}/subtransactions:
     parameters:
       - $ref: '../iceberg-rest-catalog-open-api.yaml#/components/parameters/prefix'
@@ -793,3 +837,25 @@ components:
         lease_seconds:
           type: integer
           default: 3600
+
+    GetSubtransactionResponse:
+      type: object
+      required:
+        - txn_id
+        - assigned_staging_path
+        - table_uuid
+      properties:
+        txn_id:
+          type: integer
+          format: int64
+          description: Parent transaction ID
+        txn_snapshot_id:
+          type: integer
+          format: int64
+          description: Pinned read snapshot ID (null for READ_COMMITTED transactions)
+        assigned_staging_path:
+          type: string
+          description: Server-assigned path for the worker to write staged metadata
+        table_uuid:
+          type: string
+          description: Fully-qualified table identifier, e.g. 'ns.orders'

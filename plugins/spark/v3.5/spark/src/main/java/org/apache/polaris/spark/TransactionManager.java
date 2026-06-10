@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.Optional;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.polaris.spark.rest.CommitTransactionRESTRequest;
+import org.apache.polaris.spark.rest.GetSubtransactionRESTResponse;
 import org.apache.polaris.spark.rest.StagedTableCommitRESTRequest;
 import org.apache.polaris.spark.rest.SubtransactionRESTResponse;
 import org.apache.polaris.spark.rest.TransactionRESTResponse;
@@ -106,10 +107,6 @@ public class TransactionManager {
           "Transaction already in progress. COMMIT or ROLLBACK first.");
     }
     setConf(spark, CONF_PENDING_ISOLATION, isolation);
-    System.out.println(
-        "Transaction pending — isolation: "
-            + isolation
-            + "  (transaction starts at first query)");
   }
 
   /**
@@ -127,7 +124,6 @@ public class TransactionManager {
       throw new IllegalStateException("No transaction in progress. Use BEGIN first.");
     }
     setConf(spark, CONF_PENDING_ISOLATION, isolation);
-    System.out.println("Isolation level set to: " + isolation);
   }
 
   /** Called by CommitTransactionCommand. */
@@ -204,8 +200,7 @@ public class TransactionManager {
    * </ul>
    */
   public Optional<String> resolveMetadataLocation(SparkSession spark, TableIdentifier ident) {
-    String pendingIsolation = getConf(spark, CONF_PENDING_ISOLATION);
-    if (pendingIsolation == null) {
+    if (getConf(spark, CONF_PENDING_ISOLATION) == null) {
       return Optional.empty();
     }
 
@@ -216,25 +211,7 @@ public class TransactionManager {
       return staged;
     }
 
-    String txnId = getConf(spark, CONF_TXN_ID);
-    if (txnId == null) {
-      // PENDING → ACTIVE: call beginTransaction now
-      TransactionRESTResponse txn =
-          restCatalog.beginTransaction(pendingIsolation, DEFAULT_LEASE_SECONDS);
-      setConf(spark, CONF_TXN_ID, String.valueOf(txn.txnId()));
-      setConf(spark, CONF_TXN_TOKEN, txn.txnToken());
-      Long snapId = txn.txnSnapshotId();
-      if (snapId != null) {
-        setConf(spark, CONF_TXN_SNAPSHOT_ID, String.valueOf(snapId));
-      }
-      System.out.println(
-          "Transaction started  txn_id="
-              + txn.txnId()
-              + "  txn_token="
-              + txn.txnToken()
-              + (snapId != null ? "  txn_snapshot_id=" + snapId : "  (READ_COMMITTED)"));
-      txnId = getConf(spark, CONF_TXN_ID);
-    }
+    ensureTransactionStarted(spark);
 
     String snapIdStr = getConf(spark, CONF_TXN_SNAPSHOT_ID);
     if (snapIdStr == null) {
@@ -251,6 +228,43 @@ public class TransactionManager {
         snapId,
         metadataLocation);
     return Optional.of(metadataLocation);
+  }
+
+  /**
+   * Transitions the session from PENDING to ACTIVE by firing the {@code beginTransaction} REST
+   * call, storing the returned txn_id / txn_token / txn_snapshot_id in Spark conf, and printing
+   * the "Transaction started" status line.
+   *
+   * <p>This is a no-op if the session is already ACTIVE (txn_id already set). Called by both
+   * {@link #resolveMetadataLocation} (first {@code loadTable}) and {@link
+   * #createSubtransactionForOrchestrator} (first {@code CREATE SUBTRANSACTION FOR}), so that the
+   * snapshot is pinned at the first real statement — consistent with PostgreSQL REPEATABLE READ
+   * semantics.
+   *
+   * @throws IllegalStateException if no transaction is in progress (not even PENDING)
+   */
+  private void ensureTransactionStarted(SparkSession spark) {
+    String pendingIsolation = getConf(spark, CONF_PENDING_ISOLATION);
+    if (pendingIsolation == null) {
+      throw new IllegalStateException("No active transaction. Use BEGIN first.");
+    }
+    if (getConf(spark, CONF_TXN_ID) != null) {
+      return; // already ACTIVE
+    }
+    TransactionRESTResponse txn =
+        restCatalog.beginTransaction(pendingIsolation, DEFAULT_LEASE_SECONDS);
+    setConf(spark, CONF_TXN_ID, String.valueOf(txn.txnId()));
+    setConf(spark, CONF_TXN_TOKEN, txn.txnToken());
+    Long snapId = txn.txnSnapshotId();
+    if (snapId != null) {
+      setConf(spark, CONF_TXN_SNAPSHOT_ID, String.valueOf(snapId));
+    }
+    System.out.println(
+        "Transaction started  txn_id="
+            + txn.txnId()
+            + ", txn_token="
+            + txn.txnToken()
+            + (snapId != null ? ", txn_snapshot_id=" + snapId : ", (READ_COMMITTED)"));
   }
 
   // -------------------------------------------------------------------------
@@ -295,26 +309,27 @@ public class TransactionManager {
   // -------------------------------------------------------------------------
 
   /**
-   * Enters worker mode directly into ACTIVE state using credentials provided by the orchestrator.
-   * Skips beginTransaction REST call. Pre-populates the staged path with the server-allocated path.
+   * Enters worker mode: fetches txn_id, txn_snapshot_id, and assigned_staging_path from the server
+   * using only the subtxn_id and subtxn_token. The worker does not need the orchestrator to pass
+   * those values explicitly.
    */
   public void beginWorkerSubtransaction(
       SparkSession spark,
-      long txnId,
-      long txnSnapshotId,
       long subtxnId,
       String subtxnToken,
       TableIdentifier table,
-      String stagingPath,
       String operation) {
     String pending = getConf(spark, CONF_PENDING_ISOLATION);
     if (pending != null) {
       throw new IllegalStateException(
           "Transaction already in progress. COMMIT or ROLLBACK first.");
     }
+    GetSubtransactionRESTResponse info = restCatalog.getSubtransaction(subtxnId, subtxnToken);
     setConf(spark, CONF_PENDING_ISOLATION, DEFAULT_ISOLATION);
-    setConf(spark, CONF_TXN_ID, String.valueOf(txnId));
-    setConf(spark, CONF_TXN_SNAPSHOT_ID, String.valueOf(txnSnapshotId));
+    setConf(spark, CONF_TXN_ID, String.valueOf(info.txnId()));
+    if (info.txnSnapshotId() != null) {
+      setConf(spark, CONF_TXN_SNAPSHOT_ID, String.valueOf(info.txnSnapshotId()));
+    }
     setConf(spark, CONF_WORKER_SUBTXN_ID, String.valueOf(subtxnId));
     setConf(spark, CONF_WORKER_SUBTXN_TOKEN, subtxnToken);
     setConf(spark, CONF_WORKER_TABLE, identToKey(table));
@@ -323,9 +338,7 @@ public class TransactionManager {
     // in resolveMetadataLocation before any metadata file has been written, causing loadTable
     // to attempt reading a non-existent path.  stageWrite is called by PinnedTableOperations
     // after the file is written.
-    setConf(spark, CONF_WORKER_STAGING_PATH, stagingPath);
-    System.out.println(
-        "Worker subtransaction started  txn_id=" + txnId + "  subtxn_id=" + subtxnId);
+    setConf(spark, CONF_WORKER_STAGING_PATH, info.assignedStagingPath());
   }
 
   /**
@@ -350,7 +363,6 @@ public class TransactionManager {
     try {
       restCatalog.commitSubtransaction(
           Long.parseLong(txnId), Long.parseLong(subtxnIdStr), subtxnToken, stagedPath);
-      System.out.println("Subtransaction committed  (subtxn_id=" + subtxnIdStr + ")");
     } finally {
       clearConf(spark);
     }
@@ -362,21 +374,26 @@ public class TransactionManager {
     if (subtxnIdStr == null) {
       throw new IllegalStateException("Not in worker mode.");
     }
-    System.out.println("Worker subtransaction rolled back  (subtxn_id=" + subtxnIdStr + ")");
-    clearConf(spark);
+    String subtxnToken = getConf(spark, CONF_WORKER_SUBTXN_TOKEN);
+    String txnId = getConf(spark, CONF_TXN_ID);
+    try {
+      restCatalog.abortSubtransaction(Long.parseLong(txnId), Long.parseLong(subtxnIdStr), subtxnToken);
+    } finally {
+      clearConf(spark);
+    }
   }
 
   /**
-   * Called by orchestrator SQL: {@code CREATE SUBTRANSACTION FOR <table>}. Allocates a
-   * server-side staging path and returns the credentials to be passed to the worker cluster.
+   * Called by orchestrator SQL: {@code CREATE SUBTRANSACTION FOR <table>}. If the session is still
+   * PENDING, fires {@code beginTransaction} REST first (snapshot pinned at the first statement,
+   * consistent with PostgreSQL REPEATABLE READ semantics — no dummy SELECT required). Then
+   * allocates a server-side staging path and returns the subtransaction credentials.
    */
   public SubtransactionRESTResponse createSubtransactionForOrchestrator(
       SparkSession spark, TableIdentifier table, String operation) {
+    ensureTransactionStarted(spark); // PENDING → ACTIVE if needed; throws if no transaction
     String txnId = getConf(spark, CONF_TXN_ID);
     String txnToken = getConf(spark, CONF_TXN_TOKEN);
-    if (txnId == null || txnToken == null) {
-      throw new IllegalStateException("No active transaction. Use BEGIN first.");
-    }
     return restCatalog.createSubtransaction(
         Long.parseLong(txnId), txnToken, identToKey(table), operation, DEFAULT_LEASE_SECONDS);
   }

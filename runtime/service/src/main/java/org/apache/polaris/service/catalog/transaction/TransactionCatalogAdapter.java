@@ -45,6 +45,7 @@ import org.apache.polaris.service.catalog.iceberg.IcebergCatalogHandlerFactory;
 import org.apache.polaris.service.transaction.LockManager.LockWaitTimeoutException;
 import org.apache.polaris.service.transaction.TransactionService;
 import org.apache.polaris.service.types.BeginTransactionRequest;
+import org.apache.polaris.service.types.GetSubtransactionResponse;
 import org.apache.polaris.service.types.CommitSubtransactionRequest;
 import org.apache.polaris.service.types.CommitTransactionRequest;
 import org.apache.polaris.service.types.CreateSubtransactionRequest;
@@ -329,6 +330,34 @@ public class TransactionCatalogAdapter
     try {
       handler.close();
     } catch (Exception ignored) {
+    }
+  }
+
+  @Override
+  public Response getSubtransaction(
+      String prefix,
+      Long subtxnId,
+      String xSubtxnToken,
+      RealmContext realmContext,
+      SecurityContext securityContext) {
+    if (xSubtxnToken == null || xSubtxnToken.isBlank()) {
+      return Response.status(401).entity(simpleError("X-Subtxn-Token header is required")).build();
+    }
+    try {
+      TransactionService txnService = openTxnService(securityContext, prefix);
+      TransactionService.SubtransactionInfo info =
+          txnService.getSubtransaction(subtxnId, xSubtxnToken);
+      return Response.ok(
+              new GetSubtransactionResponse(
+                  info.txnId(), info.txnSnapshotId(),
+                  info.assignedStagingPath(), info.tableUuid()))
+          .build();
+    } catch (jakarta.ws.rs.ForbiddenException e) {
+      return Response.status(403).entity(simpleError(e.getMessage())).build();
+    } catch (jakarta.ws.rs.NotFoundException e) {
+      return notFound(e.getMessage());
+    } catch (java.sql.SQLException e) {
+      return serverError("getSubtransaction failed", e);
     }
   }
 

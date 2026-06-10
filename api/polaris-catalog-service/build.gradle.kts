@@ -59,10 +59,14 @@ val transactionModels =
     "TransactionSnapshot",
     "BeginTransactionRequest",
     "Transaction",
+    // CommitTransactionRequest is hand-written — name collision with Iceberg spec.
+    // See the Javadoc in CommitTransactionRequest.java for details.
+    "StagedTableCommit",
     "CreateSubtransactionRequest",
     "Subtransaction",
     "CommitSubtransactionRequest",
     "RenewLeaseRequest",
+    "GetSubtransactionResponse",
   )
 
 val models = (genericTableModels + policyManagementModels + transactionModels).joinToString(",")

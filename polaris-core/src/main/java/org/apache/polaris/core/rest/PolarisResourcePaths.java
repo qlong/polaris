@@ -109,4 +109,14 @@ public class PolarisResourcePaths {
     return SLASH.join(
         "polaris", "v1", prefix, "transactions", txnId, "subtransactions", subtxnId, "commit");
   }
+
+  public String subtransactionAbort(long txnId, long subtxnId) {
+    return SLASH.join(
+        "polaris", "v1", prefix, "transactions", txnId, "subtransactions", subtxnId, "abort");
+  }
+
+  /** GET /transactions/subtransactions/{subtxn-id} — worker lookup by subtxn_id + token. */
+  public String subtransactionGet(long subtxnId) {
+    return SLASH.join("polaris", "v1", prefix, "transactions", "subtransactions", subtxnId);
+  }
 }

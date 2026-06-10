@@ -35,6 +35,8 @@ import java.util.Map;
 import java.util.Optional;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.polaris.spark.rest.GetSubtransactionRESTResponse;
+import org.apache.polaris.spark.rest.SubtransactionRESTResponse;
 import org.apache.polaris.spark.rest.TransactionRESTResponse;
 import org.apache.spark.sql.RuntimeConfig;
 import org.apache.spark.sql.SparkSession;
@@ -86,6 +88,15 @@ public class TransactionManagerTest {
 
     txnManager = new TransactionManager(mockRestCatalog, CATALOG);
     confStore.clear();
+
+    // Default response for getSubtransaction — used by beginWorkerSubtransaction.
+    // Tests that use different values can override this mock locally.
+    GetSubtransactionRESTResponse defaultSubtxnInfo = mock(GetSubtransactionRESTResponse.class);
+    when(defaultSubtxnInfo.txnId()).thenReturn(7L);
+    when(defaultSubtxnInfo.txnSnapshotId()).thenReturn(99L);
+    when(defaultSubtxnInfo.assignedStagingPath()).thenReturn("file:///tmp/txn-42.metadata.json");
+    when(defaultSubtxnInfo.tableUuid()).thenReturn("demo_ns.orders");
+    when(mockRestCatalog.getSubtransaction(anyLong(), anyString())).thenReturn(defaultSubtxnInfo);
   }
 
   // -------------------------------------------------------------------------
@@ -269,15 +280,68 @@ public class TransactionManagerTest {
   }
 
   // -------------------------------------------------------------------------
+  // createSubtransactionForOrchestrator() — lazy-BEGIN trigger
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void testCreateSubtransactionTriggersBeginWhenPending() {
+    TransactionRESTResponse txnResp = mock(TransactionRESTResponse.class);
+    when(txnResp.txnId()).thenReturn(10L);
+    when(txnResp.txnToken()).thenReturn("tok10");
+    when(txnResp.txnSnapshotId()).thenReturn(50L);
+    when(mockRestCatalog.beginTransaction(anyString(), anyInt())).thenReturn(txnResp);
+    SubtransactionRESTResponse subtxnResp = mock(SubtransactionRESTResponse.class);
+    when(mockRestCatalog.createSubtransaction(anyLong(), anyString(), anyString(), anyString(), anyInt()))
+        .thenReturn(subtxnResp);
+
+    txnManager.begin(mockSpark, "REPEATABLE_READ"); // PENDING — no REST call yet
+    TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
+    txnManager.createSubtransactionForOrchestrator(mockSpark, orders, "APPEND");
+
+    // beginTransaction must have fired on the first CREATE SUBTRANSACTION FOR
+    verify(mockRestCatalog).beginTransaction("REPEATABLE_READ", TransactionManager.DEFAULT_LEASE_SECONDS);
+    verify(mockRestCatalog).createSubtransaction(
+        10L, "tok10", "demo_ns.orders", "APPEND", TransactionManager.DEFAULT_LEASE_SECONDS);
+    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_ID, CATALOG))).isEqualTo("10");
+    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG))).isEqualTo("tok10");
+    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_SNAPSHOT_ID, CATALOG))).isEqualTo("50");
+  }
+
+  @Test
+  public void testCreateSubtransactionDoesNotRebegindWhenAlreadyActive() {
+    // Pre-set ACTIVE state (txn_id already present)
+    confStore.put(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG), "REPEATABLE_READ");
+    confStore.put(String.format(TransactionManager.CONF_TXN_ID, CATALOG), "99");
+    confStore.put(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG), "tok99");
+    SubtransactionRESTResponse subtxnResp = mock(SubtransactionRESTResponse.class);
+    when(mockRestCatalog.createSubtransaction(anyLong(), anyString(), anyString(), anyString(), anyInt()))
+        .thenReturn(subtxnResp);
+
+    TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
+    txnManager.createSubtransactionForOrchestrator(mockSpark, orders, "APPEND");
+
+    verify(mockRestCatalog, never()).beginTransaction(anyString(), anyInt());
+    verify(mockRestCatalog).createSubtransaction(
+        99L, "tok99", "demo_ns.orders", "APPEND", TransactionManager.DEFAULT_LEASE_SECONDS);
+  }
+
+  @Test
+  public void testCreateSubtransactionThrowsWhenNoTransaction() {
+    TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
+
+    assertThatThrownBy(() -> txnManager.createSubtransactionForOrchestrator(mockSpark, orders, "APPEND"))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("No active transaction");
+  }
+
+  // -------------------------------------------------------------------------
   // Worker mode — beginWorkerSubtransaction / commit / rollback
   // -------------------------------------------------------------------------
 
   @Test
   public void testBeginWorkerSubtransactionSetsConfWithoutRyow() {
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
-    txnManager.beginWorkerSubtransaction(
-        mockSpark, 7L, 99L, 42L, "subtok", orders,
-        "file:///tmp/txn-42.metadata.json", "APPEND");
+    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "APPEND");
 
     // Worker conf keys must be set
     assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_ID, CATALOG)))
@@ -305,10 +369,7 @@ public class TransactionManagerTest {
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
 
     assertThatThrownBy(
-            () ->
-                txnManager.beginWorkerSubtransaction(
-                    mockSpark, 7L, 99L, 42L, "subtok", orders,
-                    "file:///tmp/txn-42.metadata.json", "APPEND"))
+            () -> txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "APPEND"))
         .isInstanceOf(IllegalStateException.class)
         .hasMessageContaining("Transaction already in progress");
   }
@@ -316,9 +377,7 @@ public class TransactionManagerTest {
   @Test
   public void testWorkerStagingPathReturnedByGetter() {
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
-    txnManager.beginWorkerSubtransaction(
-        mockSpark, 7L, 99L, 42L, "subtok", orders,
-        "file:///tmp/txn-42.metadata.json", "APPEND");
+    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "APPEND");
 
     Optional<String> path = txnManager.getWorkerStagingPath(mockSpark);
     assertThat(path).hasValue("file:///tmp/txn-42.metadata.json");
@@ -329,9 +388,7 @@ public class TransactionManagerTest {
     assertThat(txnManager.isWorkerMode(mockSpark)).isFalse();
 
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
-    txnManager.beginWorkerSubtransaction(
-        mockSpark, 7L, 99L, 42L, "subtok", orders,
-        "file:///tmp/txn-42.metadata.json", "APPEND");
+    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "APPEND");
 
     assertThat(txnManager.isWorkerMode(mockSpark)).isTrue();
   }
@@ -339,9 +396,7 @@ public class TransactionManagerTest {
   @Test
   public void testCommitWorkerSubtransactionCallsRestAndClearsConf() {
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
-    txnManager.beginWorkerSubtransaction(
-        mockSpark, 7L, 99L, 42L, "subtok", orders,
-        "file:///tmp/txn-42.metadata.json", "APPEND");
+    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "APPEND");
     // Simulate PinnedTableOperations.commit() having written the staged path
     txnManager.stageWrite(mockSpark, orders, "file:///tmp/txn-42.metadata.json", "APPEND");
 
@@ -361,9 +416,7 @@ public class TransactionManagerTest {
   @Test
   public void testRollbackWorkerSubtransactionClearsConfWithoutRestCall() {
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
-    txnManager.beginWorkerSubtransaction(
-        mockSpark, 7L, 99L, 42L, "subtok", orders,
-        "file:///tmp/txn-42.metadata.json", "APPEND");
+    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "APPEND");
 
     txnManager.rollbackWorkerSubtransaction(mockSpark);
 
@@ -382,9 +435,7 @@ public class TransactionManagerTest {
   @Test
   public void testOrchestratorCommitThrowsInWorkerMode() {
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
-    txnManager.beginWorkerSubtransaction(
-        mockSpark, 7L, 99L, 42L, "subtok", orders,
-        "file:///tmp/txn-42.metadata.json", "APPEND");
+    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "APPEND");
 
     assertThatThrownBy(() -> txnManager.commit(mockSpark))
         .isInstanceOf(IllegalStateException.class)

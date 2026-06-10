@@ -282,7 +282,7 @@ public class PolarisSparkSqlParserTest {
       verify(mockTxnManager)
           .createSubtransactionForOrchestrator(
               eq(mockSpark),
-              eq(TableIdentifier.of(Namespace.of("NS"), "ORDERS")),
+              eq(TableIdentifier.of(Namespace.of("ns"), "orders")),
               eq("APPEND"));
     }
   }
@@ -305,7 +305,7 @@ public class PolarisSparkSqlParserTest {
       verify(mockTxnManager)
           .createSubtransactionForOrchestrator(
               eq(mockSpark),
-              eq(TableIdentifier.of(Namespace.of("NS"), "ORDERS")),
+              eq(TableIdentifier.of(Namespace.of("ns"), "orders")),
               eq("ROW_DELTA"));
     }
   }
@@ -332,7 +332,7 @@ public class PolarisSparkSqlParserTest {
               eq(7L),
               eq(100L),
               eq("secret-tok"),
-              eq(TableIdentifier.of(Namespace.of("NS"), "ORDERS")),
+              eq(TableIdentifier.of(Namespace.of("ns"), "orders")),
               eq("s3://bucket/staging.json"),
               eq("APPEND"));
     }

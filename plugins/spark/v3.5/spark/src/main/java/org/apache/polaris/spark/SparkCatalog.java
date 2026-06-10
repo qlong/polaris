@@ -300,11 +300,18 @@ public class SparkCatalog
         }
       }
 
-      // Allocate a new staging file path on each write (new UUID keeps savepoint history intact)
+      // In worker mode, use the server-allocated path from beginWorkerSubtransaction; otherwise
+      // allocate a new local path (new UUID per commit keeps savepoint history intact).
       String stagingPath =
-          liveOps.metadataFileLocation(
-              txnId + "-" + UUID.randomUUID().toString().replace("-", "").substring(0, 12)
-                  + ".metadata.json");
+          txnManager
+              .getWorkerStagingPath(spark)
+              .orElseGet(
+                  () ->
+                      liveOps.metadataFileLocation(
+                          txnId
+                              + "-"
+                              + UUID.randomUUID().toString().replace("-", "").substring(0, 12)
+                              + ".metadata.json"));
 
       // Write the staged metadata file
       TableMetadataParser.write(metadata, fileIO.newOutputFile(stagingPath));

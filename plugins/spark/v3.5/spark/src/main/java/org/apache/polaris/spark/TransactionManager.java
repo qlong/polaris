@@ -68,6 +68,12 @@ public class TransactionManager {
   static final String CONF_WORKER_SUBTXN_ID = "spark.sql.catalog.%s.active_worker_subtxn_id";
   static final String CONF_WORKER_SUBTXN_TOKEN = "spark.sql.catalog.%s.active_worker_subtxn_token";
   static final String CONF_WORKER_TABLE = "spark.sql.catalog.%s.active_worker_table";
+  // Separate key for the server-allocated staging path in worker mode.
+  // NOT the same as the RYOW staged-path key — that key is only set AFTER the metadata file
+  // has been written (by PinnedTableOperations.commit), so the RYOW check in
+  // resolveMetadataLocation cannot fire prematurely on the first loadTable call.
+  static final String CONF_WORKER_STAGING_PATH =
+      "spark.sql.catalog.%s.active_worker_staging_path";
 
   static final String DEFAULT_ISOLATION = "REPEATABLE_READ";
   static final int DEFAULT_LEASE_SECONDS = 3600;
@@ -224,6 +230,8 @@ public class TransactionManager {
       System.out.println(
           "Transaction started  txn_id="
               + txn.txnId()
+              + "  txn_token="
+              + txn.txnToken()
               + (snapId != null ? "  txn_snapshot_id=" + snapId : "  (READ_COMMITTED)"));
       txnId = getConf(spark, CONF_TXN_ID);
     }
@@ -310,8 +318,12 @@ public class TransactionManager {
     setConf(spark, CONF_WORKER_SUBTXN_ID, String.valueOf(subtxnId));
     setConf(spark, CONF_WORKER_SUBTXN_TOKEN, subtxnToken);
     setConf(spark, CONF_WORKER_TABLE, identToKey(table));
-    // Pre-populate staged path so RYOW works and PinnedTableOperations writes to it
-    stageWrite(spark, table, stagingPath, operation);
+    // Store the server-allocated staging path under a dedicated key so PinnedTableOperations
+    // knows where to write. Do NOT call stageWrite() here — that would trigger the RYOW branch
+    // in resolveMetadataLocation before any metadata file has been written, causing loadTable
+    // to attempt reading a non-existent path.  stageWrite is called by PinnedTableOperations
+    // after the file is written.
+    setConf(spark, CONF_WORKER_STAGING_PATH, stagingPath);
     System.out.println(
         "Worker subtransaction started  txn_id=" + txnId + "  subtxn_id=" + subtxnId);
   }
@@ -377,6 +389,15 @@ public class TransactionManager {
   /** Returns the worker's assigned table key (used by PinnedTableOperations for lock guard). */
   public String getWorkerTable(SparkSession spark) {
     return getConf(spark, CONF_WORKER_TABLE);
+  }
+
+  /**
+   * Returns the server-allocated staging path for this worker session. Set by
+   * beginWorkerSubtransaction; read by PinnedTableOperations.commit() to know where to write the
+   * staged metadata file.
+   */
+  public Optional<String> getWorkerStagingPath(SparkSession spark) {
+    return Optional.ofNullable(getConf(spark, CONF_WORKER_STAGING_PATH));
   }
 
   // -------------------------------------------------------------------------
@@ -503,6 +524,7 @@ public class TransactionManager {
     spark.conf().unset(confKey(CONF_WORKER_SUBTXN_ID));
     spark.conf().unset(confKey(CONF_WORKER_SUBTXN_TOKEN));
     spark.conf().unset(confKey(CONF_WORKER_TABLE));
+    spark.conf().unset(confKey(CONF_WORKER_STAGING_PATH));
     savepoints.clear();
   }
 }

@@ -133,18 +133,21 @@ public class PolarisSparkSqlParser implements ParserInterface {
     // e.g.  CREATE SUBTRANSACTION FOR ns.orders WITH ROW_DELTA
     if (normalized.startsWith("CREATE SUBTRANSACTION FOR ")) {
       SparkSession spark = SparkSession.active();
-      String rest = normalized.substring("CREATE SUBTRANSACTION FOR ".length()).trim();
+      // Use original sql to preserve the table name's natural case (server lookup is case-sensitive).
+      String rawSql = sql.trim();
+      if (rawSql.endsWith(";")) rawSql = rawSql.substring(0, rawSql.length() - 1).trim();
+      String rawUpper = rawSql.toUpperCase(Locale.ROOT);
+      int withIdx = rawUpper.indexOf(" WITH ", "CREATE SUBTRANSACTION FOR ".length());
       String operation = "APPEND";
-      int withIdx = rest.indexOf(" WITH ");
       String tableStr;
       if (withIdx >= 0) {
-        tableStr = rest.substring(0, withIdx).trim();
-        String opToken = rest.substring(withIdx + " WITH ".length()).trim();
+        tableStr = rawSql.substring("CREATE SUBTRANSACTION FOR ".length(), withIdx).trim();
+        String opToken = rawUpper.substring(withIdx + " WITH ".length()).trim();
         if (opToken.equals("ROW_DELTA")) {
           operation = "ROW_DELTA";
         }
       } else {
-        tableStr = rest;
+        tableStr = rawSql.substring("CREATE SUBTRANSACTION FOR ".length()).trim();
       }
       org.apache.iceberg.catalog.TableIdentifier ident = parseTableIdentifierPolaris(tableStr);
       SubtransactionRESTResponse resp =
@@ -177,8 +180,9 @@ public class PolarisSparkSqlParser implements ParserInterface {
       }
       String tableStr = rawRest.substring(after, txnIdIdx).trim();
       if (tableStr.endsWith(",")) tableStr = tableStr.substring(0, tableStr.length() - 1).trim();
-      org.apache.iceberg.catalog.TableIdentifier ident =
-          parseTableIdentifierPolaris(tableStr.toUpperCase(Locale.ROOT));
+      // Preserve original case — identToKey uses this for the lock guard in PinnedTableOperations,
+      // which must match the lowercase key produced from the Spark catalog's loadTable ident.
+      org.apache.iceberg.catalog.TableIdentifier ident = parseTableIdentifierPolaris(tableStr);
 
       long txnId = parseLongParam(rawRest, rawUpper, "TXN_ID");
       long subtxnId = parseLongParam(rawRest, rawUpper, "SUBTXN_ID");

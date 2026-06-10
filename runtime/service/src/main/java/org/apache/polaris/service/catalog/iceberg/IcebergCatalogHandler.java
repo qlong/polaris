@@ -1411,8 +1411,9 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
    * Finalizes a multi-table extension transaction atomically:
    *
    * <ol>
-   *   <li>Buffers all entity updates in a {@link TransactionWorkspaceMetaStoreManager} (same
-   *       pattern as {@link #commitTransaction}).
+   *   <li>Creates a fresh {@link IcebergCatalogHandler} per table so the resolution manifest has
+   *       each table's passthrough path registered (same pattern as {@link #finalizeInlineTables}).
+   *   <li>Buffers all entity updates in a shared {@link TransactionWorkspaceMetaStoreManager}.
    *   <li>Applies direct pointer swaps and APPEND merge-and-retry commits.
    *   <li>Commits every entity update in a single {@code updateEntitiesPropertiesIfNotChanged} call.
    *   <li>Inserts all {@code committed_table_snapshots} rows with a shared {@code committed_txn_id}
@@ -1421,18 +1422,30 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
    *
    * @param direct subtransactions whose staged metadata can be applied as-is (no conflict)
    * @param mergeRetry APPEND subtransactions that had a conflict and need merge-and-retry
+   * @param handlerFactory factory used to create per-table handlers (required for manifest setup)
+   * @param catalogName catalog to operate on
+   * @param principal authenticated principal
    */
   public void finalizeExtensionTransaction(
       List<JdbcTransactionPersistence.SubtransactionRow> direct,
-      List<JdbcTransactionPersistence.SubtransactionRow> mergeRetry) {
+      List<JdbcTransactionPersistence.SubtransactionRow> mergeRetry,
+      IcebergCatalogHandlerFactory handlerFactory,
+      String catalogName,
+      org.apache.polaris.core.auth.PolarisPrincipal principal) {
 
+    // Each table needs its own handler so the resolution manifest has the table's passthrough path.
     TransactionWorkspaceMetaStoreManager workspace =
         new TransactionWorkspaceMetaStoreManager(diagnostics(), metaStoreManager());
-    ((IcebergCatalog) baseCatalog).setMetaStoreManager(workspace);
+
+    List<IcebergCatalogHandler> openHandlers = new java.util.ArrayList<>();
     try {
       for (JdbcTransactionPersistence.SubtransactionRow sub : direct) {
         TableIdentifier tableId = extensionTableId(sub.tableUuid());
-        Table table = baseCatalog.loadTable(tableId);
+        IcebergCatalogHandler tableHandler = handlerFactory.createHandler(catalogName, principal);
+        openHandlers.add(tableHandler);
+        tableHandler.loadTable(tableId, null);
+        Table table = tableHandler.loadRawTable(tableId);
+        tableHandler.setWorkspaceMetaStoreManager(workspace);
         TableOperations ops = ((BaseTable) table).operations();
         FileIO io = ops.io();
         TableMetadata base =
@@ -1440,20 +1453,26 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
                 ? TableMetadataParser.read(io, sub.serverBaseMetadataLocation())
                 : ops.current();
         TableMetadata staged = TableMetadataParser.read(io, sub.stagedMetadataLocation());
-        ops.commit(base, staged); // entity update buffered; CTS skipped while inWorkspace=true
+        ops.commit(base, staged);
       }
       for (JdbcTransactionPersistence.SubtransactionRow sub : mergeRetry) {
         TableIdentifier tableId = extensionTableId(sub.tableUuid());
-        Table liveTable = baseCatalog.loadTable(tableId);
+        IcebergCatalogHandler tableHandler = handlerFactory.createHandler(catalogName, principal);
+        openHandlers.add(tableHandler);
+        tableHandler.loadTable(tableId, null);
+        Table liveTable = tableHandler.loadRawTable(tableId);
+        tableHandler.setWorkspaceMetaStoreManager(workspace);
         FileIO io = ((BaseTable) liveTable).operations().io();
         TableMetadata staged = TableMetadataParser.read(io, sub.stagedMetadataLocation());
         List<DataFile> addedFiles = extractAddedDataFiles(staged, io);
         AppendFiles append = liveTable.newAppend();
         addedFiles.forEach(append::appendFile);
-        append.commit(); // entity update buffered; CTS skipped while inWorkspace=true
+        append.commit();
       }
     } finally {
-      ((IcebergCatalog) baseCatalog).setMetaStoreManager(metaStoreManager());
+      for (IcebergCatalogHandler h : openHandlers) {
+        try { h.close(); } catch (Exception ignored) {}
+      }
     }
 
     // Commit all entity updates atomically (one DB transaction).

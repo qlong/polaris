@@ -295,7 +295,8 @@ public class TransactionCatalogAdapter
           LOGGER.info(
               "Committing txn={} (subtxn): {} direct, {} merge-and-retry",
               txnId, result.direct().size(), result.mergeRetry().size());
-          handler.finalizeExtensionTransaction(result.direct(), result.mergeRetry());
+          handler.finalizeExtensionTransaction(
+              result.direct(), result.mergeRetry(), handlerFactory, catalogName, principal);
         }
       } finally {
         closeQuietly(handler);

@@ -10,8 +10,10 @@ Implements the atomic-publish pattern:
   5. Commit the transaction      (POST .../transactions/{id}/commit)
   6. Both tables become visible atomically
 
-This script simulates step 3 (no real Spark required).
-In production: spark.range(N).write.parquet(assigned_staging_path).
+This script exercises the REST API layer directly (step 3 is simulated).
+For the Spark SQL path — where real Spark sessions use
+  BEGIN WORKER SUBTRANSACTION / INSERT / COMMIT SUBTRANSACTION
+see demo_uc2_spark.sh and demo_interactive.md Part 2.
 
 Prerequisites:
     pip install requests

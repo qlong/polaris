@@ -269,6 +269,129 @@ public class TransactionManagerTest {
   }
 
   // -------------------------------------------------------------------------
+  // Worker mode — beginWorkerSubtransaction / commit / rollback
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void testBeginWorkerSubtransactionSetsConfWithoutRyow() {
+    TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
+    txnManager.beginWorkerSubtransaction(
+        mockSpark, 7L, 99L, 42L, "subtok", orders,
+        "file:///tmp/txn-42.metadata.json", "APPEND");
+
+    // Worker conf keys must be set
+    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_ID, CATALOG)))
+        .isEqualTo("7");
+    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_SNAPSHOT_ID, CATALOG)))
+        .isEqualTo("99");
+    assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_SUBTXN_ID, CATALOG)))
+        .isEqualTo("42");
+    assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_SUBTXN_TOKEN, CATALOG)))
+        .isEqualTo("subtok");
+    assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_TABLE, CATALOG)))
+        .isEqualTo("demo_ns.orders");
+    assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_STAGING_PATH, CATALOG)))
+        .isEqualTo("file:///tmp/txn-42.metadata.json");
+
+    // CRITICAL: staged-path conf key must NOT be set — if it were, resolveMetadataLocation would
+    // return it as a RYOW path before the file exists, causing loadTable to fail.
+    Optional<String> ryow = txnManager.getStagedPath(mockSpark, orders);
+    assertThat(ryow).isEmpty();
+  }
+
+  @Test
+  public void testBeginWorkerSubtransactionThrowsIfTransactionAlreadyActive() {
+    txnManager.begin(mockSpark, "REPEATABLE_READ");
+    TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
+
+    assertThatThrownBy(
+            () ->
+                txnManager.beginWorkerSubtransaction(
+                    mockSpark, 7L, 99L, 42L, "subtok", orders,
+                    "file:///tmp/txn-42.metadata.json", "APPEND"))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("Transaction already in progress");
+  }
+
+  @Test
+  public void testWorkerStagingPathReturnedByGetter() {
+    TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
+    txnManager.beginWorkerSubtransaction(
+        mockSpark, 7L, 99L, 42L, "subtok", orders,
+        "file:///tmp/txn-42.metadata.json", "APPEND");
+
+    Optional<String> path = txnManager.getWorkerStagingPath(mockSpark);
+    assertThat(path).hasValue("file:///tmp/txn-42.metadata.json");
+  }
+
+  @Test
+  public void testIsWorkerMode() {
+    assertThat(txnManager.isWorkerMode(mockSpark)).isFalse();
+
+    TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
+    txnManager.beginWorkerSubtransaction(
+        mockSpark, 7L, 99L, 42L, "subtok", orders,
+        "file:///tmp/txn-42.metadata.json", "APPEND");
+
+    assertThat(txnManager.isWorkerMode(mockSpark)).isTrue();
+  }
+
+  @Test
+  public void testCommitWorkerSubtransactionCallsRestAndClearsConf() {
+    TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
+    txnManager.beginWorkerSubtransaction(
+        mockSpark, 7L, 99L, 42L, "subtok", orders,
+        "file:///tmp/txn-42.metadata.json", "APPEND");
+    // Simulate PinnedTableOperations.commit() having written the staged path
+    txnManager.stageWrite(mockSpark, orders, "file:///tmp/txn-42.metadata.json", "APPEND");
+
+    txnManager.commitWorkerSubtransaction(mockSpark);
+
+    verify(mockRestCatalog)
+        .commitSubtransaction(7L, 42L, "subtok", "file:///tmp/txn-42.metadata.json");
+    // All conf cleared after commit
+    assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_SUBTXN_ID, CATALOG)))
+        .isNull();
+    assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_STAGING_PATH, CATALOG)))
+        .isNull();
+    assertThat(confStore.get(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG)))
+        .isNull();
+  }
+
+  @Test
+  public void testRollbackWorkerSubtransactionClearsConfWithoutRestCall() {
+    TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
+    txnManager.beginWorkerSubtransaction(
+        mockSpark, 7L, 99L, 42L, "subtok", orders,
+        "file:///tmp/txn-42.metadata.json", "APPEND");
+
+    txnManager.rollbackWorkerSubtransaction(mockSpark);
+
+    verify(mockRestCatalog, never()).commitSubtransaction(anyLong(), anyLong(), anyString(), anyString());
+    assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_SUBTXN_ID, CATALOG)))
+        .isNull();
+  }
+
+  @Test
+  public void testCommitWorkerThrowsIfNotInWorkerMode() {
+    assertThatThrownBy(() -> txnManager.commitWorkerSubtransaction(mockSpark))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("Not in worker mode");
+  }
+
+  @Test
+  public void testOrchestratorCommitThrowsInWorkerMode() {
+    TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
+    txnManager.beginWorkerSubtransaction(
+        mockSpark, 7L, 99L, 42L, "subtok", orders,
+        "file:///tmp/txn-42.metadata.json", "APPEND");
+
+    assertThatThrownBy(() -> txnManager.commit(mockSpark))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("use COMMIT SUBTRANSACTION");
+  }
+
+  // -------------------------------------------------------------------------
   // Helper
   // -------------------------------------------------------------------------
 

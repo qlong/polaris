@@ -1427,8 +1427,8 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
    * @param principal authenticated principal
    */
   public void finalizeExtensionTransaction(
-      List<JdbcTransactionPersistence.SubtransactionRow> direct,
-      List<JdbcTransactionPersistence.SubtransactionRow> mergeRetry,
+      List<JdbcTransactionPersistence.OperationRow> direct,
+      List<JdbcTransactionPersistence.OperationRow> mergeRetry,
       IcebergCatalogHandlerFactory handlerFactory,
       String catalogName,
       org.apache.polaris.core.auth.PolarisPrincipal principal) {
@@ -1439,7 +1439,7 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
 
     List<IcebergCatalogHandler> openHandlers = new java.util.ArrayList<>();
     try {
-      for (JdbcTransactionPersistence.SubtransactionRow sub : direct) {
+      for (JdbcTransactionPersistence.OperationRow sub : direct) {
         TableIdentifier tableId = extensionTableId(sub.tableUuid());
         IcebergCatalogHandler tableHandler = handlerFactory.createHandler(catalogName, principal);
         openHandlers.add(tableHandler);
@@ -1453,9 +1453,26 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
                 ? TableMetadataParser.read(io, sub.serverBaseMetadataLocation())
                 : ops.current();
         TableMetadata staged = TableMetadataParser.read(io, sub.stagedMetadataLocation());
+        // Guard: staged was built on a snapshot that pre-dates base's current snapshot.
+        // This happens when the EXCLUSIVE lock retry fires after a concurrent transaction
+        // committed (so serverBase == currentMeta), but the worker's MVCC snapshot was taken
+        // before that commit, so staged points to the old chain.  A direct ops.commit() would
+        // succeed at the OCC pointer-swap level but silently overwrite the concurrent commit's
+        // snapshot chain, losing that writer's data files.  Route to mergeRetry instead so the
+        // added files are re-appended on top of the live (post-conflict) table.
+        if (staged.currentSnapshot() != null) {
+          Long stagedParentId = staged.currentSnapshot().parentId();
+          // null when base has no snapshots yet (fresh table)
+          Long baseCurrSnapId =
+              base.currentSnapshot() != null ? base.currentSnapshot().snapshotId() : null;
+          if (!java.util.Objects.equals(stagedParentId, baseCurrSnapId)) {
+            mergeRetry.add(sub);
+            continue;
+          }
+        }
         ops.commit(base, staged);
       }
-      for (JdbcTransactionPersistence.SubtransactionRow sub : mergeRetry) {
+      for (JdbcTransactionPersistence.OperationRow sub : mergeRetry) {
         TableIdentifier tableId = extensionTableId(sub.tableUuid());
         IcebergCatalogHandler tableHandler = handlerFactory.createHandler(catalogName, principal);
         openHandlers.add(tableHandler);

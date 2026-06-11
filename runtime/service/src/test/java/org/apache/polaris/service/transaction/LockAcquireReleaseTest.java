@@ -38,7 +38,8 @@ import org.junit.jupiter.api.Test;
 /**
  * Integration tests for {@link LockManager} lock lifecycle using an in-memory H2 database.
  *
- * <p>Verifies: acquire → grant, conflicting acquire → wait (timeout), release → grant.
+ * <p>Verifies: acquire → grant, conflicting acquire → immediate {@link
+ * LockManager.LockConflictException}, release → grant on retry.
  */
 class LockAcquireReleaseTest {
 
@@ -86,52 +87,51 @@ class LockAcquireReleaseTest {
     ops.executeScript(schema);
 
     persistence = new JdbcTransactionPersistence(dataSource, DatabaseType.H2, REALM, CATALOG_ID);
-    // Use a very short timeout so conflict tests don't block for long
-    lockManager = new LockManager(persistence, 200L);
+    lockManager = new LockManager(persistence);
   }
 
   @Test
   void acquireGrantsLockWhenNoConflict() throws Exception {
     long txnId = persistence.nextTxnId();
 
-    long lockId = lockManager.acquire(txnId, RESOURCE, LockManager.MODE_APPEND);
+    long lockId = lockManager.acquire(txnId, RESOURCE, LockManager.MODE_ROW_EXCLUSIVE);
 
     assertThat(lockId).isGreaterThan(0);
     List<LockRow> granted = persistence.findGrantedLocksOnResource(RESOURCE, -1L);
     assertThat(granted).hasSize(1);
     assertThat(granted.get(0).txnId()).isEqualTo(txnId);
-    assertThat(granted.get(0).lockMode()).isEqualTo(LockManager.MODE_APPEND);
+    assertThat(granted.get(0).lockMode()).isEqualTo(LockManager.MODE_ROW_EXCLUSIVE);
   }
 
   @Test
-  void conflictingAcquireTimesOut() throws Exception {
+  void conflictingAcquireThrowsImmediately() throws Exception {
     long txn1 = persistence.nextTxnId();
     long txn2 = persistence.nextTxnId();
 
-    // txn1 holds ROW_DELTA lock
-    lockManager.acquire(txn1, RESOURCE, LockManager.MODE_ROW_DELTA);
+    // txn1 holds EXCLUSIVE lock
+    lockManager.acquire(txn1, RESOURCE, LockManager.MODE_EXCLUSIVE);
 
-    // txn2 tries to acquire conflicting ROW_DELTA — should timeout
-    assertThatThrownBy(() -> lockManager.acquire(txn2, RESOURCE, LockManager.MODE_ROW_DELTA))
-        .isInstanceOf(LockManager.LockWaitTimeoutException.class);
+    // txn2 tries to acquire conflicting EXCLUSIVE — must throw immediately (no wait)
+    assertThatThrownBy(() -> lockManager.acquire(txn2, RESOURCE, LockManager.MODE_EXCLUSIVE))
+        .isInstanceOf(LockManager.LockConflictException.class);
   }
 
   @Test
-  void appendDoesNotConflictWithAppend() throws Exception {
+  void rowExclusiveIsCompatibleWithRowExclusive() throws Exception {
     long txn1 = persistence.nextTxnId();
     long txn2 = persistence.nextTxnId();
 
-    lockManager.acquire(txn1, RESOURCE, LockManager.MODE_APPEND);
+    lockManager.acquire(txn1, RESOURCE, LockManager.MODE_ROW_EXCLUSIVE);
 
-    // APPEND on same resource by another txn — compatible
-    long lockId2 = lockManager.acquire(txn2, RESOURCE, LockManager.MODE_APPEND);
+    // ROW_EXCLUSIVE on same resource by another txn — compatible (OCC path)
+    long lockId2 = lockManager.acquire(txn2, RESOURCE, LockManager.MODE_ROW_EXCLUSIVE);
     assertThat(lockId2).isGreaterThan(0);
   }
 
   @Test
   void releaseAllClearsGrantedLocks() throws Exception {
     long txnId = persistence.nextTxnId();
-    lockManager.acquire(txnId, RESOURCE, LockManager.MODE_ROW_DELTA);
+    lockManager.acquire(txnId, RESOURCE, LockManager.MODE_EXCLUSIVE);
 
     lockManager.releaseAll(txnId);
 
@@ -140,35 +140,46 @@ class LockAcquireReleaseTest {
   }
 
   @Test
-  void lockGrantedAfterConflictingLockIsReleased() throws Exception {
+  void newTransactionCanAcquireAfterConflictingTxnReleases() throws Exception {
     long txn1 = persistence.nextTxnId();
     long txn2 = persistence.nextTxnId();
-    long txn3 = persistence.nextTxnId();
 
-    // txn1 holds ROW_DELTA
-    lockManager.acquire(txn1, RESOURCE, LockManager.MODE_ROW_DELTA);
+    // txn1 holds EXCLUSIVE — txn2 fails immediately
+    lockManager.acquire(txn1, RESOURCE, LockManager.MODE_EXCLUSIVE);
+    assertThatThrownBy(() -> lockManager.acquire(txn2, RESOURCE, LockManager.MODE_EXCLUSIVE))
+        .isInstanceOf(LockManager.LockConflictException.class);
 
-    // Release txn1 lock asynchronously so txn3 can get it
-    Thread releaser =
-        new Thread(
-            () -> {
-              try {
-                Thread.sleep(50);
-                lockManager.releaseAll(txn1);
-              } catch (Exception e) {
-                throw new RuntimeException(e);
-              }
-            });
-    releaser.start();
-
-    // txn3 with a long enough timeout — should get the lock after txn1 releases
-    LockManager longTimeoutLM = new LockManager(persistence, 5000L);
-    long lockId = longTimeoutLM.acquire(txn3, RESOURCE, LockManager.MODE_ROW_DELTA);
-    releaser.join();
+    // txn1 releases — txn2 retries (new attempt) and succeeds
+    lockManager.releaseAll(txn1);
+    long lockId = lockManager.acquire(txn2, RESOURCE, LockManager.MODE_EXCLUSIVE);
 
     assertThat(lockId).isGreaterThan(0);
     List<LockRow> granted = persistence.findGrantedLocksOnResource(RESOURCE, -1L);
     assertThat(granted).hasSize(1);
-    assertThat(granted.get(0).txnId()).isEqualTo(txn3);
+    assertThat(granted.get(0).txnId()).isEqualTo(txn2);
+  }
+
+  @Test
+  void exclusiveBlocksAccessExclusive() throws Exception {
+    long txn1 = persistence.nextTxnId();
+    long txn2 = persistence.nextTxnId();
+
+    lockManager.acquire(txn1, RESOURCE, LockManager.MODE_EXCLUSIVE);
+
+    assertThatThrownBy(
+            () -> lockManager.acquire(txn2, RESOURCE, LockManager.MODE_ACCESS_EXCLUSIVE))
+        .isInstanceOf(LockManager.LockConflictException.class);
+  }
+
+  @Test
+  void accessExclusiveBlocksRowExclusive() throws Exception {
+    long txn1 = persistence.nextTxnId();
+    long txn2 = persistence.nextTxnId();
+
+    lockManager.acquire(txn1, RESOURCE, LockManager.MODE_ACCESS_EXCLUSIVE);
+
+    assertThatThrownBy(
+            () -> lockManager.acquire(txn2, RESOURCE, LockManager.MODE_ROW_EXCLUSIVE))
+        .isInstanceOf(LockManager.LockConflictException.class);
   }
 }

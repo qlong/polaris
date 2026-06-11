@@ -19,11 +19,11 @@
 -- Changes from v4:
 --  * Added multi-table transaction support tables:
 --    - txn_id_seq: monotonically increasing sequence for transaction and snapshot IDs
---    - transactions: transaction CLOG with isolation level and expiry
---    - subtransactions: per-table units of work within a transaction
---    - txn_snapshots: exportable read-consistency handles (MVCC-style)
+--    - transactions: top-level write transactions; parent_txn_id enables nested transactions
+--    - transaction_operations: per-table staging units within a transaction (replaces subtransactions)
+--    - txn_snapshots: MVCC visibility window; shared by read-only handles and write transactions
 --    - committed_table_snapshots: MVCC-to-Iceberg snapshot bridge
---    - locks: pessimistic lock state
+--    - locks: pessimistic lock state (ROW_EXCLUSIVE, EXCLUSIVE, ACCESS_EXCLUSIVE)
 --    - txn_watermark: purge horizon for old transaction history
 
 CREATE SCHEMA IF NOT EXISTS POLARIS_SCHEMA;
@@ -319,23 +319,23 @@ CREATE SEQUENCE IF NOT EXISTS txn_id_seq
     NO CYCLE;
 
 -- ---------------------------------------------------------------------------
--- transactions: transaction commit log (CLOG)
+-- transactions: top-level write transactions.
+-- parent_txn_id is NULL for top-level; non-NULL for nested transactions.
+-- txn_snapshot_id references txn_snapshots; NULL for READ_COMMITTED.
+-- snap_xmin/xmax/xip live in txn_snapshots, not here.
 -- status: 0=IN_PROGRESS, 1=COMMITTED, 2=ABORTED
 -- isolation: 'READ_COMMITTED', 'REPEATABLE_READ'
--- snap_xmin/xmax/xip: captured pg_snapshot at BEGIN (for REPEATABLE_READ)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS transactions (
     txn_id          BIGINT PRIMARY KEY,
+    parent_txn_id   BIGINT REFERENCES transactions(txn_id),  -- NULL = top-level
     realm_id        TEXT NOT NULL,
     catalog_id      BIGINT NOT NULL,
     txn_token       TEXT NOT NULL,           -- random 32-byte hex; held by orchestrator
     owner_principal TEXT NOT NULL,
     status          SMALLINT NOT NULL DEFAULT 0,
     isolation       TEXT NOT NULL DEFAULT 'REPEATABLE_READ',
-    snap_xmin       BIGINT,                  -- populated for REPEATABLE_READ
-    snap_xmax       BIGINT,
-    snap_xip_list   TEXT,                    -- comma-separated in-progress txn IDs at BEGIN
-    txn_snapshot_id BIGINT,                  -- ID of the txn_snapshots row created at BEGIN (REPEATABLE_READ only)
+    txn_snapshot_id BIGINT,                  -- FK to txn_snapshots; NULL for READ_COMMITTED
     started_at      TIMESTAMP NOT NULL DEFAULT now(),
     expires_at      TIMESTAMP NOT NULL,
     ended_at        TIMESTAMP
@@ -347,35 +347,37 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_txns_token
     ON transactions (txn_token);
 
 -- ---------------------------------------------------------------------------
--- subtransactions: per-table units of work inside a parent transaction
--- status: 0=IN_PROGRESS, 1=SUB_COMMITTED, 2=SUB_ABORTED
--- operation: 'APPEND', 'ROW_DELTA', 'OVERWRITE', 'EXCLUSIVE'
+-- transaction_operations: per-table staging units within a transaction.
+-- Created explicitly (CREATE SUBTRANSACTION FOR) or implicitly by StagingTableOperations.
+-- commitTransaction processes all COMMITTED rows atomically.
+-- lock_mode: 'ROW_EXCLUSIVE' (default/OCC), 'EXCLUSIVE', 'ACCESS_EXCLUSIVE'
+-- status: 0=IN_PROGRESS, 1=COMMITTED, 2=ABORTED
 -- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS subtransactions (
-    subtxn_id               BIGINT PRIMARY KEY,
-    parent_txn_id           BIGINT NOT NULL REFERENCES transactions(txn_id),
-    realm_id                TEXT NOT NULL,
-    catalog_id              BIGINT NOT NULL,
-    table_uuid              TEXT NOT NULL,   -- stable UUID of the Iceberg table entity
-    operation               TEXT NOT NULL,
-    base_snapshot_id        BIGINT,          -- Iceberg snapshot ID at subtxn creation time
-    server_base_metadata_location TEXT,      -- table's committed metadata-location at subtxn creation (server-captured)
-    assigned_staging_path   TEXT NOT NULL,   -- server-assigned s3://…/staging/{txn_id}/{subtxn_id}/
-    staged_metadata_location TEXT,           -- filled in by commitSubtransaction
-    subtxn_token            TEXT NOT NULL,   -- random 32-byte hex; given to worker app
-    status                  SMALLINT NOT NULL DEFAULT 0,
-    retry_of_subtxn_id      BIGINT,          -- set when this subtxn retries a failed predecessor
-    created_at              TIMESTAMP NOT NULL DEFAULT now(),
-    expires_at              TIMESTAMP NOT NULL,
-    ended_at                TIMESTAMP
+CREATE TABLE IF NOT EXISTS transaction_operations (
+    op_id                         BIGINT PRIMARY KEY,
+    txn_id                        BIGINT NOT NULL REFERENCES transactions(txn_id),
+    realm_id                      TEXT NOT NULL,
+    catalog_id                    BIGINT NOT NULL,
+    table_uuid                    TEXT NOT NULL,   -- stable UUID of the Iceberg table entity
+    lock_mode                     TEXT NOT NULL DEFAULT 'ROW_EXCLUSIVE',
+    base_snapshot_id              BIGINT,          -- Iceberg snapshot ID at op creation time
+    server_base_metadata_location TEXT,            -- table's metadata-location at op creation (server-captured)
+    assigned_staging_path         TEXT NOT NULL,   -- server-assigned staging path for metadata
+    staged_metadata_location      TEXT,            -- filled in by commitOperation
+    op_token                      TEXT NOT NULL,   -- random 32-byte hex; given to worker app
+    status                        SMALLINT NOT NULL DEFAULT 0,
+    retry_of_op_id                BIGINT,          -- set when this op retries a failed predecessor
+    created_at                    TIMESTAMP NOT NULL DEFAULT now(),
+    expires_at                    TIMESTAMP NOT NULL,
+    ended_at                      TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_subtxns_parent
-    ON subtransactions (parent_txn_id, status);
-CREATE INDEX IF NOT EXISTS idx_subtxns_table
-    ON subtransactions (realm_id, catalog_id, table_uuid, status);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_subtxns_token
-    ON subtransactions (subtxn_token);
+CREATE INDEX IF NOT EXISTS idx_ops_txn
+    ON transaction_operations (txn_id, status);
+CREATE INDEX IF NOT EXISTS idx_ops_table
+    ON transaction_operations (realm_id, catalog_id, table_uuid, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ops_token
+    ON transaction_operations (op_token);
 
 -- ---------------------------------------------------------------------------
 -- txn_snapshots: exportable consistent-read handles
@@ -422,9 +424,9 @@ CREATE INDEX IF NOT EXISTS idx_cts_txn
     ON committed_table_snapshots (committed_txn_id);
 
 -- ---------------------------------------------------------------------------
--- locks: pessimistic lock manager state
--- resource format: "{table_uuid}" or "{table_uuid}:{partition_spec_id}:{partition_value}"
--- lock_mode: 'APPEND', 'ROW_DELTA', 'OVERWRITE', 'EXCLUSIVE', 'ACCESS_EXCLUSIVE'
+-- locks: pessimistic lock state.
+-- resource: "{table_uuid}" or "{table_uuid}:{partition_spec_id}:{partition_value}"
+-- lock_mode: 'ROW_EXCLUSIVE' (default/OCC, self-compatible), 'EXCLUSIVE', 'ACCESS_EXCLUSIVE'
 -- status: 0=WAITING, 1=GRANTED
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS locks (

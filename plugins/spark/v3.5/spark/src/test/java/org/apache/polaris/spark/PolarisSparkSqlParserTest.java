@@ -280,7 +280,7 @@ public class PolarisSparkSqlParserTest {
           .createSubtransactionForOrchestrator(
               eq(mockSpark),
               eq(TableIdentifier.of(Namespace.of("ns"), "orders")),
-              eq("APPEND"));
+              eq("ROW_EXCLUSIVE"));
     }
   }
 
@@ -297,13 +297,13 @@ public class PolarisSparkSqlParserTest {
         org.mockito.Mockito.mockStatic(SparkSession.class)) {
       staticMock.when(SparkSession::active).thenReturn(mockSpark);
 
-      parser.parsePlan("CREATE SUBTRANSACTION FOR ns.orders WITH ROW_DELTA");
+      parser.parsePlan("CREATE SUBTRANSACTION FOR ns.orders WITH EXCLUSIVE");
 
       verify(mockTxnManager)
           .createSubtransactionForOrchestrator(
               eq(mockSpark),
               eq(TableIdentifier.of(Namespace.of("ns"), "orders")),
-              eq("ROW_DELTA"));
+              eq("EXCLUSIVE"));
     }
   }
 
@@ -326,7 +326,7 @@ public class PolarisSparkSqlParserTest {
               eq(100L),
               eq("secret-tok"),
               eq(TableIdentifier.of(Namespace.of("ns"), "orders")),
-              eq("APPEND"));
+              eq("ROW_EXCLUSIVE"));
     }
   }
 
@@ -348,7 +348,7 @@ public class PolarisSparkSqlParserTest {
               eq(100L),
               eq("secret-tok"),
               eq(TableIdentifier.of(Namespace.of("ns"), "orders")),
-              eq("APPEND"));
+              eq("ROW_EXCLUSIVE"));
     }
   }
 
@@ -367,7 +367,7 @@ public class PolarisSparkSqlParserTest {
               eq(100L),
               eq("tok"),
               eq(TableIdentifier.of(Namespace.of("ns"), "orders")),
-              eq("APPEND"));
+              eq("ROW_EXCLUSIVE"));
     }
   }
 

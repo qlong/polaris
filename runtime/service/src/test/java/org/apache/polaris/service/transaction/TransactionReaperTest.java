@@ -103,15 +103,13 @@ class TransactionReaperTest {
     TransactionRow row =
         new TransactionRow(
             txnId,
+            null, // parentTxnId
             REALM,
             CATALOG_ID,
             "token-" + txnId,
             OWNER,
             JdbcTransactionPersistence.TXN_STATUS_IN_PROGRESS,
             "REPEATABLE_READ",
-            null,
-            null,
-            null,
             null, // txnSnapshotId
             now,
             now.minus(1, ChronoUnit.MINUTES), // already expired
@@ -136,15 +134,13 @@ class TransactionReaperTest {
     TransactionRow row =
         new TransactionRow(
             txnId,
+            null, // parentTxnId
             REALM,
             CATALOG_ID,
             "token-" + txnId,
             OWNER,
             JdbcTransactionPersistence.TXN_STATUS_IN_PROGRESS,
             "REPEATABLE_READ",
-            null,
-            null,
-            null,
             null, // txnSnapshotId
             now,
             now.plus(1, ChronoUnit.HOURS), // not yet expired
@@ -160,7 +156,7 @@ class TransactionReaperTest {
   void reaperAbortsExpiredTransactionAndReleasesLocks() throws Exception {
     TransactionRow txn = insertExpiredTransaction();
     // Give the expired transaction a lock
-    lockManager.acquire(txn.txnId(), RESOURCE, LockManager.MODE_ROW_DELTA);
+    lockManager.acquire(txn.txnId(), RESOURCE, LockManager.MODE_EXCLUSIVE);
 
     // Simulate what TransactionReaper.reapTransaction does
     List<Long> expired = persistence.findExpiredTransactionIdsForRealm();
@@ -193,7 +189,7 @@ class TransactionReaperTest {
   @Test
   void reaperReleasesLocksForExpiredTransactionEnablingNewAcquire() throws Exception {
     TransactionRow expiredTxn = insertExpiredTransaction();
-    lockManager.acquire(expiredTxn.txnId(), RESOURCE, LockManager.MODE_ROW_DELTA);
+    lockManager.acquire(expiredTxn.txnId(), RESOURCE, LockManager.MODE_EXCLUSIVE);
 
     // Reap the expired transaction
     persistence.updateTransactionStatus(
@@ -202,7 +198,7 @@ class TransactionReaperTest {
 
     // A new transaction should now be able to acquire the same resource
     long newTxnId = persistence.nextTxnId();
-    long lockId = lockManager.acquire(newTxnId, RESOURCE, LockManager.MODE_ROW_DELTA);
+    long lockId = lockManager.acquire(newTxnId, RESOURCE, LockManager.MODE_EXCLUSIVE);
     assertThat(lockId).isGreaterThan(0);
   }
 }

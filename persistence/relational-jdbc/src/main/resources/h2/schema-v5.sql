@@ -19,8 +19,8 @@
 
 -- Changes from v4:
 --  * Added multi-table transaction support tables:
---    - txn_id_seq, transactions, subtransactions, txn_snapshots,
---      committed_table_snapshots, locks, txn_watermark
+--    - txn_id_seq, transactions (with parent_txn_id for nesting), transaction_operations,
+--      txn_snapshots, committed_table_snapshots, locks, txn_watermark
 --  * H2: TEXT for JSON-like columns, MERGE for version, sequences instead of BIGSERIAL,
 --    no partial indexes on txn_snapshots (H2 index DDL)
 
@@ -309,15 +309,13 @@ CREATE SEQUENCE IF NOT EXISTS txn_id_seq
 
 CREATE TABLE IF NOT EXISTS transactions (
     txn_id          BIGINT PRIMARY KEY,
+    parent_txn_id   BIGINT,
     realm_id        TEXT NOT NULL,
     catalog_id      BIGINT NOT NULL,
     txn_token       TEXT NOT NULL,
     owner_principal TEXT NOT NULL,
     status          SMALLINT NOT NULL DEFAULT 0,
     isolation       TEXT NOT NULL DEFAULT 'REPEATABLE_READ',
-    snap_xmin       BIGINT,
-    snap_xmax       BIGINT,
-    snap_xip_list   TEXT,
     txn_snapshot_id BIGINT,
     started_at      TIMESTAMP NOT NULL DEFAULT now(),
     expires_at      TIMESTAMP NOT NULL,
@@ -329,31 +327,31 @@ CREATE INDEX IF NOT EXISTS idx_txns_realm_status
 CREATE UNIQUE INDEX IF NOT EXISTS idx_txns_token
     ON transactions (txn_token);
 
-CREATE TABLE IF NOT EXISTS subtransactions (
-    subtxn_id               BIGINT PRIMARY KEY,
-    parent_txn_id           BIGINT NOT NULL,
-    realm_id                TEXT NOT NULL,
-    catalog_id              BIGINT NOT NULL,
-    table_uuid              TEXT NOT NULL,
-    operation               TEXT NOT NULL,
-    base_snapshot_id        BIGINT,
+CREATE TABLE IF NOT EXISTS transaction_operations (
+    op_id                         BIGINT PRIMARY KEY,
+    txn_id                        BIGINT NOT NULL,
+    realm_id                      TEXT NOT NULL,
+    catalog_id                    BIGINT NOT NULL,
+    table_uuid                    TEXT NOT NULL,
+    lock_mode                     TEXT NOT NULL DEFAULT 'ROW_EXCLUSIVE',
+    base_snapshot_id              BIGINT,
     server_base_metadata_location TEXT,
-    assigned_staging_path   TEXT NOT NULL,
-    staged_metadata_location TEXT,
-    subtxn_token            TEXT NOT NULL,
-    status                  SMALLINT NOT NULL DEFAULT 0,
-    retry_of_subtxn_id      BIGINT,
-    created_at              TIMESTAMP NOT NULL DEFAULT now(),
-    expires_at              TIMESTAMP NOT NULL,
-    ended_at                TIMESTAMP
+    assigned_staging_path         TEXT NOT NULL,
+    staged_metadata_location      TEXT,
+    op_token                      TEXT NOT NULL,
+    status                        SMALLINT NOT NULL DEFAULT 0,
+    retry_of_op_id                BIGINT,
+    created_at                    TIMESTAMP NOT NULL DEFAULT now(),
+    expires_at                    TIMESTAMP NOT NULL,
+    ended_at                      TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_subtxns_parent
-    ON subtransactions (parent_txn_id, status);
-CREATE INDEX IF NOT EXISTS idx_subtxns_table
-    ON subtransactions (realm_id, catalog_id, table_uuid, status);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_subtxns_token
-    ON subtransactions (subtxn_token);
+CREATE INDEX IF NOT EXISTS idx_ops_txn
+    ON transaction_operations (txn_id, status);
+CREATE INDEX IF NOT EXISTS idx_ops_table
+    ON transaction_operations (realm_id, catalog_id, table_uuid, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ops_token
+    ON transaction_operations (op_token);
 
 CREATE TABLE IF NOT EXISTS txn_snapshots (
     txn_snapshot_id BIGINT PRIMARY KEY,

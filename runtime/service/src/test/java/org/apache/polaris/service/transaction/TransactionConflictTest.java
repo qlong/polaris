@@ -39,13 +39,13 @@ import org.junit.jupiter.api.Test;
  * <p>Three scenarios exercised:
  *
  * <ol>
- *   <li><b>No conflict</b> — subtransaction's {@code server_base_metadata_location} matches the
- *       current committed state → subtxn routed to {@code direct}.
- *   <li><b>APPEND conflict → merge-retry</b> — a concurrent writer advanced the table between
- *       subtxn creation and {@code prepareCommit}; operation is APPEND → subtxn routed to {@code
- *       mergeRetry}.
- *   <li><b>Non-APPEND conflict → SerializationFailure</b> — same concurrent-write scenario but
- *       operation is OVERWRITE / ROW_DELTA → {@link
+ *   <li><b>No conflict</b> — operation's {@code server_base_metadata_location} matches the current
+ *       committed state → operation routed to {@code direct}.
+ *   <li><b>ROW_EXCLUSIVE conflict → merge-retry</b> — a concurrent writer advanced the table
+ *       between operation creation and {@code prepareCommit}; lock mode is ROW_EXCLUSIVE →
+ *       operation routed to {@code mergeRetry}.
+ *   <li><b>EXCLUSIVE conflict → SerializationFailure</b> — same concurrent-write scenario but lock
+ *       mode is EXCLUSIVE or ACCESS_EXCLUSIVE → {@link
  *       TransactionService.SerializationFailureException} is thrown and transaction is ABORTED.
  * </ol>
  */
@@ -110,17 +110,16 @@ class TransactionConflictTest {
   }
 
   /**
-   * Creates a subtransaction for {@code tableUuid} and marks it SUB_COMMITTED with the given
-   * staged path. The {@code server_base_metadata_location} is set by {@code createSubtransaction}
-   * at creation time — so call this BEFORE simulating concurrent commits.
+   * Creates an operation for {@code TABLE_UUID} and marks it COMMITTED with the staged path.
+   * The {@code server_base_metadata_location} is set by {@code createOperation} at creation time —
+   * so call this BEFORE simulating concurrent commits.
    */
-  private long beginSubtxnAndStage(long txnId, String txnToken, String operation) throws Exception {
-    var subtxn =
-        service.createSubtransaction(
-            txnId, txnToken, TABLE_UUID, operation, null, null, 3600, TABLE_META_DIR);
-    service.commitSubtransaction(
-        txnId, subtxn.subtxnId(), subtxn.subtxnToken(), subtxn.assignedStagingPath());
-    return subtxn.subtxnId();
+  private long beginOpAndStage(long txnId, String txnToken, String lockMode) throws Exception {
+    var op =
+        service.createOperation(
+            txnId, txnToken, TABLE_UUID, lockMode, null, null, 3600, TABLE_META_DIR);
+    service.commitOperation(txnId, op.opId(), op.opToken(), op.assignedStagingPath());
+    return op.opId();
   }
 
   // ---------------------------------------------------------------------------
@@ -129,12 +128,12 @@ class TransactionConflictTest {
 
   @Test
   void noConflict_routesToDirect() throws Exception {
-    // Establish a committed version that the subtxn will see as its base
+    // Establish a committed version that the operation will see as its base
     commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v1.json");
 
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
-    // createSubtransaction captures v1.json as server_base; no further commits happen
-    beginSubtxnAndStage(txn.txnId(), txn.txnToken(), "APPEND");
+    // createOperation captures v1.json as server_base; no further commits happen
+    beginOpAndStage(txn.txnId(), txn.txnToken(), "ROW_EXCLUSIVE");
 
     var result = service.prepareCommit(txn.txnId(), txn.txnToken());
 
@@ -147,7 +146,7 @@ class TransactionConflictTest {
   void noConflict_nullServerBase_alwaysRoutesToDirect() throws Exception {
     // Table has never been committed — server_base will be null; no conflict possible
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
-    beginSubtxnAndStage(txn.txnId(), txn.txnToken(), "OVERWRITE");
+    beginOpAndStage(txn.txnId(), txn.txnToken(), "EXCLUSIVE");
 
     var result = service.prepareCommit(txn.txnId(), txn.txnToken());
 
@@ -164,12 +163,12 @@ class TransactionConflictTest {
 
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
 
-    // Create and stage subtxns for both tables before any new commit
-    var subA = service.createSubtransaction(txn.txnId(), txn.txnToken(), tableA, "APPEND", null, null, 3600, "s3://bucket/a/metadata");
-    service.commitSubtransaction(txn.txnId(), subA.subtxnId(), subA.subtxnToken(), subA.assignedStagingPath());
+    // Create and stage operations for both tables before any new commit
+    var subA = service.createOperation(txn.txnId(), txn.txnToken(), tableA, "ROW_EXCLUSIVE", null, null, 3600, "s3://bucket/a/metadata");
+    service.commitOperation(txn.txnId(), subA.opId(), subA.opToken(), subA.assignedStagingPath());
 
-    var subB = service.createSubtransaction(txn.txnId(), txn.txnToken(), tableB, "APPEND", null, null, 3600, "s3://bucket/b/metadata");
-    service.commitSubtransaction(txn.txnId(), subB.subtxnId(), subB.subtxnToken(), subB.assignedStagingPath());
+    var subB = service.createOperation(txn.txnId(), txn.txnToken(), tableB, "ROW_EXCLUSIVE", null, null, 3600, "s3://bucket/b/metadata");
+    service.commitOperation(txn.txnId(), subB.opId(), subB.opToken(), subB.assignedStagingPath());
 
     var result = service.prepareCommit(txn.txnId(), txn.txnToken());
 
@@ -178,18 +177,18 @@ class TransactionConflictTest {
   }
 
   // ---------------------------------------------------------------------------
-  // 2. APPEND conflict → mergeRetry
+  // 2. ROW_EXCLUSIVE conflict → mergeRetry
   // ---------------------------------------------------------------------------
 
   @Test
-  void appendConflict_routesToMergeRetry() throws Exception {
+  void rowExclusiveConflict_routesToMergeRetry() throws Exception {
     commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v1.json");
 
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
-    // Subtxn created while v1 is current (server_base = v1)
-    beginSubtxnAndStage(txn.txnId(), txn.txnToken(), "APPEND");
+    // Operation created while v1 is current (server_base = v1)
+    beginOpAndStage(txn.txnId(), txn.txnToken(), "ROW_EXCLUSIVE");
 
-    // Concurrent writer commits v2 between subtxn creation and prepareCommit
+    // Concurrent writer commits v2 between operation creation and prepareCommit
     commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v2.json");
 
     var result = service.prepareCommit(txn.txnId(), txn.txnToken());
@@ -200,23 +199,23 @@ class TransactionConflictTest {
   }
 
   @Test
-  void appendConflict_txnRemainsInProgress() throws Exception {
+  void rowExclusiveConflict_txnRemainsInProgress() throws Exception {
     commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v1.json");
 
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
-    beginSubtxnAndStage(txn.txnId(), txn.txnToken(), "APPEND");
+    beginOpAndStage(txn.txnId(), txn.txnToken(), "ROW_EXCLUSIVE");
     commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v2.json");
 
     var result = service.prepareCommit(txn.txnId(), txn.txnToken());
 
-    // APPEND conflict does NOT abort the transaction — it goes to merge-retry
+    // ROW_EXCLUSIVE conflict does NOT abort the transaction — it goes to merge-retry
     assertThat(result.mergeRetry()).hasSize(1);
     JdbcTransactionPersistence.TransactionRow txnRow = persistence.findTransaction(txn.txnId()).orElseThrow();
     assertThat(txnRow.status()).isEqualTo(JdbcTransactionPersistence.TXN_STATUS_IN_PROGRESS);
   }
 
   @Test
-  void mixedTables_oneConflictOneClean_appendRouting() throws Exception {
+  void mixedTables_oneConflictOneClean_rowExclusiveRouting() throws Exception {
     String cleanTable = "ns.cleanTable";
     String dirtyTable = "ns.dirtyTable";
     commitTableVersion(cleanTable, "s3://bucket/clean/v1.json");
@@ -224,11 +223,11 @@ class TransactionConflictTest {
 
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
 
-    var subClean = service.createSubtransaction(txn.txnId(), txn.txnToken(), cleanTable, "APPEND", null, null, 3600, "s3://bucket/clean/metadata");
-    service.commitSubtransaction(txn.txnId(), subClean.subtxnId(), subClean.subtxnToken(), subClean.assignedStagingPath());
+    var subClean = service.createOperation(txn.txnId(), txn.txnToken(), cleanTable, "ROW_EXCLUSIVE", null, null, 3600, "s3://bucket/clean/metadata");
+    service.commitOperation(txn.txnId(), subClean.opId(), subClean.opToken(), subClean.assignedStagingPath());
 
-    var subDirty = service.createSubtransaction(txn.txnId(), txn.txnToken(), dirtyTable, "APPEND", null, null, 3600, "s3://bucket/dirty/metadata");
-    service.commitSubtransaction(txn.txnId(), subDirty.subtxnId(), subDirty.subtxnToken(), subDirty.assignedStagingPath());
+    var subDirty = service.createOperation(txn.txnId(), txn.txnToken(), dirtyTable, "ROW_EXCLUSIVE", null, null, 3600, "s3://bucket/dirty/metadata");
+    service.commitOperation(txn.txnId(), subDirty.opId(), subDirty.opToken(), subDirty.assignedStagingPath());
 
     // Concurrent writer advances only dirtyTable
     commitTableVersion(dirtyTable, "s3://bucket/dirty/v2.json");
@@ -242,15 +241,15 @@ class TransactionConflictTest {
   }
 
   // ---------------------------------------------------------------------------
-  // 3. Non-APPEND conflict → SerializationFailureException + transaction ABORTED
+  // 3. EXCLUSIVE conflict → SerializationFailureException + transaction ABORTED
   // ---------------------------------------------------------------------------
 
   @Test
-  void overwriteConflict_throwsSerializationFailure() throws Exception {
+  void exclusiveConflict_throwsSerializationFailure() throws Exception {
     commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v1.json");
 
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
-    beginSubtxnAndStage(txn.txnId(), txn.txnToken(), "OVERWRITE");
+    beginOpAndStage(txn.txnId(), txn.txnToken(), "EXCLUSIVE");
 
     // Concurrent writer commits v2
     commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v2.json");
@@ -261,11 +260,11 @@ class TransactionConflictTest {
   }
 
   @Test
-  void overwriteConflict_transactionIsAborted() throws Exception {
+  void exclusiveConflict_transactionIsAborted() throws Exception {
     commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v1.json");
 
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
-    beginSubtxnAndStage(txn.txnId(), txn.txnToken(), "OVERWRITE");
+    beginOpAndStage(txn.txnId(), txn.txnToken(), "EXCLUSIVE");
     commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v2.json");
 
     try {
@@ -280,23 +279,11 @@ class TransactionConflictTest {
   }
 
   @Test
-  void rowDeltaConflict_throwsSerializationFailure() throws Exception {
+  void accessExclusiveConflict_throwsSerializationFailure() throws Exception {
     commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v1.json");
 
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
-    beginSubtxnAndStage(txn.txnId(), txn.txnToken(), "ROW_DELTA");
-    commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v2.json");
-
-    assertThatThrownBy(() -> service.prepareCommit(txn.txnId(), txn.txnToken()))
-        .isInstanceOf(TransactionService.SerializationFailureException.class);
-  }
-
-  @Test
-  void exclusiveConflict_throwsSerializationFailure() throws Exception {
-    commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v1.json");
-
-    var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
-    beginSubtxnAndStage(txn.txnId(), txn.txnToken(), "EXCLUSIVE");
+    beginOpAndStage(txn.txnId(), txn.txnToken(), "ACCESS_EXCLUSIVE");
     commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v2.json");
 
     assertThatThrownBy(() -> service.prepareCommit(txn.txnId(), txn.txnToken()))
@@ -311,7 +298,7 @@ class TransactionConflictTest {
     JdbcTransactionPersistence.TransactionRow txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
     long txnId = txn.txnId();
     String txnToken = txn.txnToken();
-    beginSubtxnAndStage(txnId, txnToken, "OVERWRITE");
+    beginOpAndStage(txnId, txnToken, "EXCLUSIVE");
     commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v2.json");
 
     try {

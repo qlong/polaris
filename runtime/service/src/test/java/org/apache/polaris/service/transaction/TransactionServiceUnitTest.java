@@ -171,48 +171,46 @@ class TransactionServiceUnitTest {
   }
 
   // ---------------------------------------------------------------------------
-  // State machine: subtransactions
+  // State machine: operations
   // ---------------------------------------------------------------------------
 
   @Test
-  void createSubtransactionCreatesInProgressSubtxn() throws Exception {
+  void createOperationCreatesInProgressOp() throws Exception {
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
 
-    var subtxn =
-        service.createSubtransaction(
-            txn.txnId(), txn.txnToken(), "table-uuid-1", "APPEND", null, null, 3600, TABLE_METADATA_DIR);
+    var op =
+        service.createOperation(
+            txn.txnId(), txn.txnToken(), "table-uuid-1", "ROW_EXCLUSIVE", null, null, 3600, TABLE_METADATA_DIR);
 
-    assertThat(subtxn.subtxnId()).isGreaterThan(0);
-    assertThat(subtxn.subtxnToken()).isNotBlank();
-    assertThat(subtxn.status()).isEqualTo(JdbcTransactionPersistence.SUBTXN_STATUS_IN_PROGRESS);
-    assertThat(subtxn.assignedStagingPath()).startsWith(TABLE_METADATA_DIR);
-    assertThat(subtxn.assignedStagingPath()).endsWith(".metadata.json");
+    assertThat(op.opId()).isGreaterThan(0);
+    assertThat(op.opToken()).isNotBlank();
+    assertThat(op.status()).isEqualTo(JdbcTransactionPersistence.OP_STATUS_IN_PROGRESS);
+    assertThat(op.assignedStagingPath()).startsWith(TABLE_METADATA_DIR);
+    assertThat(op.assignedStagingPath()).endsWith(".metadata.json");
   }
 
   @Test
-  void commitSubtransactionTransitionsToSubCommitted() throws Exception {
+  void commitOperationTransitionsToCommitted() throws Exception {
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
-    var subtxn =
-        service.createSubtransaction(
-            txn.txnId(), txn.txnToken(), "table-uuid-2", "APPEND", null, null, 3600, TABLE_METADATA_DIR);
+    var op =
+        service.createOperation(
+            txn.txnId(), txn.txnToken(), "table-uuid-2", "ROW_EXCLUSIVE", null, null, 3600, TABLE_METADATA_DIR);
 
-    // metadata location must be under the assigned staging path
-    // assignedStagingPath is now the exact file path — pass it directly
-    String metadataLocation = subtxn.assignedStagingPath();
-    service.commitSubtransaction(
-        txn.txnId(), subtxn.subtxnId(), subtxn.subtxnToken(), metadataLocation);
+    // assignedStagingPath is the exact file path — pass it directly
+    String metadataLocation = op.assignedStagingPath();
+    service.commitOperation(txn.txnId(), op.opId(), op.opToken(), metadataLocation);
 
     var result = service.prepareCommit(txn.txnId(), txn.txnToken());
     assertThat(result.direct()).hasSize(1);
     assertThat(result.direct().get(0).status())
-        .isEqualTo(JdbcTransactionPersistence.SUBTXN_STATUS_SUB_COMMITTED);
+        .isEqualTo(JdbcTransactionPersistence.OP_STATUS_COMMITTED);
   }
 
   @Test
-  void prepareCommitFailsWhenSubtxnStillInProgress() throws Exception {
+  void prepareCommitFailsWhenOpStillInProgress() throws Exception {
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
-    service.createSubtransaction(
-        txn.txnId(), txn.txnToken(), "table-uuid-3", "APPEND", null, null, 3600, TABLE_METADATA_DIR);
+    service.createOperation(
+        txn.txnId(), txn.txnToken(), "table-uuid-3", "ROW_EXCLUSIVE", null, null, 3600, TABLE_METADATA_DIR);
 
     assertThatThrownBy(() -> service.prepareCommit(txn.txnId(), txn.txnToken()))
         .isInstanceOf(BadRequestException.class)
@@ -220,35 +218,35 @@ class TransactionServiceUnitTest {
   }
 
   @Test
-  void getSubtransactionReturnsParentTxnAndStagingPath() throws Exception {
+  void getOperationReturnsParentTxnAndStagingPath() throws Exception {
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
-    var subtxn =
-        service.createSubtransaction(
-            txn.txnId(), txn.txnToken(), "ns.orders", "APPEND", null, null, 3600, TABLE_METADATA_DIR);
+    var op =
+        service.createOperation(
+            txn.txnId(), txn.txnToken(), "ns.orders", "ROW_EXCLUSIVE", null, null, 3600, TABLE_METADATA_DIR);
 
-    var info = service.getSubtransaction(subtxn.subtxnId(), subtxn.subtxnToken());
+    var info = service.getOperation(op.opId(), op.opToken());
 
     assertThat(info.txnId()).isEqualTo(txn.txnId());
     assertThat(info.txnSnapshotId()).isEqualTo(txn.txnSnapshotId());
-    assertThat(info.assignedStagingPath()).isEqualTo(subtxn.assignedStagingPath());
+    assertThat(info.assignedStagingPath()).isEqualTo(op.assignedStagingPath());
     assertThat(info.tableUuid()).isEqualTo("ns.orders");
   }
 
   @Test
-  void getSubtransactionWithWrongTokenThrowsForbidden() throws Exception {
+  void getOperationWithWrongTokenThrowsForbidden() throws Exception {
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
-    var subtxn =
-        service.createSubtransaction(
-            txn.txnId(), txn.txnToken(), "ns.orders", "APPEND", null, null, 3600, TABLE_METADATA_DIR);
+    var op =
+        service.createOperation(
+            txn.txnId(), txn.txnToken(), "ns.orders", "ROW_EXCLUSIVE", null, null, 3600, TABLE_METADATA_DIR);
 
-    assertThatThrownBy(() -> service.getSubtransaction(subtxn.subtxnId(), "wrong-token"))
+    assertThatThrownBy(() -> service.getOperation(op.opId(), "wrong-token"))
         .isInstanceOf(ForbiddenException.class)
-        .hasMessageContaining("subtxn_token");
+        .hasMessageContaining("op_token");
   }
 
   @Test
-  void getSubtransactionWithUnknownIdThrowsNotFound() {
-    assertThatThrownBy(() -> service.getSubtransaction(99999L, "any-token"))
+  void getOperationWithUnknownIdThrowsNotFound() {
+    assertThatThrownBy(() -> service.getOperation(99999L, "any-token"))
         .isInstanceOf(NotFoundException.class)
         .hasMessageContaining("99999");
   }

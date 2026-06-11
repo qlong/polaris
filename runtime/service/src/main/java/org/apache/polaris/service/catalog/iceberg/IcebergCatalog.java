@@ -424,25 +424,6 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
     return lockManager;
   }
 
-  /**
-   * Derives the Iceberg operation type from the metadata transition for use in lock compatibility
-   * checks. Returns "APPEND" for purely additive changes (no rewritten files), "ROW_DELTA" for
-   * positional-delete or equality-delete additions, and "OVERWRITE" for partition overwrites.
-   */
-  private static String deriveOperationFromMetadata(
-      @Nullable TableMetadata base, TableMetadata metadata) {
-    if (base == null) return "APPEND";
-    var current = metadata.currentSnapshot();
-    if (current == null) return "APPEND";
-    String op = current.operation();
-    if (op == null) return "APPEND";
-    return switch (op.toLowerCase(Locale.ROOT)) {
-      case "delete", "overwrite" -> "OVERWRITE";
-      case "replace" -> "EXCLUSIVE";
-      default -> "APPEND";
-    };
-  }
-
   @VisibleForTesting
   public void setCatalogFileIo(FileIO fileIO) {
     catalogFileIO = fileIO;
@@ -1857,11 +1838,10 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
         // (old and new clients). This is the only enforcement point because old clients
         // are invisible to the server until they call doCommit.
         String tableUuid = entity.getId() + "";
-        String operation = deriveOperationFromMetadata(base, metadata);
         try {
           LockManager lockManager = getLockManagerIfPresent();
           if (lockManager != null) {
-            lockManager.checkConflictAtCommit(tableUuid, operation, -1L);
+            lockManager.checkConflictAtCommit(tableUuid, -1L);
           }
         } catch (CommitFailedException e) {
           throw e;

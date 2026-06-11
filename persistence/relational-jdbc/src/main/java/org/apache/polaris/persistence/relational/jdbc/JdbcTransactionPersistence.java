@@ -38,7 +38,7 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Raw JDBC persistence for the multi-table transaction extension tables introduced in schema v5:
- * {@code transactions}, {@code subtransactions}, {@code txn_snapshots}, {@code
+ * {@code transactions}, {@code transaction_operations}, {@code txn_snapshots}, {@code
  * committed_table_snapshots}, {@code locks}, {@code txn_watermark}.
  *
  * <p>Uses {@link DataSource} directly (borrowed from the same pool as {@link
@@ -57,11 +57,11 @@ public class JdbcTransactionPersistence {
   public static final int TXN_STATUS_COMMITTED = 1;
   public static final int TXN_STATUS_ABORTED = 2;
 
-  /** Status codes for the {@code subtransactions} table. */
-  public static final int SUBTXN_STATUS_IN_PROGRESS = 0;
+  /** Status codes for the {@code transaction_operations} table. */
+  public static final int OP_STATUS_IN_PROGRESS = 0;
 
-  public static final int SUBTXN_STATUS_SUB_COMMITTED = 1;
-  public static final int SUBTXN_STATUS_SUB_ABORTED = 2;
+  public static final int OP_STATUS_COMMITTED = 1;
+  public static final int OP_STATUS_ABORTED = 2;
 
   /** Status codes for the {@code locks} table. */
   public static final int LOCK_STATUS_WAITING = 0;
@@ -145,15 +145,13 @@ public class JdbcTransactionPersistence {
 
   public record TransactionRow(
       long txnId,
+      @Nullable Long parentTxnId,
       String realmId,
       long catalogId,
       String txnToken,
       String ownerPrincipal,
       int status,
       String isolation,
-      @Nullable Long snapXmin,
-      @Nullable Long snapXmax,
-      @Nullable String snapXipList,
       @Nullable Long txnSnapshotId,
       Instant startedAt,
       Instant expiresAt,
@@ -162,33 +160,31 @@ public class JdbcTransactionPersistence {
   public void insertTransaction(@Nonnull TransactionRow row) throws SQLException {
     String sql =
         "INSERT INTO POLARIS_SCHEMA.transactions "
-            + "(txn_id, realm_id, catalog_id, txn_token, owner_principal, status, isolation, "
-            + " snap_xmin, snap_xmax, snap_xip_list, txn_snapshot_id, started_at, expires_at) "
-            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            + "(txn_id, parent_txn_id, realm_id, catalog_id, txn_token, owner_principal, "
+            + " status, isolation, txn_snapshot_id, started_at, expires_at) "
+            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
       conn.setAutoCommit(true);
       ps.setLong(1, row.txnId());
-      ps.setString(2, row.realmId());
-      ps.setLong(3, row.catalogId());
-      ps.setString(4, row.txnToken());
-      ps.setString(5, row.ownerPrincipal());
-      ps.setInt(6, row.status());
-      ps.setString(7, row.isolation());
-      setNullableLong(ps, 8, row.snapXmin());
-      setNullableLong(ps, 9, row.snapXmax());
-      ps.setString(10, row.snapXipList());
-      setNullableLong(ps, 11, row.txnSnapshotId());
-      ps.setTimestamp(12, Timestamp.from(row.startedAt()));
-      ps.setTimestamp(13, Timestamp.from(row.expiresAt()));
+      setNullableLong(ps, 2, row.parentTxnId());
+      ps.setString(3, row.realmId());
+      ps.setLong(4, row.catalogId());
+      ps.setString(5, row.txnToken());
+      ps.setString(6, row.ownerPrincipal());
+      ps.setInt(7, row.status());
+      ps.setString(8, row.isolation());
+      setNullableLong(ps, 9, row.txnSnapshotId());
+      ps.setTimestamp(10, Timestamp.from(row.startedAt()));
+      ps.setTimestamp(11, Timestamp.from(row.expiresAt()));
       ps.executeUpdate();
     }
   }
 
   public Optional<TransactionRow> findTransaction(long txnId) throws SQLException {
     String sql =
-        "SELECT txn_id, realm_id, catalog_id, txn_token, owner_principal, status, isolation, "
-            + "snap_xmin, snap_xmax, snap_xip_list, txn_snapshot_id, started_at, expires_at, ended_at "
+        "SELECT txn_id, parent_txn_id, realm_id, catalog_id, txn_token, owner_principal, "
+            + "status, isolation, txn_snapshot_id, started_at, expires_at, ended_at "
             + "FROM POLARIS_SCHEMA.transactions WHERE txn_id = ? AND realm_id = ?";
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -268,15 +264,13 @@ public class JdbcTransactionPersistence {
   private TransactionRow rowToTransaction(ResultSet rs) throws SQLException {
     return new TransactionRow(
         rs.getLong("txn_id"),
+        getNullableLong(rs, "parent_txn_id"),
         rs.getString("realm_id"),
         rs.getLong("catalog_id"),
         rs.getString("txn_token"),
         rs.getString("owner_principal"),
         rs.getInt("status"),
         rs.getString("isolation"),
-        getNullableLong(rs, "snap_xmin"),
-        getNullableLong(rs, "snap_xmax"),
-        rs.getString("snap_xip_list"),
         getNullableLong(rs, "txn_snapshot_id"),
         toInstant(rs.getTimestamp("started_at")),
         toInstant(rs.getTimestamp("expires_at")),
@@ -286,135 +280,136 @@ public class JdbcTransactionPersistence {
   // ---------------------------------------------------------------------------
   // subtransactions
   // ---------------------------------------------------------------------------
+  // transaction_operations
+  // ---------------------------------------------------------------------------
 
-  public record SubtransactionRow(
-      long subtxnId,
-      long parentTxnId,
+  public record OperationRow(
+      long opId,
+      long txnId,
       String realmId,
       long catalogId,
       String tableUuid,
-      String operation,
+      String lockMode,
       @Nullable Long baseSnapshotId,
       @Nullable String serverBaseMetadataLocation,
       String assignedStagingPath,
       @Nullable String stagedMetadataLocation,
-      String subtxnToken,
+      String opToken,
       int status,
-      @Nullable Long retryOfSubtxnId,
+      @Nullable Long retryOfOpId,
       Instant createdAt,
       Instant expiresAt,
       @Nullable Instant endedAt) {}
 
-  public void insertSubtransaction(@Nonnull SubtransactionRow row) throws SQLException {
+  public void insertOperation(@Nonnull OperationRow row) throws SQLException {
     String sql =
-        "INSERT INTO POLARIS_SCHEMA.subtransactions "
-            + "(subtxn_id, parent_txn_id, realm_id, catalog_id, table_uuid, operation, "
+        "INSERT INTO POLARIS_SCHEMA.transaction_operations "
+            + "(op_id, txn_id, realm_id, catalog_id, table_uuid, lock_mode, "
             + " base_snapshot_id, server_base_metadata_location, assigned_staging_path, "
-            + " subtxn_token, status, retry_of_subtxn_id, created_at, expires_at) "
+            + " op_token, status, retry_of_op_id, created_at, expires_at) "
             + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
       conn.setAutoCommit(true);
-      ps.setLong(1, row.subtxnId());
-      ps.setLong(2, row.parentTxnId());
+      ps.setLong(1, row.opId());
+      ps.setLong(2, row.txnId());
       ps.setString(3, row.realmId());
       ps.setLong(4, row.catalogId());
       ps.setString(5, row.tableUuid());
-      ps.setString(6, row.operation());
+      ps.setString(6, row.lockMode());
       setNullableLong(ps, 7, row.baseSnapshotId());
       ps.setString(8, row.serverBaseMetadataLocation());
       ps.setString(9, row.assignedStagingPath());
-      ps.setString(10, row.subtxnToken());
+      ps.setString(10, row.opToken());
       ps.setInt(11, row.status());
-      setNullableLong(ps, 12, row.retryOfSubtxnId());
+      setNullableLong(ps, 12, row.retryOfOpId());
       ps.setTimestamp(13, Timestamp.from(row.createdAt()));
       ps.setTimestamp(14, Timestamp.from(row.expiresAt()));
       ps.executeUpdate();
     }
   }
 
-  public Optional<SubtransactionRow> findSubtransaction(long subtxnId) throws SQLException {
+  public Optional<OperationRow> findOperation(long opId) throws SQLException {
     String sql =
-        "SELECT subtxn_id, parent_txn_id, realm_id, catalog_id, table_uuid, operation, "
+        "SELECT op_id, txn_id, realm_id, catalog_id, table_uuid, lock_mode, "
             + "base_snapshot_id, server_base_metadata_location, assigned_staging_path, "
-            + "staged_metadata_location, subtxn_token, status, retry_of_subtxn_id, "
+            + "staged_metadata_location, op_token, status, retry_of_op_id, "
             + "created_at, expires_at, ended_at "
-            + "FROM POLARIS_SCHEMA.subtransactions WHERE subtxn_id = ? AND realm_id = ?";
+            + "FROM POLARIS_SCHEMA.transaction_operations WHERE op_id = ? AND realm_id = ?";
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
-      ps.setLong(1, subtxnId);
+      ps.setLong(1, opId);
       ps.setString(2, realmId);
       try (ResultSet rs = ps.executeQuery()) {
-        return rs.next() ? Optional.of(rowToSubtransaction(rs)) : Optional.empty();
+        return rs.next() ? Optional.of(rowToOperation(rs)) : Optional.empty();
       }
     }
   }
 
-  public List<SubtransactionRow> findSubtransactionsForTransaction(long txnId) throws SQLException {
+  public List<OperationRow> findOperationsForTransaction(long txnId) throws SQLException {
     String sql =
-        "SELECT subtxn_id, parent_txn_id, realm_id, catalog_id, table_uuid, operation, "
+        "SELECT op_id, txn_id, realm_id, catalog_id, table_uuid, lock_mode, "
             + "base_snapshot_id, server_base_metadata_location, assigned_staging_path, "
-            + "staged_metadata_location, subtxn_token, status, retry_of_subtxn_id, "
+            + "staged_metadata_location, op_token, status, retry_of_op_id, "
             + "created_at, expires_at, ended_at "
-            + "FROM POLARIS_SCHEMA.subtransactions WHERE parent_txn_id = ? AND realm_id = ?";
-    List<SubtransactionRow> rows = new ArrayList<>();
+            + "FROM POLARIS_SCHEMA.transaction_operations WHERE txn_id = ? AND realm_id = ?";
+    List<OperationRow> rows = new ArrayList<>();
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
       ps.setLong(1, txnId);
       ps.setString(2, realmId);
       try (ResultSet rs = ps.executeQuery()) {
-        while (rs.next()) rows.add(rowToSubtransaction(rs));
+        while (rs.next()) rows.add(rowToOperation(rs));
       }
     }
     return rows;
   }
 
-  public void markSubtransactionCommitted(long subtxnId, String stagedMetadataLocation)
-      throws SQLException {
+  public void markOperationCommitted(long opId, String stagedMetadataLocation) throws SQLException {
     String sql =
-        "UPDATE POLARIS_SCHEMA.subtransactions "
+        "UPDATE POLARIS_SCHEMA.transaction_operations "
             + "SET status = ?, staged_metadata_location = ?, ended_at = now() "
-            + "WHERE subtxn_id = ? AND realm_id = ?";
+            + "WHERE op_id = ? AND realm_id = ?";
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
       conn.setAutoCommit(true);
-      ps.setInt(1, SUBTXN_STATUS_SUB_COMMITTED);
+      ps.setInt(1, OP_STATUS_COMMITTED);
       ps.setString(2, stagedMetadataLocation);
-      ps.setLong(3, subtxnId);
+      ps.setLong(3, opId);
       ps.setString(4, realmId);
       ps.executeUpdate();
     }
   }
 
-  public void markSubtransactionAborted(long subtxnId) throws SQLException {
+  public void markOperationAborted(long opId) throws SQLException {
     String sql =
-        "UPDATE POLARIS_SCHEMA.subtransactions SET status = ?, ended_at = now() "
-            + "WHERE subtxn_id = ? AND realm_id = ?";
+        "UPDATE POLARIS_SCHEMA.transaction_operations SET status = ?, ended_at = now() "
+            + "WHERE op_id = ? AND realm_id = ?";
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
       conn.setAutoCommit(true);
-      ps.setInt(1, SUBTXN_STATUS_SUB_ABORTED);
-      ps.setLong(2, subtxnId);
+      ps.setInt(1, OP_STATUS_ABORTED);
+      ps.setLong(2, opId);
       ps.setString(3, realmId);
       ps.executeUpdate();
     }
   }
 
-  private SubtransactionRow rowToSubtransaction(ResultSet rs) throws SQLException {
-    return new SubtransactionRow(
-        rs.getLong("subtxn_id"),
-        rs.getLong("parent_txn_id"),
+  private OperationRow rowToOperation(ResultSet rs) throws SQLException {
+    return new OperationRow(
+        rs.getLong("op_id"),
+        rs.getLong("txn_id"),
         rs.getString("realm_id"),
         rs.getLong("catalog_id"),
         rs.getString("table_uuid"),
-        rs.getString("operation"),
+        rs.getString("lock_mode"),
         getNullableLong(rs, "base_snapshot_id"),
         rs.getString("server_base_metadata_location"),
         rs.getString("assigned_staging_path"),
         rs.getString("staged_metadata_location"),
-        rs.getString("subtxn_token"),
+        rs.getString("op_token"),
         rs.getInt("status"),
-        getNullableLong(rs, "retry_of_subtxn_id"),
+        getNullableLong(rs, "retry_of_op_id"),
         toInstant(rs.getTimestamp("created_at")),
         toInstant(rs.getTimestamp("expires_at")),
         toInstant(rs.getTimestamp("ended_at")));
@@ -784,6 +779,19 @@ public class JdbcTransactionPersistence {
       conn.setAutoCommit(true);
       ps.setLong(1, txnId);
       ps.setString(2, realmId);
+      ps.executeUpdate();
+    }
+  }
+
+  public void deleteLockForResource(long txnId, @Nonnull String resource) throws SQLException {
+    String sql =
+        "DELETE FROM POLARIS_SCHEMA.locks WHERE txn_id = ? AND realm_id = ? AND resource = ?";
+    try (Connection conn = dataSource.getConnection();
+        PreparedStatement ps = conn.prepareStatement(sql)) {
+      conn.setAutoCommit(true);
+      ps.setLong(1, txnId);
+      ps.setString(2, realmId);
+      ps.setString(3, resource);
       ps.executeUpdate();
     }
   }

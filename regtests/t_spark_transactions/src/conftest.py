@@ -169,7 +169,7 @@ def test_ns(txn_spark, catalog_name):
         # Best-effort cleanup; suppress errors so teardown never masks a test failure
         for table in ("orders", "customers"):
             try:
-                txn_spark.sql(f"DROP TABLE IF EXISTS {cat}.{ns}.{table} PURGE")
+                txn_spark.sql(f"DROP TABLE IF EXISTS {cat}.{ns}.{table}")
             except Exception:
                 pass
         try:

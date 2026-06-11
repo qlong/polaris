@@ -34,7 +34,7 @@ import org.apache.iceberg.util.LocationUtil;
 import org.apache.polaris.core.auth.PolarisPrincipal;
 import org.apache.polaris.core.context.RealmContext;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence;
-import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.SubtransactionRow;
+import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.OperationRow;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.TransactionRow;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.TxnSnapshotRow;
 import org.apache.polaris.service.catalog.CatalogPrefixParser;
@@ -42,7 +42,7 @@ import org.apache.polaris.service.catalog.api.PolarisCatalogTransactionApiServic
 import org.apache.polaris.service.catalog.common.CatalogAdapter;
 import org.apache.polaris.service.catalog.iceberg.IcebergCatalogHandler;
 import org.apache.polaris.service.catalog.iceberg.IcebergCatalogHandlerFactory;
-import org.apache.polaris.service.transaction.LockManager.LockWaitTimeoutException;
+import org.apache.polaris.service.transaction.LockManager.LockConflictException;
 import org.apache.polaris.service.transaction.TransactionService;
 import org.apache.polaris.service.types.BeginTransactionRequest;
 import org.apache.polaris.service.types.GetSubtransactionResponse;
@@ -280,7 +280,7 @@ public class TransactionCatalogAdapter
                               t.getTableIdentifier(),
                               t.getStagedMetadataLocation(),
                               null,
-                              t.getOperation() != null ? t.getOperation().name() : "APPEND"))
+                              t.getOperation() != null ? t.getOperation().name() : "ROW_EXCLUSIVE"))
                   .toList();
           TransactionService.PrepareInlineResult result =
               txnService.prepareInlineCommit(txnId, xTxnToken, inputTables);
@@ -345,8 +345,8 @@ public class TransactionCatalogAdapter
     }
     try {
       TransactionService txnService = openTxnService(securityContext, prefix);
-      TransactionService.SubtransactionInfo info =
-          txnService.getSubtransaction(subtxnId, xSubtxnToken);
+      TransactionService.OperationInfo info =
+          txnService.getOperation(subtxnId, xSubtxnToken);
       return Response.ok(
               new GetSubtransactionResponse(
                   info.txnId(), info.txnSnapshotId(),
@@ -357,7 +357,7 @@ public class TransactionCatalogAdapter
     } catch (jakarta.ws.rs.NotFoundException e) {
       return notFound(e.getMessage());
     } catch (java.sql.SQLException e) {
-      return serverError("getSubtransaction failed", e);
+      return serverError("getOperation failed", e);
     }
   }
 
@@ -426,24 +426,37 @@ public class TransactionCatalogAdapter
       String tableMetadataDir = resolveTableMetadataDir(
           handlerFactory, catalogName, principal,
           createSubtransactionRequest.getTableIdentifier());
-      LockMode op = createSubtransactionRequest.getOperation();
-      String operation = (op != null ? op : LockMode.APPEND).name();
-      SubtransactionRow subtxn =
-          txnService.createSubtransaction(
+      LockMode lockModeEnum = createSubtransactionRequest.getOperation();
+      String lockMode = (lockModeEnum != null ? lockModeEnum : LockMode.ROW_EXCLUSIVE).name();
+      OperationRow op =
+          txnService.createOperation(
               txnId,
               xTxnToken,
               createSubtransactionRequest.getTableIdentifier(),
-              operation,
+              lockMode,
               null,
               createSubtransactionRequest.getRetryOfSubtxnId(),
               createSubtransactionRequest.getLeaseSeconds(),
               tableMetadataDir);
-      return Response.ok(toSubtransaction(subtxn, true)).build();
+      return Response.ok(toSubtransaction(op, true)).build();
     } catch (jakarta.ws.rs.BadRequestException | jakarta.ws.rs.ForbiddenException e) {
       return Response.status(e instanceof jakarta.ws.rs.ForbiddenException ? 403 : 400)
           .entity(simpleError(e.getMessage()))
           .build();
-    } catch (LockWaitTimeoutException e) {
+    } catch (LockConflictException e) {
+      long retryAfterMs = e.retryAfterMs();
+      if (retryAfterMs > 0) {
+        // EXCLUSIVE/ACCESS_EXCLUSIVE conflict: tell the client to retry with backoff.
+        return Response.status(409)
+            .entity(
+                ErrorResponse.builder()
+                    .responseCode(409)
+                    .withType("LockConflictError")
+                    .withMessage(String.valueOf(retryAfterMs))
+                    .build())
+            .build();
+      }
+      // ROW_EXCLUSIVE blocked by held EXCLUSIVE/ACCESS_EXCLUSIVE: fail immediately.
       return Response.status(409).entity(simpleError(e.getMessage())).build();
     } catch (SQLException e) {
       return serverError("createSubtransaction failed", e);
@@ -476,7 +489,7 @@ public class TransactionCatalogAdapter
     }
     try {
       TransactionService txnService = openTxnService(securityContext, prefix);
-      txnService.commitSubtransaction(txnId, subtxnId, xSubtxnToken, staged);
+      txnService.commitOperation(txnId, subtxnId, xSubtxnToken, staged);
       return Response.noContent().build();
     } catch (jakarta.ws.rs.BadRequestException e) {
       return Response.status(400).entity(simpleError(e.getMessage())).build();
@@ -500,7 +513,7 @@ public class TransactionCatalogAdapter
       SecurityContext securityContext) {
     try {
       TransactionService txnService = openTxnService(securityContext, prefix);
-      txnService.abortSubtransaction(txnId, subtxnId, xSubtxnToken, xTxnToken);
+      txnService.abortOperation(txnId, subtxnId, xSubtxnToken, xTxnToken);
       return Response.noContent().build();
     } catch (jakarta.ws.rs.BadRequestException e) {
       return Response.status(400).entity(simpleError(e.getMessage())).build();
@@ -524,8 +537,8 @@ public class TransactionCatalogAdapter
       SecurityContext securityContext) {
     try {
       TransactionService txnService = openTxnService(securityContext, prefix);
-      SubtransactionRow row =
-          txnService.renewSubtransaction(
+      OperationRow row =
+          txnService.renewOperation(
               txnId, subtxnId, xSubtxnToken, renewLeaseRequest.getLeaseSeconds());
       return Response.ok(toSubtransaction(row, false)).build();
     } catch (jakarta.ws.rs.ForbiddenException e) {
@@ -570,18 +583,18 @@ public class TransactionCatalogAdapter
     }
   }
 
-  private static Subtransaction toSubtransaction(SubtransactionRow sub, boolean includeToken) {
+  private static Subtransaction toSubtransaction(OperationRow op, boolean includeToken) {
     return new Subtransaction(
-        sub.subtxnId(),
-        includeToken ? sub.subtxnToken() : null,
-        sub.parentTxnId(),
-        sub.tableUuid(),
-        LockMode.valueOf(sub.operation()),
-        sub.baseSnapshotId(),
-        sub.assignedStagingPath(),
-        sub.stagedMetadataLocation(),
-        toSubtransactionStatus(sub.status()),
-        Date.from(sub.expiresAt()));
+        op.opId(),
+        includeToken ? op.opToken() : null,
+        op.txnId(),
+        op.tableUuid(),
+        LockMode.valueOf(op.lockMode()),
+        op.baseSnapshotId(),
+        op.assignedStagingPath(),
+        op.stagedMetadataLocation(),
+        toSubtransactionStatus(op.status()),
+        Date.from(op.expiresAt()));
   }
 
   private static TransactionStatus toTransactionStatus(int status) {
@@ -594,9 +607,8 @@ public class TransactionCatalogAdapter
 
   private static SubtransactionStatus toSubtransactionStatus(int status) {
     return switch (status) {
-      case JdbcTransactionPersistence.SUBTXN_STATUS_SUB_COMMITTED ->
-          SubtransactionStatus.SUB_COMMITTED;
-      case JdbcTransactionPersistence.SUBTXN_STATUS_SUB_ABORTED -> SubtransactionStatus.SUB_ABORTED;
+      case JdbcTransactionPersistence.OP_STATUS_COMMITTED -> SubtransactionStatus.COMMITTED;
+      case JdbcTransactionPersistence.OP_STATUS_ABORTED -> SubtransactionStatus.ABORTED;
       default -> SubtransactionStatus.IN_PROGRESS;
     };
   }

@@ -296,12 +296,12 @@ public class TransactionManagerTest {
 
     txnManager.begin(mockSpark, "REPEATABLE_READ"); // PENDING — no REST call yet
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
-    txnManager.createSubtransactionForOrchestrator(mockSpark, orders, "APPEND");
+    txnManager.createSubtransactionForOrchestrator(mockSpark, orders, "ROW_EXCLUSIVE");
 
     // beginTransaction must have fired on the first CREATE SUBTRANSACTION FOR
     verify(mockRestCatalog).beginTransaction("REPEATABLE_READ", TransactionManager.DEFAULT_LEASE_SECONDS);
     verify(mockRestCatalog).createSubtransaction(
-        10L, "tok10", "demo_ns.orders", "APPEND", TransactionManager.DEFAULT_LEASE_SECONDS);
+        10L, "tok10", "demo_ns.orders", "ROW_EXCLUSIVE", TransactionManager.DEFAULT_LEASE_SECONDS);
     assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_ID, CATALOG))).isEqualTo("10");
     assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG))).isEqualTo("tok10");
     assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_SNAPSHOT_ID, CATALOG))).isEqualTo("50");
@@ -318,18 +318,18 @@ public class TransactionManagerTest {
         .thenReturn(subtxnResp);
 
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
-    txnManager.createSubtransactionForOrchestrator(mockSpark, orders, "APPEND");
+    txnManager.createSubtransactionForOrchestrator(mockSpark, orders, "ROW_EXCLUSIVE");
 
     verify(mockRestCatalog, never()).beginTransaction(anyString(), anyInt());
     verify(mockRestCatalog).createSubtransaction(
-        99L, "tok99", "demo_ns.orders", "APPEND", TransactionManager.DEFAULT_LEASE_SECONDS);
+        99L, "tok99", "demo_ns.orders", "ROW_EXCLUSIVE", TransactionManager.DEFAULT_LEASE_SECONDS);
   }
 
   @Test
   public void testCreateSubtransactionThrowsWhenNoTransaction() {
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
 
-    assertThatThrownBy(() -> txnManager.createSubtransactionForOrchestrator(mockSpark, orders, "APPEND"))
+    assertThatThrownBy(() -> txnManager.createSubtransactionForOrchestrator(mockSpark, orders, "ROW_EXCLUSIVE"))
         .isInstanceOf(IllegalStateException.class)
         .hasMessageContaining("No active transaction");
   }
@@ -341,7 +341,7 @@ public class TransactionManagerTest {
   @Test
   public void testBeginWorkerSubtransactionSetsConfWithoutRyow() {
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
-    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "APPEND");
+    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "ROW_EXCLUSIVE");
 
     // Worker conf keys must be set
     assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_ID, CATALOG)))
@@ -369,7 +369,7 @@ public class TransactionManagerTest {
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
 
     assertThatThrownBy(
-            () -> txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "APPEND"))
+            () -> txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "ROW_EXCLUSIVE"))
         .isInstanceOf(IllegalStateException.class)
         .hasMessageContaining("Transaction already in progress");
   }
@@ -377,7 +377,7 @@ public class TransactionManagerTest {
   @Test
   public void testWorkerStagingPathReturnedByGetter() {
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
-    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "APPEND");
+    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "ROW_EXCLUSIVE");
 
     Optional<String> path = txnManager.getWorkerStagingPath(mockSpark);
     assertThat(path).hasValue("file:///tmp/txn-42.metadata.json");
@@ -388,7 +388,7 @@ public class TransactionManagerTest {
     assertThat(txnManager.isWorkerMode(mockSpark)).isFalse();
 
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
-    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "APPEND");
+    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "ROW_EXCLUSIVE");
 
     assertThat(txnManager.isWorkerMode(mockSpark)).isTrue();
   }
@@ -396,9 +396,9 @@ public class TransactionManagerTest {
   @Test
   public void testCommitWorkerSubtransactionCallsRestAndClearsConf() {
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
-    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "APPEND");
+    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "ROW_EXCLUSIVE");
     // Simulate PinnedTableOperations.commit() having written the staged path
-    txnManager.stageWrite(mockSpark, orders, "file:///tmp/txn-42.metadata.json", "APPEND");
+    txnManager.stageWrite(mockSpark, orders, "file:///tmp/txn-42.metadata.json", "ROW_EXCLUSIVE");
 
     txnManager.commitWorkerSubtransaction(mockSpark);
 
@@ -416,7 +416,7 @@ public class TransactionManagerTest {
   @Test
   public void testRollbackWorkerSubtransactionClearsConfWithoutRestCall() {
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
-    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "APPEND");
+    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "ROW_EXCLUSIVE");
 
     txnManager.rollbackWorkerSubtransaction(mockSpark);
 
@@ -435,7 +435,7 @@ public class TransactionManagerTest {
   @Test
   public void testOrchestratorCommitThrowsInWorkerMode() {
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
-    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "APPEND");
+    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "ROW_EXCLUSIVE");
 
     assertThatThrownBy(() -> txnManager.commit(mockSpark))
         .isInstanceOf(IllegalStateException.class)

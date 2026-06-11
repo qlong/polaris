@@ -45,7 +45,7 @@ def _create_subtxn(client, txn: dict, ns: str, table: str) -> dict:
     """Create a subtransaction for ns.table and return the parsed response dict."""
     resp = client.post(
         f"/transactions/{txn['txn_id']}/subtransactions",
-        {"table_identifier": f"{ns}.{table}", "operation": "APPEND", "lease_seconds": 60},
+        {"table_identifier": f"{ns}.{table}", "operation": "ROW_EXCLUSIVE", "lease_seconds": 60},
         extra_headers={"X-Txn-Token": txn["txn_token"]},
     )
     resp.raise_for_status()

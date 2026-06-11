@@ -90,15 +90,13 @@ class JdbcTransactionPersistenceTest {
     JdbcTransactionPersistence.TransactionRow row =
         new JdbcTransactionPersistence.TransactionRow(
             txnId,
+            null,
             REALM,
             CATALOG_ID,
             "tok-" + txnId,
             "alice",
             JdbcTransactionPersistence.TXN_STATUS_IN_PROGRESS,
             "REPEATABLE_READ",
-            null,
-            null,
-            null,
             null,
             now,
             expires,
@@ -159,15 +157,13 @@ class JdbcTransactionPersistenceTest {
     JdbcTransactionPersistence.TransactionRow expired =
         new JdbcTransactionPersistence.TransactionRow(
             expiredId,
+            null,
             REALM,
             CATALOG_ID,
             "tok-" + expiredId,
             "bob",
             JdbcTransactionPersistence.TXN_STATUS_IN_PROGRESS,
             "REPEATABLE_READ",
-            null,
-            null,
-            null,
             null,
             Instant.now().minusSeconds(600),
             Instant.now().minusSeconds(1), // already expired
@@ -178,15 +174,13 @@ class JdbcTransactionPersistenceTest {
     JdbcTransactionPersistence.TransactionRow active =
         new JdbcTransactionPersistence.TransactionRow(
             activeId,
+            null,
             REALM,
             CATALOG_ID,
             "tok-" + activeId,
             "carol",
             JdbcTransactionPersistence.TXN_STATUS_IN_PROGRESS,
             "REPEATABLE_READ",
-            null,
-            null,
-            null,
             null,
             Instant.now(),
             Instant.now().plusSeconds(300),
@@ -198,98 +192,94 @@ class JdbcTransactionPersistenceTest {
   }
 
   // ---------------------------------------------------------------------------
-  // subtransactions
+  // transaction_operations
   // ---------------------------------------------------------------------------
 
   @Test
-  void insertAndFindSubtransaction() throws SQLException {
+  void insertAndFindOperation() throws SQLException {
     long txnId = persistence.nextTxnId();
     insertSimpleTransaction(txnId);
 
-    long subtxnId = persistence.nextTxnId();
+    long opId = persistence.nextTxnId();
     Instant now = Instant.now();
-    JdbcTransactionPersistence.SubtransactionRow sub =
-        new JdbcTransactionPersistence.SubtransactionRow(
-            subtxnId,
+    JdbcTransactionPersistence.OperationRow op =
+        new JdbcTransactionPersistence.OperationRow(
+            opId,
             txnId,
             REALM,
             CATALOG_ID,
             "table-uuid-1",
-            "APPEND",
+            "ROW_EXCLUSIVE",
+            null,
             null,
             "s3://staging/path",
             null,
-            "subtok-" + subtxnId,
-            JdbcTransactionPersistence.SUBTXN_STATUS_IN_PROGRESS,
+            "subtok-" + opId,
+            JdbcTransactionPersistence.OP_STATUS_IN_PROGRESS,
             null,
             now,
             now.plusSeconds(60),
             null);
 
-    persistence.insertSubtransaction(sub);
+    persistence.insertOperation(op);
 
-    Optional<JdbcTransactionPersistence.SubtransactionRow> found =
-        persistence.findSubtransaction(subtxnId);
+    Optional<JdbcTransactionPersistence.OperationRow> found = persistence.findOperation(opId);
     assertThat(found).isPresent();
-    JdbcTransactionPersistence.SubtransactionRow r = found.get();
-    assertThat(r.subtxnId()).isEqualTo(subtxnId);
-    assertThat(r.parentTxnId()).isEqualTo(txnId);
+    JdbcTransactionPersistence.OperationRow r = found.get();
+    assertThat(r.opId()).isEqualTo(opId);
+    assertThat(r.txnId()).isEqualTo(txnId);
     assertThat(r.tableUuid()).isEqualTo("table-uuid-1");
-    assertThat(r.operation()).isEqualTo("APPEND");
+    assertThat(r.lockMode()).isEqualTo("ROW_EXCLUSIVE");
     assertThat(r.assignedStagingPath()).isEqualTo("s3://staging/path");
     assertThat(r.stagedMetadataLocation()).isNull();
-    assertThat(r.status()).isEqualTo(JdbcTransactionPersistence.SUBTXN_STATUS_IN_PROGRESS);
+    assertThat(r.status()).isEqualTo(JdbcTransactionPersistence.OP_STATUS_IN_PROGRESS);
   }
 
   @Test
-  void findSubtransactionsForTransactionReturnsAllChildren() throws SQLException {
+  void findOperationsForTransactionReturnsAllChildren() throws SQLException {
     long txnId = persistence.nextTxnId();
     insertSimpleTransaction(txnId);
 
-    long sub1 = persistence.nextTxnId();
-    long sub2 = persistence.nextTxnId();
-    insertSimpleSubtransaction(sub1, txnId);
-    insertSimpleSubtransaction(sub2, txnId);
+    long op1 = persistence.nextTxnId();
+    long op2 = persistence.nextTxnId();
+    insertSimpleOperation(op1, txnId);
+    insertSimpleOperation(op2, txnId);
 
-    List<JdbcTransactionPersistence.SubtransactionRow> rows =
-        persistence.findSubtransactionsForTransaction(txnId);
+    List<JdbcTransactionPersistence.OperationRow> rows =
+        persistence.findOperationsForTransaction(txnId);
     assertThat(rows).hasSize(2);
-    assertThat(rows.stream().map(JdbcTransactionPersistence.SubtransactionRow::subtxnId))
-        .containsExactlyInAnyOrder(sub1, sub2);
+    assertThat(rows.stream().map(JdbcTransactionPersistence.OperationRow::opId))
+        .containsExactlyInAnyOrder(op1, op2);
   }
 
   @Test
-  void markSubtransactionCommittedUpdatesStatus() throws SQLException {
+  void markOperationCommittedUpdatesStatus() throws SQLException {
     long txnId = persistence.nextTxnId();
     insertSimpleTransaction(txnId);
-    long subtxnId = persistence.nextTxnId();
-    insertSimpleSubtransaction(subtxnId, txnId);
+    long opId = persistence.nextTxnId();
+    insertSimpleOperation(opId, txnId);
 
-    persistence.markSubtransactionCommitted(subtxnId, "s3://staging/metadata.json");
+    persistence.markOperationCommitted(opId, "s3://staging/metadata.json");
 
-    Optional<JdbcTransactionPersistence.SubtransactionRow> found =
-        persistence.findSubtransaction(subtxnId);
+    Optional<JdbcTransactionPersistence.OperationRow> found = persistence.findOperation(opId);
     assertThat(found).isPresent();
-    assertThat(found.get().status())
-        .isEqualTo(JdbcTransactionPersistence.SUBTXN_STATUS_SUB_COMMITTED);
+    assertThat(found.get().status()).isEqualTo(JdbcTransactionPersistence.OP_STATUS_COMMITTED);
     assertThat(found.get().stagedMetadataLocation()).isEqualTo("s3://staging/metadata.json");
     assertThat(found.get().endedAt()).isNotNull();
   }
 
   @Test
-  void markSubtransactionAbortedUpdatesStatus() throws SQLException {
+  void markOperationAbortedUpdatesStatus() throws SQLException {
     long txnId = persistence.nextTxnId();
     insertSimpleTransaction(txnId);
-    long subtxnId = persistence.nextTxnId();
-    insertSimpleSubtransaction(subtxnId, txnId);
+    long opId = persistence.nextTxnId();
+    insertSimpleOperation(opId, txnId);
 
-    persistence.markSubtransactionAborted(subtxnId);
+    persistence.markOperationAborted(opId);
 
-    Optional<JdbcTransactionPersistence.SubtransactionRow> found =
-        persistence.findSubtransaction(subtxnId);
+    Optional<JdbcTransactionPersistence.OperationRow> found = persistence.findOperation(opId);
     assertThat(found).isPresent();
-    assertThat(found.get().status())
-        .isEqualTo(JdbcTransactionPersistence.SUBTXN_STATUS_SUB_ABORTED);
+    assertThat(found.get().status()).isEqualTo(JdbcTransactionPersistence.OP_STATUS_ABORTED);
     assertThat(found.get().endedAt()).isNotNull();
   }
 
@@ -416,7 +406,7 @@ class JdbcTransactionPersistenceTest {
     long txnId = persistence.nextTxnId();
     insertSimpleTransaction(txnId);
 
-    long lockId = persistence.insertLock(txnId, "resource-A", "APPEND");
+    long lockId = persistence.insertLock(txnId, "resource-A", "ROW_EXCLUSIVE");
     assertThat(lockId).isGreaterThan(0);
 
     persistence.grantLock(lockId);
@@ -435,8 +425,8 @@ class JdbcTransactionPersistenceTest {
     insertSimpleTransaction(txn1);
     insertSimpleTransaction(txn2);
 
-    long lock1 = persistence.insertLock(txn1, "resource-B", "APPEND");
-    long lock2 = persistence.insertLock(txn2, "resource-B", "APPEND");
+    long lock1 = persistence.insertLock(txn1, "resource-B", "ROW_EXCLUSIVE");
+    long lock2 = persistence.insertLock(txn2, "resource-B", "ROW_EXCLUSIVE");
     persistence.grantLock(lock1);
     persistence.grantLock(lock2);
 
@@ -452,8 +442,8 @@ class JdbcTransactionPersistenceTest {
     long txnId = persistence.nextTxnId();
     insertSimpleTransaction(txnId);
 
-    persistence.insertLock(txnId, "resource-C", "APPEND");
-    persistence.insertLock(txnId, "resource-D", "OVERWRITE");
+    persistence.insertLock(txnId, "resource-C", "ROW_EXCLUSIVE");
+    persistence.insertLock(txnId, "resource-D", "EXCLUSIVE");
 
     persistence.deleteLocksForTransaction(txnId);
 
@@ -579,6 +569,7 @@ class JdbcTransactionPersistenceTest {
     persistence.insertTransaction(
         new JdbcTransactionPersistence.TransactionRow(
             txnId,
+            null,
             REALM,
             CATALOG_ID,
             "tok-" + txnId,
@@ -586,29 +577,27 @@ class JdbcTransactionPersistenceTest {
             JdbcTransactionPersistence.TXN_STATUS_IN_PROGRESS,
             "REPEATABLE_READ",
             null,
-            null,
-            null,
-            null,
             now,
             now.plusSeconds(300),
             null));
   }
 
-  private void insertSimpleSubtransaction(long subtxnId, long parentTxnId) throws SQLException {
+  private void insertSimpleOperation(long opId, long txnId) throws SQLException {
     Instant now = Instant.now();
-    persistence.insertSubtransaction(
-        new JdbcTransactionPersistence.SubtransactionRow(
-            subtxnId,
-            parentTxnId,
+    persistence.insertOperation(
+        new JdbcTransactionPersistence.OperationRow(
+            opId,
+            txnId,
             REALM,
             CATALOG_ID,
             "table-uuid-sub",
-            "APPEND",
+            "ROW_EXCLUSIVE",
             null,
-            "s3://staging/" + subtxnId,
             null,
-            "subtok-" + subtxnId,
-            JdbcTransactionPersistence.SUBTXN_STATUS_IN_PROGRESS,
+            "s3://staging/" + opId,
+            null,
+            "subtok-" + opId,
+            JdbcTransactionPersistence.OP_STATUS_IN_PROGRESS,
             null,
             now,
             now.plusSeconds(60),

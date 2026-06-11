@@ -36,6 +36,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.io.CloseableGroup;
 import org.apache.iceberg.rest.Endpoint;
+import org.apache.iceberg.rest.ErrorHandler;
 import org.apache.iceberg.rest.ErrorHandlers;
 import org.apache.iceberg.rest.HTTPClient;
 import org.apache.iceberg.rest.RESTClient;
@@ -80,6 +81,52 @@ public class PolarisRESTCatalog implements PolarisCatalog, Closeable {
 
   // the default endpoints to config if server doesn't specify the 'endpoints' configuration.
   private static final Set<Endpoint> DEFAULT_ENDPOINTS = PolarisEndpoints.GENERIC_TABLE_ENDPOINTS;
+
+  /** Thrown when the server signals a retryable lock conflict (HTTP 409, type=LockConflictError). */
+  static class LockConflictRetryException extends RuntimeException {
+    final long retryAfterMs;
+
+    LockConflictRetryException(long retryAfterMs) {
+      super("Lock conflict; retry after " + retryAfterMs + " ms");
+      this.retryAfterMs = retryAfterMs;
+    }
+  }
+
+  /** Thrown when lock wait retries are exhausted. */
+  public static class LockWaitTimeoutException extends RuntimeException {
+    public LockWaitTimeoutException(String message) {
+      super(message);
+    }
+  }
+
+  /**
+   * Error handler that intercepts 409 LockConflictError responses and converts them to
+   * {@link LockConflictRetryException} so callers can implement retry-with-backoff.
+   * All other errors fall through to the default handler.
+   */
+  private static final ErrorHandler LOCK_AWARE_ERROR_HANDLER =
+      new ErrorHandler() {
+        private final ErrorHandler delegate = (ErrorHandler) ErrorHandlers.defaultErrorHandler();
+
+        @Override
+        public org.apache.iceberg.rest.responses.ErrorResponse parseResponse(
+            int code, String json) {
+          return delegate.parseResponse(code, json);
+        }
+
+        @Override
+        public void accept(org.apache.iceberg.rest.responses.ErrorResponse error) {
+          if (error.code() == 409 && "LockConflictError".equals(error.type())) {
+            long ms = 1_000L;
+            try {
+              ms = Long.parseLong(error.message().trim());
+            } catch (NumberFormatException ignored) {
+            }
+            throw new LockConflictRetryException(ms);
+          }
+          delegate.accept(error);
+        }
+      };
 
   public PolarisRESTCatalog() {
     this(config -> HTTPClient.builder(config).uri(config.get(CatalogProperties.URI)).build());
@@ -304,7 +351,7 @@ public class PolarisRESTCatalog implements PolarisCatalog, Closeable {
             new CreateSubtransactionRESTRequest(tableIdentifier, operation, leaseSeconds),
             SubtransactionRESTResponse.class,
             Map.of("X-Txn-Token", txnToken),
-            ErrorHandlers.defaultErrorHandler());
+            LOCK_AWARE_ERROR_HANDLER);
   }
 
   /**

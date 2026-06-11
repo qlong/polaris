@@ -79,6 +79,9 @@ public class TransactionManager {
   static final String DEFAULT_ISOLATION = "REPEATABLE_READ";
   static final int DEFAULT_LEASE_SECONDS = 3600;
 
+  /** Maximum number of retry attempts when waiting to acquire an EXCLUSIVE lock. */
+  static final int MAX_LOCK_WAIT_RETRIES = 30;
+
   private final PolarisRESTCatalog restCatalog;
   private final String catalogName;
 
@@ -272,18 +275,18 @@ public class TransactionManager {
   // -------------------------------------------------------------------------
 
   /**
-   * Records a staged write for the given table. Upgrades the stored operation from APPEND to
-   * ROW_DELTA if needed; never downgrades. Must be called after writing the staged metadata file.
+   * Records a staged write for the given table. Upgrades the stored operation from ROW_EXCLUSIVE to
+   * EXCLUSIVE if needed; never downgrades. Must be called after writing the staged metadata file.
    */
   public void stageWrite(
       SparkSession spark, TableIdentifier ident, String stagingPath, String operation) {
     String tableKey = identToKey(ident);
     spark.conf().set(stagedPathConfKey(tableKey), stagingPath);
-    // Upgrade operation: ROW_DELTA takes precedence over APPEND
+    // Upgrade operation: EXCLUSIVE takes precedence over ROW_EXCLUSIVE
     String currentOp =
         spark.conf().getOption(stagedOpConfKey(tableKey)).getOrElse(() -> null);
     String finalOp =
-        ("ROW_DELTA".equals(currentOp) || "ROW_DELTA".equals(operation)) ? "ROW_DELTA" : operation;
+        ("EXCLUSIVE".equals(currentOp) || "EXCLUSIVE".equals(operation)) ? "EXCLUSIVE" : operation;
     spark.conf().set(stagedOpConfKey(tableKey), finalOp);
     // Track in the staged tables list
     String tablesStr = getConf(spark, CONF_STAGED_TABLES);
@@ -394,8 +397,48 @@ public class TransactionManager {
     ensureTransactionStarted(spark); // PENDING → ACTIVE if needed; throws if no transaction
     String txnId = getConf(spark, CONF_TXN_ID);
     String txnToken = getConf(spark, CONF_TXN_TOKEN);
-    return restCatalog.createSubtransaction(
-        Long.parseLong(txnId), txnToken, identToKey(table), operation, DEFAULT_LEASE_SECONDS);
+    return createSubtransactionWithRetry(
+        Long.parseLong(txnId), txnToken, identToKey(table), operation);
+  }
+
+  /**
+   * Calls {@code createSubtransaction} with retry-with-backoff for EXCLUSIVE lock conflicts.
+   * The server returns HTTP 409 with type={@code LockConflictError} and a {@code retry_after_ms}
+   * hint when an EXCLUSIVE request finds in-flight ROW_EXCLUSIVE holders. This method sleeps the
+   * suggested delay and retries up to {@link #MAX_LOCK_WAIT_RETRIES} times before throwing
+   * {@link PolarisRESTCatalog.LockWaitTimeoutException}.
+   */
+  SubtransactionRESTResponse createSubtransactionWithRetry(
+      long txnId, String txnToken, String tableKey, String operation) {
+    for (int attempt = 0; attempt <= MAX_LOCK_WAIT_RETRIES; attempt++) {
+      try {
+        return restCatalog.createSubtransaction(
+            txnId, txnToken, tableKey, operation, DEFAULT_LEASE_SECONDS);
+      } catch (PolarisRESTCatalog.LockConflictRetryException e) {
+        if (attempt >= MAX_LOCK_WAIT_RETRIES) {
+          throw new PolarisRESTCatalog.LockWaitTimeoutException(
+              "Lock wait timeout acquiring "
+                  + operation
+                  + " on "
+                  + tableKey
+                  + " after "
+                  + MAX_LOCK_WAIT_RETRIES
+                  + " retries");
+        }
+        LOG.info(
+            "Lock conflict on {} (attempt {}/{}); retrying after {} ms",
+            tableKey, attempt + 1, MAX_LOCK_WAIT_RETRIES, e.retryAfterMs);
+        try {
+          Thread.sleep(e.retryAfterMs);
+        } catch (InterruptedException ie) {
+          Thread.currentThread().interrupt();
+          throw new PolarisRESTCatalog.LockWaitTimeoutException(
+              "Interrupted while waiting for lock on " + tableKey);
+        }
+      }
+    }
+    // unreachable
+    throw new PolarisRESTCatalog.LockWaitTimeoutException("Lock wait timeout on " + tableKey);
   }
 
   /** Returns true if this session is in worker subtransaction mode. */
@@ -434,7 +477,7 @@ public class TransactionManager {
             spark.conf().getOption(stagedPathConfKey(tableKey)).getOrElse(() -> null);
         String op = spark.conf().getOption(stagedOpConfKey(tableKey)).getOrElse(() -> null);
         if (path != null) {
-          snapshot.put(tableKey, new String[] {path, op != null ? op : "APPEND"});
+          snapshot.put(tableKey, new String[] {path, op != null ? op : "ROW_EXCLUSIVE"});
         }
       }
     }
@@ -485,7 +528,7 @@ public class TransactionManager {
       String op = spark.conf().getOption(stagedOpConfKey(tableKey)).getOrElse(() -> null);
       if (path != null) {
         result.add(
-            new StagedTableCommitRESTRequest(tableKey, path, op != null ? op : "APPEND"));
+            new StagedTableCommitRESTRequest(tableKey, path, op != null ? op : "ROW_EXCLUSIVE"));
       }
     }
     return result;

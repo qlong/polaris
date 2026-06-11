@@ -56,10 +56,10 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
  *   <li><b>Torn-read prevention</b>: a concurrent writer commits to two tables with a delay between
  *       them; a reader that acquires a {@code TxnSnapshot} between the two commits sees a consistent
  *       one-or-the-other view, never a mix.
- *   <li><b>Lock conflict serialization</b>: a ROW_DELTA lock blocks a conflicting second writer;
+ *   <li><b>Lock conflict serialization</b>: an EXCLUSIVE lock blocks a conflicting second writer;
  *       after the first transaction aborts the second acquires the lock successfully.
- *   <li><b>APPEND non-blocking</b>: concurrent APPEND subtransactions on the same table all
- *       succeed without blocking each other.
+ *   <li><b>ROW_EXCLUSIVE non-blocking</b>: concurrent ROW_EXCLUSIVE operations on the same table
+ *       all succeed without blocking each other (OCC path, no lock acquired).
  * </ol>
  */
 class TxnConcurrencyTest {
@@ -74,9 +74,6 @@ class TxnConcurrencyTest {
   private static DataSource dataSource;
   private static final long CATALOG_ID = 1L;
   private static final String TABLE_METADATA_DIR = "s3://test/ns/table/metadata";
-
-  // Short lock wait for tests — real conflicts resolve fast in tests
-  private static final long LOCK_TIMEOUT_MS = 1_000L;
 
   private JdbcTransactionPersistence persistence;
   private TransactionService service;
@@ -124,7 +121,7 @@ class TxnConcurrencyTest {
     // Unique realm per test — isolates data without dropping/recreating tables
     String realm = "realm-" + UUID.randomUUID();
     persistence = new JdbcTransactionPersistence(dataSource, DatabaseType.POSTGRES, realm, CATALOG_ID);
-    service = new TransactionService(persistence, new LockManager(persistence, LOCK_TIMEOUT_MS));
+    service = new TransactionService(persistence, new LockManager(persistence));
   }
 
   // ---------------------------------------------------------------------------
@@ -204,90 +201,90 @@ class TxnConcurrencyTest {
   // ---------------------------------------------------------------------------
 
   /**
-   * Scenario: T1 holds a ROW_DELTA lock on a table. T2 tries to acquire the same lock — it must
-   * fail with {@link LockManager.LockWaitTimeoutException} within {@code LOCK_TIMEOUT_MS}. After T1
-   * aborts and releases its lock, T2 retries and succeeds.
+   * Scenario: T1 holds an EXCLUSIVE lock on a table. T2 tries to acquire the same lock — it must
+   * fail with {@link LockManager.LockConflictException} immediately (no wait). After T1 aborts and
+   * releases its lock, T2 retries and succeeds.
    */
   @Test
-  void rowDeltaLockBlocksConflictingWriterThenReleasesOnAbort() throws Exception {
+  void exclusiveLockBlocksConflictingWriterThenReleasesOnAbort() throws Exception {
     String tableUuid = "table-" + UUID.randomUUID();
 
-    // T1 acquires ROW_DELTA lock by creating a subtransaction
+    // T1 acquires EXCLUSIVE lock by creating an operation
     var txn1 = service.beginTransaction("REPEATABLE_READ", 3600, "owner1");
-    service.createSubtransaction(
-        txn1.txnId(), txn1.txnToken(), tableUuid, "ROW_DELTA", null, null, 3600, TABLE_METADATA_DIR);
+    service.createOperation(
+        txn1.txnId(), txn1.txnToken(), tableUuid, "EXCLUSIVE", null, null, 3600, TABLE_METADATA_DIR);
 
-    // T2 tries ROW_DELTA on the same resource — must time out
+    // T2 tries EXCLUSIVE on the same resource — must throw immediately
     var txn2 = service.beginTransaction("REPEATABLE_READ", 3600, "owner2");
     assertThatThrownBy(
             () ->
-                service.createSubtransaction(
+                service.createOperation(
                     txn2.txnId(),
                     txn2.txnToken(),
                     tableUuid,
-                    "ROW_DELTA",
+                    "EXCLUSIVE",
                     null,
                     null,
                     3600,
                     TABLE_METADATA_DIR))
-        .isInstanceOf(LockManager.LockWaitTimeoutException.class);
+        .isInstanceOf(LockManager.LockConflictException.class);
 
     // T1 aborts — releases its lock
     service.abortTransaction(txn1.txnId(), txn1.txnToken());
 
-    // T2 retries with a fresh transaction (its previous attempt cleaned up waiting locks)
+    // T2 retries with a fresh transaction and succeeds
     var txn2b = service.beginTransaction("REPEATABLE_READ", 3600, "owner2");
-    var subtxn2 =
-        service.createSubtransaction(
+    var op2 =
+        service.createOperation(
             txn2b.txnId(),
             txn2b.txnToken(),
             tableUuid,
-            "ROW_DELTA",
+            "EXCLUSIVE",
             null,
             null,
             3600,
             TABLE_METADATA_DIR);
 
-    assertThat(subtxn2.status())
-        .as("after T1 releases its lock, T2 must acquire ROW_DELTA successfully")
-        .isEqualTo(JdbcTransactionPersistence.SUBTXN_STATUS_IN_PROGRESS);
+    assertThat(op2.status())
+        .as("after T1 releases its lock, T2 must acquire EXCLUSIVE successfully")
+        .isEqualTo(JdbcTransactionPersistence.OP_STATUS_IN_PROGRESS);
   }
 
   /**
-   * APPEND is compatible with ROW_DELTA — the high-throughput ingest path must never be blocked by
-   * a concurrent destructive write on the same table.
+   * ROW_EXCLUSIVE does not call {@link LockManager#acquire}, so it never blocks on a conflicting
+   * EXCLUSIVE lock held by another transaction. The conflict is detected at commit time via OCC.
    */
   @Test
-  void appendIsCompatibleWithRowDeltaLock() throws Exception {
+  void rowExclusiveDoesNotBlockWhenExclusiveLockHeld() throws Exception {
     String tableUuid = "table-" + UUID.randomUUID();
 
-    // T1 holds ROW_DELTA lock
+    // T1 holds EXCLUSIVE lock
     var txn1 = service.beginTransaction("REPEATABLE_READ", 3600, "owner1");
-    service.createSubtransaction(
-        txn1.txnId(), txn1.txnToken(), tableUuid, "ROW_DELTA", null, null, 3600, TABLE_METADATA_DIR);
+    service.createOperation(
+        txn1.txnId(), txn1.txnToken(), tableUuid, "EXCLUSIVE", null, null, 3600, TABLE_METADATA_DIR);
 
-    // T2 APPEND on same table — must succeed immediately (APPEND never blocks)
+    // T2 ROW_EXCLUSIVE on same table — must succeed (ROW_EXCLUSIVE never acquires a lock)
     var txn2 = service.beginTransaction("REPEATABLE_READ", 3600, "owner2");
-    var appendSubtxn =
-        service.createSubtransaction(
-            txn2.txnId(), txn2.txnToken(), tableUuid, "APPEND", null, null, 3600, TABLE_METADATA_DIR);
+    var op =
+        service.createOperation(
+            txn2.txnId(), txn2.txnToken(), tableUuid, "ROW_EXCLUSIVE", null, null, 3600, TABLE_METADATA_DIR);
 
-    assertThat(appendSubtxn.status())
-        .as("APPEND must not be blocked by a ROW_DELTA lock on the same table")
-        .isEqualTo(JdbcTransactionPersistence.SUBTXN_STATUS_IN_PROGRESS);
+    assertThat(op.status())
+        .as("ROW_EXCLUSIVE must not be blocked by an EXCLUSIVE lock on the same table")
+        .isEqualTo(JdbcTransactionPersistence.OP_STATUS_IN_PROGRESS);
   }
 
   // ---------------------------------------------------------------------------
-  // Test 3: APPEND non-blocking — N concurrent appenders never conflict
+  // Test 3: ROW_EXCLUSIVE non-blocking — N concurrent writers never conflict
   // ---------------------------------------------------------------------------
 
   /**
-   * Five threads each start their own transaction and create an APPEND subtransaction on the same
-   * table. All must succeed without any {@link LockManager.LockWaitTimeoutException} because APPEND
-   * is compatible with APPEND.
+   * Five threads each start their own transaction and create a ROW_EXCLUSIVE operation on the same
+   * table. All must succeed without any {@link LockManager.LockConflictException} because
+   * ROW_EXCLUSIVE never calls {@link LockManager#acquire} (OCC path).
    */
   @Test
-  void concurrentAppendsOnSameTableAllSucceed() throws Exception {
+  void concurrentRowExclusiveOpsOnSameTableAllSucceed() throws Exception {
     String tableUuid = "table-" + UUID.randomUUID();
     int N = 5;
 
@@ -302,19 +299,19 @@ class TxnConcurrencyTest {
                 try {
                   var txn =
                       service.beginTransaction(
-                          "REPEATABLE_READ", 3600, "appender-" + idx);
-                  var subtxn =
-                      service.createSubtransaction(
+                          "REPEATABLE_READ", 3600, "writer-" + idx);
+                  var op =
+                      service.createOperation(
                           txn.txnId(),
                           txn.txnToken(),
                           tableUuid,
-                          "APPEND",
+                          "ROW_EXCLUSIVE",
                           null,
                           null,
                           3600,
                           TABLE_METADATA_DIR);
-                  assertThat(subtxn.status())
-                      .isEqualTo(JdbcTransactionPersistence.SUBTXN_STATUS_IN_PROGRESS);
+                  assertThat(op.status())
+                      .isEqualTo(JdbcTransactionPersistence.OP_STATUS_IN_PROGRESS);
                 } catch (Throwable e) {
                   errors.add(e);
                 }
@@ -328,7 +325,7 @@ class TxnConcurrencyTest {
     }
 
     assertThat(errors)
-        .as("all %d concurrent APPEND subtransactions must succeed without any error", N)
+        .as("all %d concurrent ROW_EXCLUSIVE operations must succeed without any error", N)
         .isEmpty();
   }
 

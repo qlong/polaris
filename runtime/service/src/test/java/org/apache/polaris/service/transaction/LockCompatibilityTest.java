@@ -31,52 +31,30 @@ import org.junit.jupiter.params.provider.MethodSource;
  * <p>The expected matrix (held → requested):
  *
  * <pre>
- *                   APP   RD    OW    EX    AX
- * APPEND          :  T     T     T     T     F
- * ROW_DELTA       :  T     F     F     F     F
- * OVERWRITE       :  T     F     F     F     F
- * EXCLUSIVE       :  T     F     F     F     F
- * ACCESS_EXCLUSIVE:  F     F     F     F     F
+ *                    RX     EX     AX
+ * ROW_EXCLUSIVE  :   T      F      F
+ * EXCLUSIVE      :   F      F      F
+ * ACCESS_EXCLUSIVE:  F      F      F
  * </pre>
  */
 class LockCompatibilityTest {
 
-  private static final String APP = LockManager.MODE_APPEND;
-  private static final String RD = LockManager.MODE_ROW_DELTA;
-  private static final String OW = LockManager.MODE_OVERWRITE;
+  private static final String RX = LockManager.MODE_ROW_EXCLUSIVE;
   private static final String EX = LockManager.MODE_EXCLUSIVE;
   private static final String AX = LockManager.MODE_ACCESS_EXCLUSIVE;
 
   static Stream<Arguments> compatibilityMatrix() {
     return Stream.of(
-        // APPEND held
-        Arguments.of(APP, APP, true),
-        Arguments.of(APP, RD, true),
-        Arguments.of(APP, OW, true),
-        Arguments.of(APP, EX, true),
-        Arguments.of(APP, AX, false),
-        // ROW_DELTA held
-        Arguments.of(RD, APP, true),
-        Arguments.of(RD, RD, false),
-        Arguments.of(RD, OW, false),
-        Arguments.of(RD, EX, false),
-        Arguments.of(RD, AX, false),
-        // OVERWRITE held
-        Arguments.of(OW, APP, true),
-        Arguments.of(OW, RD, false),
-        Arguments.of(OW, OW, false),
-        Arguments.of(OW, EX, false),
-        Arguments.of(OW, AX, false),
+        // ROW_EXCLUSIVE held
+        Arguments.of(RX, RX, true),
+        Arguments.of(RX, EX, false),
+        Arguments.of(RX, AX, false),
         // EXCLUSIVE held
-        Arguments.of(EX, APP, true),
-        Arguments.of(EX, RD, false),
-        Arguments.of(EX, OW, false),
+        Arguments.of(EX, RX, false),
         Arguments.of(EX, EX, false),
         Arguments.of(EX, AX, false),
         // ACCESS_EXCLUSIVE held
-        Arguments.of(AX, APP, false),
-        Arguments.of(AX, RD, false),
-        Arguments.of(AX, OW, false),
+        Arguments.of(AX, RX, false),
         Arguments.of(AX, EX, false),
         Arguments.of(AX, AX, false));
   }

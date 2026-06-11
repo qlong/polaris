@@ -8,10 +8,9 @@
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Spark: use the local Spark source checkout (4.2.0-SNAPSHOT, already built).
-# The assembly/target/scala-2.13/jars/ directory contains all required JARs.
+# Spark: use the pre-built spark-4.1.2-bin-hadoop3-connect distribution.
 # ---------------------------------------------------------------------------
-export SPARK_HOME="${SPARK_HOME:-${HOME}/opensources/spark}"
+export SPARK_HOME="${SPARK_HOME:-${HOME}/spark-4.1.2-bin-hadoop3-connect}"
 
 # ---------------------------------------------------------------------------
 # Iceberg runtime jar (fat jar, includes all Iceberg dependencies for Spark).

@@ -36,10 +36,10 @@ import org.apache.iceberg.util.LocationUtil;
 import java.util.stream.Collectors;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.CommittedTableSnapshotRow;
-import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.SubtransactionRow;
+import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.OperationRow;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.TransactionRow;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.TxnSnapshotRow;
-import org.apache.polaris.service.transaction.LockManager.LockWaitTimeoutException;
+import org.apache.polaris.service.transaction.LockManager.LockConflictException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -191,15 +191,13 @@ public class TransactionService {
     TransactionRow row =
         new TransactionRow(
             txnId,
+            null,
             persistence.getRealmId(),
             persistence.getCatalogId(),
             txnToken,
             ownerPrincipal,
             JdbcTransactionPersistence.TXN_STATUS_IN_PROGRESS,
             isolation != null ? isolation : "REPEATABLE_READ",
-            snapXmin,
-            snapXmax,
-            snapXipList,
             linkedTxnSnapshotId,
             now,
             expiresAt,
@@ -251,29 +249,31 @@ public class TransactionService {
    *     credential vending and location validation require no special-casing.
    * @return the new subtransaction with {@code subtxnToken} and {@code assignedStagingPath}
    */
-  public SubtransactionRow createSubtransaction(
+  public OperationRow createOperation(
       long txnId,
       String txnToken,
       String tableUuid,
-      String operation,
+      String lockMode,
       Long baseSnapshotId,
-      Long retryOfSubtxnId,
+      Long retryOfOpId,
       int leaseSeconds,
       String tableMetadataDir)
-      throws SQLException, LockWaitTimeoutException {
+      throws SQLException, LockConflictException {
 
     TransactionRow txn = validateTxnToken(txnId, txnToken);
     requireInProgress(txn);
 
-    // Acquire lock for destructive operations (APPEND skips this)
-    if (!LockManager.MODE_APPEND.equalsIgnoreCase(operation)) {
-      String resource = tableUuid;
-      String normalizedOp = operation.toUpperCase(Locale.ROOT);
-      lockManager.acquire(txnId, resource, normalizedOp);
-    }
+    // Always acquire a lock for every mode.
+    // ROW_EXCLUSIVE: inserts a lock row so in-flight EXCLUSIVE requests can detect it and wait;
+    //   fails immediately if EXCLUSIVE/ACCESS_EXCLUSIVE is already held.
+    // EXCLUSIVE/ACCESS_EXCLUSIVE: returns a retry hint (409) if any conflict is found.
+    String normalizedMode = lockMode == null
+        ? LockManager.MODE_ROW_EXCLUSIVE
+        : lockMode.toUpperCase(Locale.ROOT);
+    lockManager.acquire(txnId, tableUuid, normalizedMode);
 
-    long subtxnId = persistence.nextTxnId();
-    String subtxnToken = generateToken();
+    long opId = persistence.nextTxnId();
+    String opToken = generateToken();
     int effective = leaseSeconds > 0 ? leaseSeconds : DEFAULT_TXN_LEASE_SECONDS;
     Instant now = Instant.now();
     String stagingPath =
@@ -281,7 +281,7 @@ public class TransactionService {
             + "/"
             + txnId
             + "-"
-            + subtxnId
+            + opId
             + "-"
             + UUID.randomUUID()
             + ".metadata.json";
@@ -291,76 +291,84 @@ public class TransactionService {
     String serverBase =
         persistence.findLatestCommittedMetadataLocation(tableUuid).orElse(null);
 
-    SubtransactionRow row =
-        new SubtransactionRow(
-            subtxnId,
+    OperationRow row =
+        new OperationRow(
+            opId,
             txnId,
             persistence.getRealmId(),
             persistence.getCatalogId(),
             tableUuid,
-            operation.toUpperCase(Locale.ROOT),
+            normalizedMode,
             baseSnapshotId,
             serverBase,
             stagingPath,
             null,
-            subtxnToken,
-            JdbcTransactionPersistence.SUBTXN_STATUS_IN_PROGRESS,
-            retryOfSubtxnId,
+            opToken,
+            JdbcTransactionPersistence.OP_STATUS_IN_PROGRESS,
+            retryOfOpId,
             now,
             now.plus(effective, ChronoUnit.SECONDS),
             null);
-    persistence.insertSubtransaction(row);
+    persistence.insertOperation(row);
     LOGGER.info(
-        "Subtransaction created: subtxn_id={} txn_id={} table={} op={}",
-        subtxnId,
+        "Operation created: op_id={} txn_id={} table={} lock_mode={}",
+        opId,
         txnId,
         tableUuid,
-        operation);
+        normalizedMode);
     return row;
   }
 
-  public void commitSubtransaction(
-      long txnId, long subtxnId, String subtxnToken, String stagedMetadataLocation)
+  public void commitOperation(
+      long txnId, long opId, String opToken, String stagedMetadataLocation)
       throws SQLException {
-    SubtransactionRow subtxn = validateSubtxnToken(subtxnId, subtxnToken);
-    if (subtxn.parentTxnId() != txnId) {
+    OperationRow op = validateOpToken(opId, opToken);
+    if (op.txnId() != txnId) {
       throw new BadRequestException(
-          "Subtransaction " + subtxnId + " does not belong to transaction " + txnId);
+          "Operation " + opId + " does not belong to transaction " + txnId);
     }
-    if (subtxn.status() != JdbcTransactionPersistence.SUBTXN_STATUS_IN_PROGRESS) {
-      throw new BadRequestException("Subtransaction already finalized: " + subtxnId);
+    if (op.status() != JdbcTransactionPersistence.OP_STATUS_IN_PROGRESS) {
+      throw new BadRequestException("Operation already finalized: " + opId);
     }
-    if (!stagedMetadataLocation.equals(subtxn.assignedStagingPath())) {
+    if (!stagedMetadataLocation.equals(op.assignedStagingPath())) {
       throw new BadRequestException(
           "staged_metadata_location '"
               + stagedMetadataLocation
               + "' does not match the assigned staging path '"
-              + subtxn.assignedStagingPath()
+              + op.assignedStagingPath()
               + "'");
     }
-    persistence.markSubtransactionCommitted(subtxnId, stagedMetadataLocation);
-    LOGGER.info(
-        "Subtransaction staged: subtxn_id={} metadata={}", subtxnId, stagedMetadataLocation);
+    persistence.markOperationCommitted(opId, stagedMetadataLocation);
+    // Release ROW_EXCLUSIVE lock immediately after staging so a waiting EXCLUSIVE can proceed.
+    // EXCLUSIVE/ACCESS_EXCLUSIVE locks are held until the parent transaction ends.
+    if (LockManager.MODE_ROW_EXCLUSIVE.equals(op.lockMode())) {
+      lockManager.releaseForResource(txnId, op.tableUuid());
+    }
+    LOGGER.info("Operation staged: op_id={} metadata={}", opId, stagedMetadataLocation);
   }
 
-  public void abortSubtransaction(long txnId, long subtxnId, String subtxnToken, String txnToken)
+  public void abortOperation(long txnId, long opId, String opToken, String txnToken)
       throws SQLException {
-    // Accept either the subtxn token or the parent txn token (orchestrator abort)
-    SubtransactionRow subtxn;
-    if (subtxnToken != null && !subtxnToken.isBlank()) {
-      subtxn = validateSubtxnToken(subtxnId, subtxnToken);
+    // Accept either the op token or the parent txn token (orchestrator abort)
+    OperationRow op;
+    if (opToken != null && !opToken.isBlank()) {
+      op = validateOpToken(opId, opToken);
     } else {
       validateTxnToken(txnId, txnToken);
-      subtxn =
+      op =
           persistence
-              .findSubtransaction(subtxnId)
-              .orElseThrow(() -> new NotFoundException("Subtransaction not found: " + subtxnId));
+              .findOperation(opId)
+              .orElseThrow(() -> new NotFoundException("Operation not found: " + opId));
     }
-    if (subtxn.parentTxnId() != txnId) {
+    if (op.txnId() != txnId) {
       throw new BadRequestException(
-          "Subtransaction " + subtxnId + " does not belong to transaction " + txnId);
+          "Operation " + opId + " does not belong to transaction " + txnId);
     }
-    persistence.markSubtransactionAborted(subtxnId);
+    persistence.markOperationAborted(opId);
+    // Release ROW_EXCLUSIVE lock on abort so waiting EXCLUSIVE requests can proceed.
+    if (LockManager.MODE_ROW_EXCLUSIVE.equals(op.lockMode())) {
+      lockManager.releaseForResource(op.txnId(), op.tableUuid());
+    }
   }
 
   /**
@@ -369,24 +377,23 @@ public class TransactionService {
    * Used by the worker's {@code BEGIN SUBTRANSACTION} command to avoid passing those
    * values through the orchestrator's SQL output.
    */
-  public record SubtransactionInfo(
+  public record OperationInfo(
       long txnId, Long txnSnapshotId, String assignedStagingPath, String tableUuid) {}
 
-  public SubtransactionInfo getSubtransaction(long subtxnId, String subtxnToken)
+  public OperationInfo getOperation(long opId, String opToken)
       throws SQLException {
-    SubtransactionRow subtxn = validateSubtxnToken(subtxnId, subtxnToken);
-    TransactionRow txn = getTransaction(subtxn.parentTxnId());
-    return new SubtransactionInfo(
-        txn.txnId(), txn.txnSnapshotId(), subtxn.assignedStagingPath(), subtxn.tableUuid());
+    OperationRow op = validateOpToken(opId, opToken);
+    TransactionRow txn = getTransaction(op.txnId());
+    return new OperationInfo(
+        txn.txnId(), txn.txnSnapshotId(), op.assignedStagingPath(), op.tableUuid());
   }
 
-  public SubtransactionRow renewSubtransaction(
-      long txnId, long subtxnId, String subtxnToken, int leaseSeconds) throws SQLException {
-    validateSubtxnToken(subtxnId, subtxnToken);
+  public OperationRow renewOperation(
+      long txnId, long opId, String opToken, int leaseSeconds) throws SQLException {
+    validateOpToken(opId, opToken);
     int effective = leaseSeconds > 0 ? leaseSeconds : DEFAULT_TXN_LEASE_SECONDS;
-    // Reuse transaction renew since subtransactions share the same lease semantics
     persistence.renewTransaction(txnId, Instant.now().plus(effective, ChronoUnit.SECONDS));
-    return persistence.findSubtransaction(subtxnId).orElseThrow();
+    return persistence.findOperation(opId).orElseThrow();
   }
 
   // ---------------------------------------------------------------------------
@@ -401,13 +408,13 @@ public class TransactionService {
    * @param stagedMetadataLocation path to the client-written staged metadata JSON
    * @param serverBaseMetadataLocation the latest committed metadata location at prepare time;
    *     {@code null} when no prior commit exists or this entry is on the merge-retry path
-   * @param operation {@code "APPEND"} or {@code "ROW_DELTA"}
+   * @param lockMode {@code "ROW_EXCLUSIVE"}, {@code "EXCLUSIVE"}, or {@code "ACCESS_EXCLUSIVE"}
    */
   public record StagedTableInfo(
       String tableIdentifier,
       String stagedMetadataLocation,
       String serverBaseMetadataLocation,
-      String operation) {}
+      String lockMode) {}
 
   /** Parallel to {@link PrepareCommitResult} but for the inline path. */
   public record PrepareInlineResult(
@@ -452,20 +459,20 @@ public class TransactionService {
                 info.tableIdentifier(),
                 info.stagedMetadataLocation(),
                 currentMeta,
-                info.operation()));
-      } else if (LockManager.MODE_APPEND.equalsIgnoreCase(info.operation())) {
+                info.lockMode()));
+      } else if (LockManager.MODE_ROW_EXCLUSIVE.equals(info.lockMode())) {
         LOGGER.info(
-            "APPEND conflict detected for table {} in inline txn {}: scheduling merge-and-retry",
+            "ROW_EXCLUSIVE conflict detected for table {} in inline txn {}: scheduling merge-and-retry",
             info.tableIdentifier(), txnId);
         mergeRetry.add(
             new StagedTableInfo(
-                info.tableIdentifier(), info.stagedMetadataLocation(), null, info.operation()));
+                info.tableIdentifier(), info.stagedMetadataLocation(), null, info.lockMode()));
       } else {
         persistence.updateTransactionStatus(txnId, JdbcTransactionPersistence.TXN_STATUS_ABORTED);
         lockManager.releaseAll(txnId);
         LOGGER.info(
-            "Serialization failure (inline): txn={} table={} op={} base={} current={}",
-            txnId, info.tableIdentifier(), info.operation(), baselineMeta, currentMeta);
+            "Serialization failure (inline): txn={} table={} lock_mode={} base={} current={}",
+            txnId, info.tableIdentifier(), info.lockMode(), baselineMeta, currentMeta);
         throw new SerializationFailureException(
             "could not serialize access due to concurrent update on table "
                 + info.tableIdentifier());
@@ -489,7 +496,7 @@ public class TransactionService {
    * </ul>
    */
   public record PrepareCommitResult(
-      List<SubtransactionRow> direct, List<SubtransactionRow> mergeRetry) {}
+      List<OperationRow> direct, List<OperationRow> mergeRetry) {}
 
   /**
    * Validates and classifies all SUB_COMMITTED subtransactions for finalization.
@@ -507,10 +514,10 @@ public class TransactionService {
     TransactionRow txn = validateTxnToken(txnId, txnToken);
     requireInProgress(txn);
 
-    List<SubtransactionRow> subtxns = persistence.findSubtransactionsForTransaction(txnId);
+    List<OperationRow> subtxns = persistence.findOperationsForTransaction(txnId);
     long uncommitted =
         subtxns.stream()
-            .filter(s -> s.status() == JdbcTransactionPersistence.SUBTXN_STATUS_IN_PROGRESS)
+            .filter(s -> s.status() == JdbcTransactionPersistence.OP_STATUS_IN_PROGRESS)
             .count();
     if (uncommitted > 0) {
       throw new BadRequestException(
@@ -520,33 +527,39 @@ public class TransactionService {
               + ". Commit or abort them before committing the transaction.");
     }
 
-    List<SubtransactionRow> direct = new ArrayList<>();
-    List<SubtransactionRow> mergeRetry = new ArrayList<>();
-    for (SubtransactionRow s :
+    List<OperationRow> direct = new ArrayList<>();
+    List<OperationRow> mergeRetry = new ArrayList<>();
+    for (OperationRow s :
         subtxns.stream()
-            .filter(s -> s.status() == JdbcTransactionPersistence.SUBTXN_STATUS_SUB_COMMITTED)
+            .filter(s -> s.status() == JdbcTransactionPersistence.OP_STATUS_COMMITTED)
             .toList()) {
       String currentMeta =
           persistence.findLatestCommittedMetadataLocation(s.tableUuid()).orElse(null);
+      // Conflict when the live committed state diverges from our recorded baseline.
+      // Two cases require mergeRetry:
+      // 1. serverBase is set and differs from currentMeta — a concurrent transaction committed
+      //    between lock-acquire and parent COMMIT.
+      // 2. serverBase is null (lock acquired before any transaction committed to committed_table_
+      //    snapshots) but currentMeta is not null — a concurrent transaction committed in the
+      //    window between lock-acquire and parent COMMIT. Without this check, the direct path
+      //    would do ops.commit(ops.current(), staged_on_old_base), replacing the concurrent
+      //    commit's snapshot chain and losing that writer's data files.
       boolean conflict =
-          s.serverBaseMetadataLocation() != null
-              && !s.serverBaseMetadataLocation().equals(currentMeta);
+          currentMeta != null
+              && (s.serverBaseMetadataLocation() == null
+                  || !s.serverBaseMetadataLocation().equals(currentMeta));
       if (!conflict) {
         direct.add(s);
-      } else if (LockManager.MODE_APPEND.equalsIgnoreCase(s.operation())) {
-        LOGGER.info(
-            "APPEND conflict detected for table {} in txn {}: scheduling merge-and-retry",
-            s.tableUuid(), txnId);
-        mergeRetry.add(s);
       } else {
-        // First-committer-wins: abort transaction and signal 409.
-        persistence.updateTransactionStatus(txnId, JdbcTransactionPersistence.TXN_STATUS_ABORTED);
-        lockManager.releaseAll(txnId);
+        // Conflict: a concurrent writer committed between this subtransaction's creation and the
+        // parent COMMIT. For all lock modes use merge-and-retry: extract this transaction's added
+        // data files from the staged metadata and re-parent them onto the current table state.
+        // This correctly handles the window where a ROW_EXCLUSIVE writer released its lock just
+        // before EXCLUSIVE was acquired but finished its parent COMMIT after.
         LOGGER.info(
-            "Serialization failure: txn={} table={} op={} base={} current={}",
-            txnId, s.tableUuid(), s.operation(), s.serverBaseMetadataLocation(), currentMeta);
-        throw new SerializationFailureException(
-            "could not serialize access due to concurrent update on table " + s.tableUuid());
+            "Conflict detected for table {} in txn {} (mode={}): scheduling merge-and-retry",
+            s.tableUuid(), txnId, s.lockMode());
+        mergeRetry.add(s);
       }
     }
     return new PrepareCommitResult(direct, mergeRetry);
@@ -611,12 +624,12 @@ public class TransactionService {
    */
   public Optional<String> resolveRYOWMetadataLocation(String tableUuid, long txnId)
       throws SQLException {
-    return persistence.findSubtransactionsForTransaction(txnId).stream()
+    return persistence.findOperationsForTransaction(txnId).stream()
         .filter(
             s ->
                 s.tableUuid().equals(tableUuid)
-                    && s.status() == JdbcTransactionPersistence.SUBTXN_STATUS_SUB_COMMITTED)
-        .map(SubtransactionRow::stagedMetadataLocation)
+                    && s.status() == JdbcTransactionPersistence.OP_STATUS_COMMITTED)
+        .map(OperationRow::stagedMetadataLocation)
         .filter(loc -> loc != null && !loc.isBlank())
         .findFirst();
   }
@@ -633,16 +646,16 @@ public class TransactionService {
     return txn;
   }
 
-  private SubtransactionRow validateSubtxnToken(long subtxnId, String subtxnToken)
+  private OperationRow validateOpToken(long opId, String opToken)
       throws SQLException {
-    SubtransactionRow subtxn =
+    OperationRow op =
         persistence
-            .findSubtransaction(subtxnId)
-            .orElseThrow(() -> new NotFoundException("Subtransaction not found: " + subtxnId));
-    if (!subtxn.subtxnToken().equals(subtxnToken)) {
-      throw new ForbiddenException("Invalid subtxn_token for subtransaction " + subtxnId);
+            .findOperation(opId)
+            .orElseThrow(() -> new NotFoundException("Operation not found: " + opId));
+    if (!op.opToken().equals(opToken)) {
+      throw new ForbiddenException("Invalid op_token for operation " + opId);
     }
-    return subtxn;
+    return op;
   }
 
   private static void requireInProgress(TransactionRow txn) {

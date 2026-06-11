@@ -635,15 +635,13 @@ components:
       type: string
       enum:
         - IN_PROGRESS
-        - SUB_COMMITTED
-        - SUB_ABORTED
+        - COMMITTED
+        - ABORTED
 
     LockMode:
       type: string
       enum:
-        - APPEND
-        - ROW_DELTA
-        - OVERWRITE
+        - ROW_EXCLUSIVE
         - EXCLUSIVE
         - ACCESS_EXCLUSIVE
 

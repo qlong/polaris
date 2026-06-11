@@ -129,8 +129,8 @@ public class PolarisSparkSqlParser implements ParserInterface {
       return delegate.parsePlan(statusSql("Subtransaction rolled back"));
     }
 
-    // CREATE SUBTRANSACTION FOR <table> [WITH (ROW_DELTA|APPEND)]
-    // e.g.  CREATE SUBTRANSACTION FOR ns.orders WITH ROW_DELTA
+    // CREATE SUBTRANSACTION FOR <table> [WITH (ROW_EXCLUSIVE|EXCLUSIVE|ACCESS_EXCLUSIVE)]
+    // e.g.  CREATE SUBTRANSACTION FOR ns.orders WITH EXCLUSIVE
     if (normalized.startsWith("CREATE SUBTRANSACTION FOR ")) {
       SparkSession spark = SparkSession.active();
       // Use original sql to preserve the table name's natural case (server lookup is case-sensitive).
@@ -138,13 +138,15 @@ public class PolarisSparkSqlParser implements ParserInterface {
       if (rawSql.endsWith(";")) rawSql = rawSql.substring(0, rawSql.length() - 1).trim();
       String rawUpper = rawSql.toUpperCase(Locale.ROOT);
       int withIdx = rawUpper.indexOf(" WITH ", "CREATE SUBTRANSACTION FOR ".length());
-      String operation = "APPEND";
+      String operation = "ROW_EXCLUSIVE";
       String tableStr;
       if (withIdx >= 0) {
         tableStr = rawSql.substring("CREATE SUBTRANSACTION FOR ".length(), withIdx).trim();
         String opToken = rawUpper.substring(withIdx + " WITH ".length()).trim();
-        if (opToken.equals("ROW_DELTA")) {
-          operation = "ROW_DELTA";
+        if (opToken.equals("EXCLUSIVE")) {
+          operation = "EXCLUSIVE";
+        } else if (opToken.equals("ACCESS_EXCLUSIVE")) {
+          operation = "ACCESS_EXCLUSIVE";
         }
       } else {
         tableStr = rawSql.substring("CREATE SUBTRANSACTION FOR ".length()).trim();
@@ -193,13 +195,14 @@ public class PolarisSparkSqlParser implements ParserInterface {
 
       long subtxnId = parseLongParam(normRest, normUpper, "SUBTXN_ID");
       String subtxnToken = parseStringParam(normRest, normUpper, "SUBTXN_TOKEN");
-      String operation = "APPEND";
+      String operation = "ROW_EXCLUSIVE";
       int opIdx = normUpper.indexOf(" OPERATION=");
       if (opIdx >= 0) {
         String opToken = normRest.substring(opIdx + " OPERATION=".length()).trim();
         int end = opToken.indexOf(' ');
         opToken = (end >= 0 ? opToken.substring(0, end) : opToken).trim().toUpperCase(Locale.ROOT);
-        if (opToken.equals("ROW_DELTA")) operation = "ROW_DELTA";
+        if (opToken.equals("EXCLUSIVE")) operation = "EXCLUSIVE";
+        else if (opToken.equals("ACCESS_EXCLUSIVE")) operation = "ACCESS_EXCLUSIVE";
       }
 
       txnManager(spark).beginWorkerSubtransaction(spark, subtxnId, subtxnToken, ident, operation);

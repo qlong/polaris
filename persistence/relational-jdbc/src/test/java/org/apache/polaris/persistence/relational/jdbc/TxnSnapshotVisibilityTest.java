@@ -35,8 +35,9 @@ import org.junit.jupiter.api.Test;
 /**
  * Tests the MVCC visibility logic in {@link JdbcTransactionPersistence#resolveTableSnapshot}.
  *
- * <p>The visibility rule is: a commit is visible under snapshot S if {@code committed_txn_id >=
- * S.xmin AND committed_txn_id < S.xmax AND committed_txn_id NOT IN S.xip_list}.
+ * <p>The visibility rule is: a commit is visible under snapshot S if {@code committed_txn_id <
+ * S.xmax AND committed_txn_id NOT IN S.xip_list}. xmin is intentionally NOT used as a lower bound:
+ * commits older than any active transaction are definitively committed and must remain visible.
  */
 class TxnSnapshotVisibilityTest {
 
@@ -110,13 +111,16 @@ class TxnSnapshotVisibilityTest {
   }
 
   @Test
-  void commitBeforeXminIsNotVisible() throws Exception {
+  void commitBeforeXminIsStillVisible() throws Exception {
+    // Commits older than xmin are definitively committed before any active transaction started;
+    // xmin is NOT a lower visibility bound — they must be visible.
     insertSnapshot(10, "s3://bucket/v10.metadata.json");
 
     Optional<CommittedTableSnapshotRow> result =
         persistence.resolveTableSnapshot(TABLE_UUID, snapshot(50, 200, ""));
 
-    assertThat(result).isEmpty();
+    assertThat(result).isPresent();
+    assertThat(result.get().metadataLocation()).isEqualTo("s3://bucket/v10.metadata.json");
   }
 
   @Test

@@ -45,11 +45,11 @@ public class PolarisSqlExtensions implements scala.Function1<SparkSessionExtensi
                 org.apache.spark.sql.catalyst.parser.ParserInterface,
                 org.apache.spark.sql.catalyst.parser.ParserInterface>)
             (session, delegate) -> {
+              // session.conf() triggers sessionState initialization which itself calls
+              // buildParser → circular StackOverflow in Spark 4.0+. Use the underlying
+              // SparkConf (via SparkContext) which is always initialized before sessionState.
               String catalogName =
-                  session
-                      .conf()
-                      .getOption(CATALOG_NAME_CONF)
-                      .getOrElse(() -> DEFAULT_CATALOG_NAME);
+                  session.sparkContext().conf().get(CATALOG_NAME_CONF, DEFAULT_CATALOG_NAME);
               return new PolarisSparkSqlParser(delegate, catalogName);
             });
     return BoxedUnit.UNIT;

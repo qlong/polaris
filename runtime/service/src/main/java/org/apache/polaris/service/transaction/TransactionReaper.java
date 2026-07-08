@@ -19,12 +19,15 @@
 package org.apache.polaris.service.transaction;
 
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
+import jakarta.enterprise.event.Startup;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import java.sql.SQLException;
 import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import javax.sql.DataSource;
 import org.apache.polaris.persistence.relational.jdbc.DatasourceOperations;
@@ -71,6 +74,7 @@ public class TransactionReaper {
   private final Instance<DataSource> dataSources;
   private final DatasourceOperations datasourceOperations;
   private final String realmsCsv;
+  private final boolean enabled;
   private volatile ScheduledExecutorService scheduler;
 
   @Inject
@@ -78,10 +82,33 @@ public class TransactionReaper {
       Instance<DataSource> dataSources,
       DatasourceOperations datasourceOperations,
       @ConfigProperty(name = "polaris.realm-context.realms", defaultValue = "POLARIS")
-          String realmsCsv) {
+          String realmsCsv,
+      @ConfigProperty(name = "polaris.transaction.reaper.enabled", defaultValue = "true")
+          boolean enabled) {
     this.dataSources = dataSources;
     this.datasourceOperations = datasourceOperations;
     this.realmsCsv = realmsCsv;
+    this.enabled = enabled;
+  }
+
+  /**
+   * Starts the reaper on server startup — on <b>every</b> Polaris node. This is safe: every action
+   * {@link #runOnce()} performs is idempotent (aborting an already-aborted txn is a no-op; lock
+   * deletes and CTS purges converge), the watermark only moves forward, and correctness never
+   * depends on the reaper (the CAS/commit_scn checks in {@code IcebergCatalog.doCommit} stand
+   * alone). Running on all nodes therefore costs redundant scans, not correctness. Each node adds
+   * random jitter to its first tick (see {@link #start(long)}) so a large fleet does not stampede
+   * the DB in lock-step. Disable per-node with {@code polaris.transaction.reaper.enabled=false}.
+   *
+   * <p>Future scaling lever (documented, not implemented): a DB advisory-lock / leased-leader gate
+   * so only one node reaps per interval — see multi-table_transactions.plan.md.
+   */
+  void onStartup(@Observes Startup event) {
+    if (!enabled) {
+      LOGGER.info("Transaction reaper disabled (polaris.transaction.reaper.enabled=false)");
+      return;
+    }
+    start();
   }
 
   /** Starts the background reaper thread. Idempotent — safe to call multiple times. */
@@ -98,6 +125,9 @@ public class TransactionReaper {
               t.setDaemon(true);
               return t;
             });
+    // Per-node jitter on the first tick so N nodes don't all fire at the same wall-clock instant
+    // and hammer the shared DB in lock-step. Subsequent ticks are fixed-delay from completion.
+    long initialDelay = intervalSeconds + ThreadLocalRandom.current().nextLong(intervalSeconds + 1);
     var unused =
         scheduler.scheduleWithFixedDelay(
             () -> {
@@ -107,10 +137,13 @@ public class TransactionReaper {
                 LOGGER.error("Transaction reaper failed", e);
               }
             },
-            intervalSeconds,
+            initialDelay,
             intervalSeconds,
             TimeUnit.SECONDS);
-    LOGGER.info("Transaction reaper started with interval={}s", intervalSeconds);
+    LOGGER.info(
+        "Transaction reaper started with interval={}s (first tick in {}s)",
+        intervalSeconds,
+        initialDelay);
   }
 
   /** Stops the background reaper. */
@@ -141,7 +174,7 @@ public class TransactionReaper {
           new JdbcTransactionPersistence(ds, datasourceOperations.getDatabaseType(), realm, 0L);
       List<Long> expired = persistence.findExpiredTransactionIdsForRealm();
       if (expired.isEmpty()) {
-        advanceWatermarkAndPurge(persistence);
+        advanceWatermarkAndPurge(ds, realm);
         continue;
       }
 
@@ -156,7 +189,7 @@ public class TransactionReaper {
           LOGGER.warn("Failed to reap transaction {}: {}", txnId, e.getMessage());
         }
       }
-      advanceWatermarkAndPurge(persistence);
+      advanceWatermarkAndPurge(ds, realm);
     }
     return total;
   }
@@ -172,24 +205,46 @@ public class TransactionReaper {
       try {
         persistence.releaseTxnSnapshot(snapId);
       } catch (Exception e) {
-        LOGGER.warn("Reaper: failed to release txn_snapshot {} for txn {}: {}", snapId, txnId, e.getMessage());
+        LOGGER.warn(
+            "Reaper: failed to release txn_snapshot {} for txn {}: {}",
+            snapId,
+            txnId,
+            e.getMessage());
       }
     }
     LOGGER.info("Reaper: aborted expired transaction txn_id={}", txnId);
   }
 
-  private void advanceWatermarkAndPurge(JdbcTransactionPersistence persistence) {
+  private void advanceWatermarkAndPurge(DataSource ds, String realm) {
     try {
-      long[] xs = persistence.captureXminXmaxForRealm();
-      long newWatermark = xs[0];
-      if (newWatermark <= 0) {
-        return;
+      // commit_scn is per-catalog, so the purge horizon and CTS purge are per-catalog too.
+      JdbcTransactionPersistence realmScoped =
+          new JdbcTransactionPersistence(ds, datasourceOperations.getDatabaseType(), realm, 0L);
+      List<Long> catalogIds = realmScoped.findCatalogIdsForRealm();
+      for (long catalogId : catalogIds) {
+        JdbcTransactionPersistence perCatalog =
+            new JdbcTransactionPersistence(
+                ds, datasourceOperations.getDatabaseType(), realm, catalogId);
+        // Purge horizon = MIN(read_point) over live snapshots (in-progress REPEATABLE_READ writers
+        // are covered via their linked live snapshot). With no live snapshots, everything below the
+        // current commit_scn is purgeable (the per-table survivor rule still keeps each table's
+        // latest row). read_point / commit_scn share the per-catalog commit clock, so they compare
+        // directly.
+        long minLive = perCatalog.minLiveReadPointForCatalog();
+        long watermark;
+        try (java.sql.Connection conn = ds.getConnection()) {
+          watermark = minLive >= 0 ? minLive : perCatalog.currentCommitScn(conn);
+        }
+        if (watermark <= 0) {
+          continue;
+        }
+        perCatalog.upsertWatermark(watermark);
+        perCatalog.purgeCommittedSnapshotsBelowWatermark(watermark);
       }
-      persistence.raiseWatermarkAcrossRealm(newWatermark);
-      persistence.purgeCommittedSnapshotsRealmWideBelow(newWatermark);
-      LOGGER.debug("Watermark advanced for realm {}", persistence.getRealmId());
+      LOGGER.debug(
+          "Watermark advanced for realm {} across {} catalog(s)", realm, catalogIds.size());
     } catch (SQLException e) {
-      LOGGER.warn("Watermark advance failed: {}", e.getMessage());
+      LOGGER.warn("Watermark advance failed for realm {}: {}", realm, e.getMessage());
     }
   }
 }

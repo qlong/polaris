@@ -49,13 +49,13 @@ import org.apache.iceberg.util.PropertyUtil;
 import org.apache.polaris.core.rest.PolarisEndpoints;
 import org.apache.polaris.core.rest.PolarisResourcePaths;
 import org.apache.polaris.spark.rest.BeginTransactionRESTRequest;
-import org.apache.polaris.spark.rest.GetSubtransactionRESTResponse;
 import org.apache.polaris.spark.rest.CommitSubtransactionRESTRequest;
 import org.apache.polaris.spark.rest.CommitTransactionRESTRequest;
 import org.apache.polaris.spark.rest.CreateGenericTableRESTRequest;
 import org.apache.polaris.spark.rest.CreateGenericTableRequest;
 import org.apache.polaris.spark.rest.CreateSubtransactionRESTRequest;
 import org.apache.polaris.spark.rest.GenericTable;
+import org.apache.polaris.spark.rest.GetSubtransactionRESTResponse;
 import org.apache.polaris.spark.rest.ListGenericTablesRESTResponse;
 import org.apache.polaris.spark.rest.LoadGenericTableRESTResponse;
 import org.apache.polaris.spark.rest.StagedTableCommitRESTRequest;
@@ -82,7 +82,9 @@ public class PolarisRESTCatalog implements PolarisCatalog, Closeable {
   // the default endpoints to config if server doesn't specify the 'endpoints' configuration.
   private static final Set<Endpoint> DEFAULT_ENDPOINTS = PolarisEndpoints.GENERIC_TABLE_ENDPOINTS;
 
-  /** Thrown when the server signals a retryable lock conflict (HTTP 409, type=LockConflictError). */
+  /**
+   * Thrown when the server signals a retryable lock conflict (HTTP 409, type=LockConflictError).
+   */
   static class LockConflictRetryException extends RuntimeException {
     final long retryAfterMs;
 
@@ -100,9 +102,9 @@ public class PolarisRESTCatalog implements PolarisCatalog, Closeable {
   }
 
   /**
-   * Error handler that intercepts 409 LockConflictError responses and converts them to
-   * {@link LockConflictRetryException} so callers can implement retry-with-backoff.
-   * All other errors fall through to the default handler.
+   * Error handler that intercepts 409 LockConflictError responses and converts them to {@link
+   * LockConflictRetryException} so callers can implement retry-with-backoff. All other errors fall
+   * through to the default handler.
    */
   private static final ErrorHandler LOCK_AWARE_ERROR_HANDLER =
       new ErrorHandler() {
@@ -325,7 +327,8 @@ public class PolarisRESTCatalog implements PolarisCatalog, Closeable {
    * <p>When {@code tables} is non-empty the server uses the inline single-session path; when empty
    * the server reads pre-registered subtransactions (multi-app path).
    */
-  public void commitTransaction(long txnId, String txnToken, List<StagedTableCommitRESTRequest> tables) {
+  public void commitTransaction(
+      long txnId, String txnToken, List<StagedTableCommitRESTRequest> tables) {
     CommitTransactionRESTRequest body =
         tables.isEmpty() ? null : new CommitTransactionRESTRequest(tables);
     restClient
@@ -387,8 +390,8 @@ public class PolarisRESTCatalog implements PolarisCatalog, Closeable {
 
   /**
    * GET /polaris/v1/{prefix}/transactions/subtransactions/{subtxnId} — looks up a subtransaction by
-   * ID and validates ownership via the subtxn_token. Returns the parent txn_id,
-   * txn_snapshot_id, assigned_staging_path, and table_uuid needed by the worker to enter worker mode.
+   * ID and validates ownership via the subtxn_token. Returns the parent txn_id, txn_snapshot_id,
+   * assigned_staging_path, and table_uuid needed by the worker to enter worker mode.
    */
   public GetSubtransactionRESTResponse getSubtransaction(long subtxnId, String subtxnToken) {
     return restClient
@@ -402,8 +405,8 @@ public class PolarisRESTCatalog implements PolarisCatalog, Closeable {
   }
 
   /**
-   * POST /polaris/v1/{prefix}/transactions/{txnId}/abort — aborts the transaction.
-   * Requires X-Txn-Token header to prove ownership.
+   * POST /polaris/v1/{prefix}/transactions/{txnId}/abort — aborts the transaction. Requires
+   * X-Txn-Token header to prove ownership.
    */
   public void abortTransaction(long txnId, String txnToken) {
     restClient
@@ -417,9 +420,9 @@ public class PolarisRESTCatalog implements PolarisCatalog, Closeable {
   }
 
   /**
-   * GET /v1/{prefix}/namespaces/{ns}/tables/{table}?txn_snapshot_id={id}
-   * Calls the standard Iceberg loadTable endpoint with a Polaris extension query param.
-   * Returns the metadata-location pinned to the given transaction snapshot.
+   * GET /v1/{prefix}/namespaces/{ns}/tables/{table}?txn_snapshot_id={id} Calls the standard Iceberg
+   * loadTable endpoint with a Polaris extension query param. Returns the metadata-location pinned
+   * to the given transaction snapshot.
    */
   public String resolveTableMetadataLocation(TableIdentifier identifier, long txnSnapshotId) {
     LoadTableResponse response =

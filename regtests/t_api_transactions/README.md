@@ -102,8 +102,8 @@ src/
 ### What is tested
 
 **`test_snapshot.py`** — `POST /transaction-snapshots`:
-- Response shape: `txn_snapshot_id`, `xmin`, `xmax`, `xip_list`, `expires_at`
-- `xmax >= xmin` invariant
+- Response shape: `txn_snapshot_id`, `read_point`, `expires_at`
+- `read_point >= 0` invariant
 - `GET` returns same id
 - Successive creates return distinct ids
 - `DELETE` returns 204
@@ -129,7 +129,7 @@ src/
 
 ```
 test_snapshot.py::TestTransactionSnapshotCRUD::test_create_returns_required_fields PASSED
-test_snapshot.py::TestTransactionSnapshotCRUD::test_xmax_at_least_xmin PASSED
+test_snapshot.py::TestTransactionSnapshotCRUD::test_read_point_is_non_negative PASSED
 test_snapshot.py::TestTransactionSnapshotCRUD::test_get_snapshot_returns_same_id PASSED
 test_snapshot.py::TestTransactionSnapshotCRUD::test_each_create_returns_unique_id PASSED
 test_snapshot.py::TestTransactionSnapshotCRUD::test_release_returns_204 PASSED

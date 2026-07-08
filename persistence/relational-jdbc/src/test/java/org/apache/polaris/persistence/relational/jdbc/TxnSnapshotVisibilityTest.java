@@ -21,6 +21,7 @@ package org.apache.polaris.persistence.relational.jdbc;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.InputStream;
+import java.sql.Connection;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Optional;
@@ -33,11 +34,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 /**
- * Tests the MVCC visibility logic in {@link JdbcTransactionPersistence#resolveTableSnapshot}.
+ * Tests the visibility logic in {@link JdbcTransactionPersistence#resolveTableSnapshot}.
  *
- * <p>The visibility rule is: a commit is visible under snapshot S if {@code committed_txn_id <
- * S.xmax AND committed_txn_id NOT IN S.xip_list}. xmin is intentionally NOT used as a lower bound:
- * commits older than any active transaction are definitively committed and must remain visible.
+ * <p>The visibility rule is a single commit-order cutoff: a commit is visible under snapshot S iff
+ * {@code commit_scn <= S.read_point}. A {@code committed_table_snapshots} row exists only for
+ * committed transactions, so no in-flight/aborted exclusion is needed.
  */
 class TxnSnapshotVisibilityTest {
 
@@ -46,6 +47,7 @@ class TxnSnapshotVisibilityTest {
   private static final String TABLE_UUID = "vis-table-uuid";
 
   private JdbcTransactionPersistence persistence;
+  private DataSource dataSource;
 
   @BeforeEach
   void setUp() throws Exception {
@@ -53,7 +55,7 @@ class TxnSnapshotVisibilityTest {
         "jdbc:h2:mem:vis_test_"
             + UUID.randomUUID()
             + ";DB_CLOSE_DELAY=-1;MODE=PostgreSQL;DATABASE_TO_UPPER=false";
-    DataSource dataSource = JdbcConnectionPool.create(jdbcUrl, "sa", "");
+    dataSource = JdbcConnectionPool.create(jdbcUrl, "sa", "");
 
     DatasourceOperations ops =
         new DatasourceOperations(
@@ -86,60 +88,57 @@ class TxnSnapshotVisibilityTest {
     persistence = new JdbcTransactionPersistence(dataSource, DatabaseType.H2, REALM, CATALOG_ID);
   }
 
-  /** Inserts a committed_table_snapshots row at the given txn_id. */
-  private void insertSnapshot(long committedTxnId, String metadataLocation) throws Exception {
-    persistence.insertCommittedTableSnapshotRow(
-        new CommittedTableSnapshotRow(TABLE_UUID, committedTxnId, null, metadataLocation));
+  /**
+   * Inserts a committed_table_snapshots row with an explicit {@code commit_scn}. Uses the
+   * connection-scoped primitive (which honors the row's scn) rather than {@code
+   * insertCommittedTableSnapshotRow} (which auto-allocates), so the visibility-boundary tests can
+   * pin specific scn values.
+   */
+  private void insertSnapshot(long commitScn, String metadataLocation) throws Exception {
+    try (Connection conn = dataSource.getConnection()) {
+      conn.setAutoCommit(false);
+      persistence.insertCommittedTableSnapshot(
+          conn, new CommittedTableSnapshotRow(TABLE_UUID, commitScn, null, metadataLocation));
+      conn.commit();
+    }
   }
 
-  /** Builds a synthetic TxnSnapshotRow for visibility queries. */
-  private TxnSnapshotRow snapshot(long xmin, long xmax, String xipList) {
+  /** Builds a synthetic TxnSnapshotRow pinned at the given read_point. */
+  private TxnSnapshotRow snapshot(long readPoint) {
     Instant now = Instant.now();
     return new TxnSnapshotRow(
-        1L, REALM, CATALOG_ID, xmin, xmax, xipList, now, now.plus(1, ChronoUnit.HOURS), null);
+        1L, REALM, CATALOG_ID, readPoint, now, now.plus(1, ChronoUnit.HOURS), null);
   }
 
   @Test
-  void visibleCommitReturnedWhenWithinBounds() throws Exception {
+  void visibleCommitReturnedWhenAtOrBelowReadPoint() throws Exception {
     insertSnapshot(100, "s3://bucket/v100.metadata.json");
 
     Optional<CommittedTableSnapshotRow> result =
-        persistence.resolveTableSnapshot(TABLE_UUID, snapshot(50, 200, ""));
+        persistence.resolveTableSnapshot(TABLE_UUID, snapshot(200));
 
     assertThat(result).isPresent();
     assertThat(result.get().metadataLocation()).isEqualTo("s3://bucket/v100.metadata.json");
   }
 
   @Test
-  void commitBeforeXminIsStillVisible() throws Exception {
-    // Commits older than xmin are definitively committed before any active transaction started;
-    // xmin is NOT a lower visibility bound — they must be visible.
-    insertSnapshot(10, "s3://bucket/v10.metadata.json");
-
-    Optional<CommittedTableSnapshotRow> result =
-        persistence.resolveTableSnapshot(TABLE_UUID, snapshot(50, 200, ""));
-
-    assertThat(result).isPresent();
-    assertThat(result.get().metadataLocation()).isEqualTo("s3://bucket/v10.metadata.json");
-  }
-
-  @Test
-  void commitAtOrAfterXmaxIsNotVisible() throws Exception {
+  void commitEqualToReadPointIsVisible() throws Exception {
+    // The cutoff is inclusive: a commit whose id equals read_point is visible.
     insertSnapshot(200, "s3://bucket/v200.metadata.json");
 
     Optional<CommittedTableSnapshotRow> result =
-        persistence.resolveTableSnapshot(TABLE_UUID, snapshot(50, 200, ""));
+        persistence.resolveTableSnapshot(TABLE_UUID, snapshot(200));
 
-    assertThat(result).isEmpty();
+    assertThat(result).isPresent();
+    assertThat(result.get().metadataLocation()).isEqualTo("s3://bucket/v200.metadata.json");
   }
 
   @Test
-  void commitInXipListIsNotVisible() throws Exception {
-    insertSnapshot(100, "s3://bucket/v100.metadata.json");
+  void commitAboveReadPointIsNotVisible() throws Exception {
+    insertSnapshot(201, "s3://bucket/v201.metadata.json");
 
-    // 100 is within [50, 200) but is in the in-progress list
     Optional<CommittedTableSnapshotRow> result =
-        persistence.resolveTableSnapshot(TABLE_UUID, snapshot(50, 200, "100"));
+        persistence.resolveTableSnapshot(TABLE_UUID, snapshot(200));
 
     assertThat(result).isEmpty();
   }
@@ -148,33 +147,19 @@ class TxnSnapshotVisibilityTest {
   void latestVisibleCommitReturnedWhenMultipleExist() throws Exception {
     insertSnapshot(50, "s3://bucket/v50.metadata.json");
     insertSnapshot(80, "s3://bucket/v80.metadata.json");
-    insertSnapshot(150, "s3://bucket/v150.metadata.json"); // beyond xmax
+    insertSnapshot(150, "s3://bucket/v150.metadata.json"); // above read_point
 
     Optional<CommittedTableSnapshotRow> result =
-        persistence.resolveTableSnapshot(TABLE_UUID, snapshot(40, 100, ""));
+        persistence.resolveTableSnapshot(TABLE_UUID, snapshot(100));
 
     assertThat(result).isPresent();
     assertThat(result.get().metadataLocation()).isEqualTo("s3://bucket/v80.metadata.json");
   }
 
   @Test
-  void xipListExcludesOnlyTheListedTxnId() throws Exception {
-    insertSnapshot(80, "s3://bucket/v80.metadata.json"); // visible
-    insertSnapshot(90, "s3://bucket/v90.metadata.json"); // in xip — not visible
-    insertSnapshot(95, "s3://bucket/v95.metadata.json"); // visible
-
-    Optional<CommittedTableSnapshotRow> result =
-        persistence.resolveTableSnapshot(TABLE_UUID, snapshot(50, 200, "90"));
-
-    // Latest visible (not in xip) is v95
-    assertThat(result).isPresent();
-    assertThat(result.get().metadataLocation()).isEqualTo("s3://bucket/v95.metadata.json");
-  }
-
-  @Test
   void noVisibleCommitReturnsEmpty() throws Exception {
     Optional<CommittedTableSnapshotRow> result =
-        persistence.resolveTableSnapshot(TABLE_UUID, snapshot(50, 200, ""));
+        persistence.resolveTableSnapshot(TABLE_UUID, snapshot(200));
 
     assertThat(result).isEmpty();
   }

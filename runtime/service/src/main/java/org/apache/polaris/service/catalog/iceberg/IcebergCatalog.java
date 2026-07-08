@@ -116,9 +116,9 @@ import org.apache.polaris.core.entity.table.GenericTableEntity;
 import org.apache.polaris.core.entity.table.IcebergTableLikeEntity;
 import org.apache.polaris.core.exceptions.CommitConflictException;
 import org.apache.polaris.core.persistence.PolarisMetaStoreManager;
-import org.apache.polaris.core.persistence.TransactionWorkspaceMetaStoreManager;
 import org.apache.polaris.core.persistence.PolarisResolvedPathWrapper;
 import org.apache.polaris.core.persistence.RetryOnConcurrencyException;
+import org.apache.polaris.core.persistence.TransactionWorkspaceMetaStoreManager;
 import org.apache.polaris.core.persistence.dao.entity.BaseResult;
 import org.apache.polaris.core.persistence.dao.entity.DropEntityResult;
 import org.apache.polaris.core.persistence.dao.entity.EntityResult;
@@ -290,12 +290,17 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
       return;
     }
     try {
-      long committedTxnId = jdbcTransactionPersistence.nextTxnId();
       Long icebergSnapshotId =
           metadata.currentSnapshot() != null ? metadata.currentSnapshot().snapshotId() : null;
+      // Best-effort (non-JDBC-atomic) path: insertCommittedTableSnapshotRow allocates the
+      // commit_scn
+      // in its own transaction, so the scn advance and the row are durable together.
       jdbcTransactionPersistence.insertCommittedTableSnapshotRow(
           new CommittedTableSnapshotRow(
-              tableUuid, committedTxnId, icebergSnapshotId, metadataLocation));
+              tableUuid,
+              JdbcTransactionPersistence.UNASSIGNED_SCN,
+              icebergSnapshotId,
+              metadataLocation));
     } catch (SQLException e) {
       throw new ServiceFailureException(
           e, "Failed to record committed_table_snapshots row for table %s", tableIdentifier);
@@ -303,8 +308,10 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
   }
 
   /**
-   * Builds a {@link CommittedTableSnapshotRow} for a table commit and returns it, or {@code null}
-   * if schema-v5 JDBC persistence is not active.
+   * Builds a {@link CommittedTableSnapshotRow} <i>template</i> for a table commit and returns it,
+   * or {@code null} if schema-v5 JDBC persistence is not active. The {@code commit_scn} is left
+   * unassigned ({@link JdbcTransactionPersistence#UNASSIGNED_SCN}); the real scn is allocated
+   * inside the entity-write transaction by {@code writeEntityWithSnapshotRecord}.
    */
   @Nullable
   private CommittedTableSnapshotRow buildSnapshotRowIfActive(
@@ -312,16 +319,10 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
     if (jdbcTransactionPersistence == null) {
       return null;
     }
-    try {
-      long committedTxnId = jdbcTransactionPersistence.nextTxnId();
-      Long icebergSnapshotId =
-          metadata.currentSnapshot() != null ? metadata.currentSnapshot().snapshotId() : null;
-      return new CommittedTableSnapshotRow(
-          tableUuid, committedTxnId, icebergSnapshotId, metadataLocation);
-    } catch (SQLException e) {
-      throw new ServiceFailureException(
-          e, "Failed to allocate txn_id for committed_table_snapshots for table %s", tableUuid);
-    }
+    Long icebergSnapshotId =
+        metadata.currentSnapshot() != null ? metadata.currentSnapshot().snapshotId() : null;
+    return new CommittedTableSnapshotRow(
+        tableUuid, JdbcTransactionPersistence.UNASSIGNED_SCN, icebergSnapshotId, metadataLocation);
   }
 
   /**

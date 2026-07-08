@@ -336,8 +336,11 @@ public class PolarisRESTCatalogTest {
     when(mockTxnResp.txnSnapshotId()).thenReturn(7L);
 
     when(mockClient.post(
-            any(), any(), eq(org.apache.polaris.spark.rest.TransactionRESTResponse.class),
-            anyMap(), any()))
+            any(),
+            any(),
+            eq(org.apache.polaris.spark.rest.TransactionRESTResponse.class),
+            anyMap(),
+            any()))
         .thenReturn(mockTxnResp);
 
     org.apache.polaris.spark.rest.TransactionRESTResponse resp =
@@ -403,7 +406,8 @@ public class PolarisRESTCatalogTest {
             any()))
         .thenReturn(mockLoadResp);
 
-    TableIdentifier ident = TableIdentifier.of(org.apache.iceberg.catalog.Namespace.of("ns"), "orders");
+    TableIdentifier ident =
+        TableIdentifier.of(org.apache.iceberg.catalog.Namespace.of("ns"), "orders");
     String location = catalog.resolveTableMetadataLocation(ident, 47L);
 
     assertThat(location).isEqualTo("file:///tmp/v5.metadata.json");

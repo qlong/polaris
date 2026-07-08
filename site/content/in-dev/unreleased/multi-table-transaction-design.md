@@ -25,7 +25,9 @@
 
 > **Implementation status (2026-06-09):** Phase 1 and Phase 2 are implemented. All known open items resolved: (1) `assigned_staging_path` now points to a specific file inside the table's own metadata directory (`{table.location}/metadata/{txn_id}-{subtxn_id}-{uuid}.metadata.json`), fixing the credential-vending location check failure on `loadTable?txn_id=T` (RYOW). (2) `IcebergCatalogHandler` RYOW lookup now uses `tableIdentifier.toString()` to correctly match `subtransactions.table_uuid`.
 
-> **Key insight — two kinds of "snapshot"**: The word "snapshot" has two distinct meanings in this system. A **`TxnSnapshot`** `(xmin, xmax, xip_list)` is the MVCC visibility state that determines which transactions a reader can see — a PostgreSQL concept, analogous to `pg_snapshot`. An **Iceberg table snapshot** (`table_snapshot_id`) is the native Iceberg point-in-time state of a table's data files. The catalog server maintains a `committed_table_snapshots` mapping table that translates a `TxnSnapshot` into the specific Iceberg table snapshot to serve for each table. Pure readers acquire a `txn_snapshot_id` — lightweight, lock-free, no CLOG entry — and pass it on every table read; the server resolves the correct Iceberg table snapshot automatically. A query that reads multiple tables **must** use a shared `TxnSnapshot`; without one, successive reads can observe different committed states and produce a torn cross-table view.
+> **Key insight — two kinds of "snapshot"**: The word "snapshot" has two distinct meanings in this system. A **`TxnSnapshot`** carries a single **`read_point`** — a monotonic commit-order value (a *commit timestamp*) captured when the snapshot is taken. It determines which committed table states a reader can see: a committed table snapshot is visible iff its `commit_scn <= read_point`. An **Iceberg table snapshot** (`table_snapshot_id`) is the native Iceberg point-in-time state of a table's data files. The catalog server maintains a `committed_table_snapshots` mapping table that translates a `read_point` into the specific Iceberg table snapshot to serve for each table. Pure readers acquire a `txn_snapshot_id` — lightweight, lock-free, no CLOG entry — and pass it on every table read; the server resolves the correct Iceberg table snapshot automatically. A query that reads multiple tables **must** use a shared `TxnSnapshot`; without one, successive reads can observe different committed states and produce a torn cross-table view.
+>
+> This is deliberately *simpler* than PostgreSQL's `pg_snapshot` `(xmin, xmax, xip_list)` triple. See [Why a single `read_point`](#why-a-single-read_point-and-not-xmin-xmax-xip) for why the triple is unnecessary in this model.
 
 ---
 
@@ -95,7 +97,7 @@ Status values:
   2 = ABORTED        transaction was rolled back or expired
 ```
 
-The CLOG is the single source of truth for visibility. A reader never needs to inspect table metadata directly — it asks the CLOG whether the transaction that wrote a given snapshot has committed.
+The CLOG is the authoritative record of transaction *lifecycle* — it governs commit/abort and write-conflict decisions. It is **not** consulted on the read path. Because a `committed_table_snapshots` row is written **only at commit** (an aborted or in-flight transaction leaves no row — see [Abort: No Undo Log Needed](#abort-no-undo-log-needed)), the mere existence of a mapping row already means "committed." A reader therefore never needs to ask the CLOG whether a writer committed: it compares `commit_scn <= read_point` against the mapping table and is done. This is the structural difference from PostgreSQL that lets us drop `(xmin, xmax, xip)` — see [Why a single `read_point`](#why-a-single-read_point-and-not-xmin-xmax-xip).
 
 ### Subtransaction
 
@@ -115,27 +117,43 @@ The word "snapshot" has two distinct meanings in this system and must not be con
 
 | Term | PostgreSQL Equivalent | What It Is | Lives In |
 |---|---|---|---|
-| **`TxnSnapshot`** | `pg_snapshot` / `SnapshotData` | The MVCC visibility state: `(xmin, xmax, xip_list)`. Determines which *transactions* are visible to a reader. | Catalog server (`txn_snapshots` table or embedded in `transactions` row) |
+| **`TxnSnapshot`** | a commit timestamp (cf. Percolator's timestamp oracle) | The read visibility point: a single **`read_point`**. Determines which committed table states are visible to a reader. | Catalog server (`txn_snapshots` table or embedded in `transactions` row) |
 | **Table Snapshot** | N/A — Iceberg-native | Iceberg's point-in-time state of a table's data files, identified by `table_snapshot_id`. Created by every Iceberg write commit. | Iceberg metadata JSON on object storage |
 
 These two are related but separate: a `TxnSnapshot` identifies a logical point in *transaction* history; a table snapshot is the concrete Iceberg metadata state that corresponds to that point for a *specific table*. The `committed_table_snapshots` mapping table bridges between them.
 
-### TxnSnapshot (MVCC Visibility State)
+### TxnSnapshot (read visibility point)
 
-A `TxnSnapshot` is taken at the moment a reader or snapshot-isolation (REPEATABLE READ) writer begins its operation. It captures the transaction landscape at that instant:
+A `TxnSnapshot` is taken at the moment a reader or snapshot-isolation (REPEATABLE READ) writer begins its operation. It captures a single value:
 
-- `xmin`: the oldest in-flight `txn_id` at snapshot time
-- `xmax`: the next `txn_id` to be assigned at snapshot time (exclusive upper bound)
-- `xip_list`: all `txn_id`s that were in-flight at snapshot time
+- `read_point`: the commit-order high-water-mark at snapshot time — the largest `commit_scn` that has durably committed. (Concretely, the current value of the catalog's `commit_scn_counter`.)
 
-**Visibility rule**: a committed transaction `T` is visible to `TxnSnapshot` `RS` if and only if:
+**Visibility rule**: a committed table snapshot `C` is visible to `TxnSnapshot` `RS` if and only if:
 
 ```
-T.txn_id < RS.xmax
-AND T.txn_id NOT IN RS.xip_list
+C.commit_scn <= RS.read_point
 ```
 
-This is the MVCC rule. It tells you *which transactions* a reader can see. It does not by itself tell you which Iceberg table snapshot to return — that requires the mapping described below.
+This tells you which committed states a reader can see. To turn it into the concrete Iceberg table snapshot to return, apply it against the mapping table described below (take the newest visible row per table).
+
+### Why a single `read_point` (and not xmin/xmax/xip)
+
+PostgreSQL needs the `(xmin, xmax, xip_list)` triple because visibility is judged **per row**: every heap tuple carries the XID that created it and the XID that deleted it, and aborted/in-flight tuples physically coexist with committed ones. A snapshot must therefore ask, per tuple, "did my creator commit as-of me, and my deleter not?" — and `xip` is how it excludes transactions that were still in flight when the snapshot was taken.
+
+Polaris has no such coexistence. The unit of visibility is a whole-table commit, recorded in `committed_table_snapshots` **only at commit time**; abort writes nothing there. So:
+
+- **Existence of a mapping row already means "committed"** — there is nothing aborted to filter out, so `xip` has no job.
+- The only remaining question is **ordering** — did this commit land before or after my snapshot — which a single monotonic cutoff answers completely.
+- The purge horizon is served directly and more precisely by `min(read_point)` over live snapshots — see [`txn_watermark`](#txn_watermark--purge-horizon).
+
+**Commit-timestamp invariant (load-bearing).** `read_point` is exact *iff* the number on each mapping row — `commit_scn` — is a *commit-order* value assigned **atomically with the durable metadata-pointer swap**, never a begin-time `txn_id`. Two hazards make this non-trivial, and both trace to the same root: nothing inherently serializes the *allocate → commit* interval, so a drawn number's order need not match commit order.
+
+1. *Assign-before-visible window*: if the number is drawn before the row commits, a reader can capture `read_point >= commit_scn` while that row is still invisible.
+2. *Out-of-order-commit anomaly*: if two writers draw ids `n < n+1` but commit in the reverse order, a pinned `REPEATABLE_READ` snapshot can later admit the lower id that actually committed *after* it — an anomaly a single cutoff cannot exclude without an `xip` set.
+
+A non-transactional SQL `SEQUENCE` cannot fix either: its `nextval` advances outside the caller's transaction (visible immediately, never rolled back), so it is an *allocator*, not a commit clock. (This is also why the earlier `xip` was always inert: it tracked begin-time `txn_id`s while mapping rows carried commit-time ids — two disjoint id spaces, so `NOT IN (xip)` never matched. The anomaly predates and survives dropping `xip`.)
+
+**Implementation — `commit_scn` is a transactional per-catalog counter.** Each `(realm, catalog)` has a `commit_scn_counter` row. A commit does `UPDATE commit_scn_counter SET scn = scn + 1 RETURNING scn` **inside the same transaction as the pointer swap and the CTS-row insert**. The `UPDATE` takes a row lock held until that transaction commits, so a higher `commit_scn` is guaranteed to become visible only *after* every lower one — **`commit_scn` order == commit order, by construction**. Then `read_point = current(commit_scn_counter)` (a plain committed read) can never exceed a not-yet-visible commit, and `commit_scn <= read_point` ⇔ "committed at or before my read point." Both hazards are closed; no `xip` is needed. The trade is that commits **serialize on the counter within a catalog** (different catalogs commit concurrently) — the SQL analog of Oracle's SCN / Percolator's timestamp oracle. This fits Iceberg's atomic-pointer-swap storage model exactly.
 
 ### Table Snapshot (Iceberg Native)
 
@@ -145,18 +163,18 @@ Table snapshots are what Spark, Trino, and other engines actually read from — 
 
 ### The Mapping: TxnSnapshot → Table Snapshot
 
-The catalog server must maintain a record of which `txn_id` committed each table snapshot. This is the bridge between the MVCC world and the Iceberg world:
+The catalog server maintains a record of which `commit_scn` produced each table snapshot. This is the bridge between the transaction ordering and the Iceberg world:
 
 ```
-TxnSnapshot RS (xmax=5050, xip_list=[5001, 5003])
+TxnSnapshot RS (read_point=5050)
          │
-         │  "which txn committed the most recent table snapshot
+         │  "which commit produced the most recent table snapshot
          │   visible to RS for table orders?"
          ▼
 committed_table_snapshots
-  table=orders, txn_id=5040, table_snapshot_id=42   ← most recent visible (5040 < 5050, not in xip_list)
-  table=orders, txn_id=5048, table_snapshot_id=43   ← also visible
-  table=orders, txn_id=5055, table_snapshot_id=44   ← NOT visible (5055 >= 5050)
+  table=orders, commit_scn=5040, table_snapshot_id=42   ← visible (5040 <= 5050)
+  table=orders, commit_scn=5048, table_snapshot_id=43   ← most recent visible (5048 <= 5050)
+  table=orders, commit_scn=5055, table_snapshot_id=44   ← NOT visible (5055 > 5050)
          │
          │  answer: table_snapshot_id=43
          ▼
@@ -171,13 +189,12 @@ The mapping query:
 SELECT table_snapshot_id, metadata_location
 FROM committed_table_snapshots
 WHERE table_uuid = :table_uuid
-  AND committed_txn_id < :xmax           -- committed before TxnSnapshot was taken
-  AND committed_txn_id != ALL(:xip_list) -- was not in-flight at TxnSnapshot time
-ORDER BY committed_txn_id DESC
+  AND commit_scn <= :read_point    -- committed at or before RS was taken
+ORDER BY commit_scn DESC
 LIMIT 1;
 ```
 
-Without this mapping table, the catalog cannot answer "which table snapshot was current at the time this `TxnSnapshot` was taken?" — it would have no way to translate the MVCC visibility state into a concrete Iceberg metadata pointer.
+Without this mapping table, the catalog cannot answer "which table snapshot was current at the time this `TxnSnapshot` was taken?" — it would have no way to translate the `read_point` into a concrete Iceberg metadata pointer.
 
 ### Do Readers Get a TxnID?
 
@@ -187,35 +204,59 @@ There are three cases:
 
 | Case | Gets | Watermark contribution |
 |---|---|---|
-| Pure reader (SELECT) | `txn_snapshot_id` only | `MIN(txn_snapshot.xmin)` |
+| Pure reader (SELECT) | `txn_snapshot_id` only | `MIN(txn_snapshot.read_point)` |
 | Pure writer (optimistic append) | `txn_id` only | `MIN(txn_id) WHERE status=IN_PROGRESS` |
-| Read-write transaction (REPEATABLE READ, multi-table) | `txn_id` + embedded `TxnSnapshot` | `MIN(txn_id) WHERE status=IN_PROGRESS` |
+| Read-write transaction (REPEATABLE READ, multi-table) | `txn_id` + embedded `read_point` | `MIN(read_point)` |
 
-A read-write transaction stores its `TxnSnapshot` as `(xmin, xmax, xip_list)` columns directly in the `transactions` row. All reads within that transaction use this embedded `TxnSnapshot`, giving snapshot isolation (REPEATABLE READ) semantics and enabling read-your-own-writes.
+A read-write transaction stores its `read_point` directly in the `transactions` row. All reads within that transaction use this embedded `read_point`, giving snapshot isolation (REPEATABLE READ) semantics. Read-your-own-writes is layered on top independently (staged metadata for the transaction's own `SUB_COMMITTED` subtransactions) and does not depend on the `read_point` — see the `txn_id` row in the next table.
 
 ### What Table Snapshot Does a Reader Get?
 
 When a client reads a table, the server resolves the appropriate Iceberg table snapshot as follows:
 
-| Request | TxnSnapshot Used | Table Snapshot Returned |
+| Request | read_point Used | Table Snapshot Returned |
 |---|---|---|
-| `GET /tables/A` (no txn_snapshot_id) | Fresh: `xmax = current max committed txn_id` | Latest committed table snapshot |
-| `GET /tables/A?txn_snapshot_id=RS` | RS from `txn_snapshots` table | Most recent table snapshot with `committed_txn_id` visible to RS |
-| `GET /tables/A?txn_id=T` | Embedded snapshot in transaction T | Most recent visible + RYOW (staged metadata if T has SUB_COMMITTED subtxn) |
+| `GET /tables/A` (no txn_snapshot_id) | Fresh: `read_point = current commit high-water-mark` | Latest committed table snapshot |
+| `GET /tables/A?txn_snapshot_id=RS` | RS from `txn_snapshots` table | Most recent table snapshot with `commit_scn <= RS.read_point` |
+| `GET /tables/A?txn_id=T` | Embedded `read_point` in transaction T | Most recent visible + RYOW (staged metadata if T has SUB_COMMITTED subtxn) |
 
 **For any query that reads more than one table, the client must acquire a `TxnSnapshot` first and pass it on every read.** Without a shared `TxnSnapshot`, two successive GETs can observe different committed states and produce a torn cross-table view.
 
 The correct multi-table read pattern:
 
 ```
-1. POST /v1/txn-snapshots                            → txn_snapshot_id=RS, xmax=5050
+1. POST /v1/txn-snapshots                            → txn_snapshot_id=RS, read_point=5050
 2. GET  /v1/tables/orders?txn_snapshot_id=RS         → table_snapshot_id=42 (visible to RS)
 3. GET  /v1/tables/customers?txn_snapshot_id=RS      → table_snapshot_id=17 (visible to RS)
    Both tables are consistent at the same logical point in transaction history.
 4. DELETE /v1/txn-snapshots/RS                       → release (advance watermark)
 ```
 
-A `TxnSnapshot` is lightweight — no CLOG entry, no locks, no write state. Its only cost is pinning the watermark via `xmin`.
+A `TxnSnapshot` is lightweight — no CLOG entry, no locks, no write state. Its only cost is pinning the purge watermark via its `read_point`.
+
+### Relationship to Iceberg Time Travel
+
+A common question: *Iceberg already has time travel (`FOR VERSION AS OF <snapshot-id>`, `FOR TIMESTAMP AS OF <ts>`) — doesn't that already give consistent multi-table reads?* The answer clarifies exactly what this design contributes. A consistent multi-table read decomposes into two independent problems:
+
+1. **Resolution** — *for one logical instant, which snapshot of **each** table is the right one?* → produces a per-table map `{orders → 42, customers → 17, products → 31}`.
+2. **Execution** — *read table X at its resolved snapshot* → scan the data files for that snapshot.
+
+**Iceberg time travel solves only problem 2.** It is a per-table executor: given a snapshot-id (or a timestamp) *for a single table*, it reads that table at that snapshot. It has no notion of a cross-table instant, so on its own it cannot answer problem 1 — it cannot tell you *which* per-table snapshots line up into one consistent view.
+
+This is why native `FOR TIMESTAMP AS OF ts1` does **not** give a consistent cross-table read: a single wall-clock `ts1` is a poor way to *derive* the resolution map. Snapshot `timestamp-ms` is the writer's wall-clock stamp (independent clocks, write-time ≠ commit-time), so the two halves of one logical multi-table transaction can straddle `ts1` → a torn view. The failure is in resolution, not execution.
+
+**`committed_table_snapshots` + `read_point` is precisely the resolver for problem 1** that Iceberg lacks: a catalog-wide, commit-ordered index that turns one `read_point` into the correct snapshot for *every* table at that logical instant, using a single global order instead of unsynchronized wall clocks. Given a correct resolution map, native time travel *is* a perfectly consistent executor.
+
+So the two are complementary — resolver + executor — and there are two valid ways to execute once `read_point` has resolved the map:
+
+| Execution strategy | How | Notes |
+|---|---|---|
+| **Metadata-pointer pin** (default) | server returns the resolved `metadata_location`; client reads that immutable `metadata.json` directly (Spark plugin wraps it in `PinnedTableOperations`) | Strongest, engine-agnostic; no `AS OF` clause needed. The metadata file already carries schema/spec/current-snapshot as of that commit. |
+| **Native time travel** | server returns the resolved `iceberg_snapshot_id` per table; client issues `FOR VERSION AS OF <id>` per table | Uses Iceberg's built-in mechanism (e.g. the Trino demo). The `iceberg_snapshot_id` column in `committed_table_snapshots` exists to supply this map. |
+
+**Prefer snapshot-ids over timestamps for the time-travel path.** `FOR VERSION AS OF <snapshot-id>` reads an exact snapshot and is always safe. `FOR TIMESTAMP AS OF t` resolves to the newest snapshot with `timestamp-ms <= t`, so to hit a specific snapshot `S` you must choose `t` in the half-open interval `[S.timestamp-ms, next_snapshot.timestamp-ms)` — fragile under non-monotonic writer clocks, same-millisecond snapshots, or a snapshot landing between resolution and read. A per-table timestamp is therefore only safe when *derived from* the already-resolved snapshot-id — i.e. once you have solved problem 1 anyway, the timestamp is just a lossy encoding of the snapshot-id you already hold.
+
+**Consistent `AS OF <timestamp>`, done correctly.** The design *can* offer a genuinely consistent wall-clock `AS OF ts1` — by routing it through the resolver: translate `ts1` once into a single cutoff, `read_point = MAX(commit_scn) WHERE committed_at <= ts1`, then apply that one `read_point` uniformly to all tables. This converts the unreliable per-table wall-clock lookup into the reliable global commit order. Caveat: this is only as precise as the `committed_at` clock resolution and assumes commits are timestamped monotonically at the catalog; for transactional correctness prefer handing out `read_point` (or `txn_snapshot_id`) directly, and treat the `ts1` path as a convenience for humans who think in timestamps.
 
 ### Lock
 
@@ -228,6 +269,13 @@ Locks are acquired pessimistically (before writing) for multi-table transactions
 ## Data Representation
 
 All transaction state lives in the REST catalog server's backend database. No shared memory is required. The catalog DB's own ACID transactions provide atomicity for state changes.
+
+> **Implementation divergences vs. the shipped schema.** The DDL in this section is the *conceptual* model; the authoritative schema is `persistence/relational-jdbc/src/main/resources/{postgres,h2}/schema-v5.sql`, and the implementation status is tracked in [multi-table_transactions.plan.md](multi-table_transactions.plan.md). Notable deltas:
+> - **`subtransactions` → `transaction_operations`** at the persistence layer (`SubtransactionRow`→`OperationRow`, `createSubtransaction`→`createOperation`). The REST/SQL surface still says "subtransaction" (`CREATE SUBTRANSACTION FOR`, `/subtransactions/{id}`).
+> - **Lock modes are the 3 PostgreSQL-style modes** `ROW_EXCLUSIVE` / `EXCLUSIVE` / `ACCESS_EXCLUSIVE` (see the [Lock Hierarchy](#lock-hierarchy) note), not the 5 data-semantic modes some examples below still narrate.
+> - **Read-write transactions link a `txn_snapshots` row via `txn_snapshot_id`** rather than storing an inline `read_point` column on `transactions` (so the embedded-`read_point` DDL below is conceptual).
+> - **`committed_txn_id` → `commit_scn`**, a *transactional per-catalog counter* (`commit_scn_counter`), not a sequence value — see [Why a single `read_point`](#why-a-single-read_point-and-not-xmin-xmax-xip).
+> - **`lock_resource`** — an added per-`(realm, catalog, resource)` anchor table used purely as a `SELECT … FOR UPDATE` gate so `LockManager.acquire`'s check-then-insert is atomic across Polaris nodes (a plain lock on `locks` can't stop two phantom inserts).
 
 ### `transactions` — The CLOG
 
@@ -247,10 +295,9 @@ CREATE TABLE transactions (
                      -- 0=IN_PROGRESS, 1=COMMITTED, 2=ABORTED
     isolation        SMALLINT NOT NULL DEFAULT 1,
                      -- 0=READ_COMMITTED, 1=REPEATABLE_READ, 2=SERIALIZABLE
-    -- Embedded TxnSnapshot for snapshot isolation (REPEATABLE_READ) transactions
-    snap_xmin        BIGINT,      -- NULL for READ_COMMITTED (fresh snapshot per statement)
-    snap_xmax        BIGINT,      -- NULL for READ_COMMITTED
-    snap_xip         BIGINT[],    -- NULL for READ_COMMITTED
+    -- Embedded read_point for snapshot isolation (REPEATABLE_READ) transactions
+    read_point       BIGINT,      -- commit high-water-mark pinned at BEGIN;
+                     -- NULL for READ_COMMITTED (fresh read point per statement)
     started_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     ended_at         TIMESTAMPTZ,
     expires_at       TIMESTAMPTZ NOT NULL
@@ -292,20 +339,18 @@ CREATE INDEX subtxn_table_idx  ON subtransactions (table_uuid, parent_txn_id);
 
 ### `txn_snapshots` — Reader Visibility Snapshots
 
-Only pure readers (no writes) get a row here. Read-write transactions store their `TxnSnapshot`
-inline in the `transactions` table (`snap_xmin`/`snap_xmax`/`snap_xip` columns).
+Only pure readers (no writes) get a row here. Read-write transactions store their `read_point`
+inline in the `transactions` table (`read_point` column).
 
 ```sql
 CREATE TABLE txn_snapshots (
     txn_snapshot_id  BIGINT PRIMARY KEY,
-                      -- unique handle; does NOT need to come from the txn_id sequence
-                      -- xmax already encodes the ordering relationship to txn_ids
-    xmin              BIGINT NOT NULL,
-                      -- oldest in-flight txn_id at snapshot time; used for watermark
-    xmax              BIGINT NOT NULL,
-                      -- next txn_id to be assigned at snapshot time; visibility upper bound
-    xip_list          BIGINT[] NOT NULL,
-                      -- in-flight txn_ids at snapshot time; excluded from visibility
+                      -- unique handle; drawn from the shared commit sequence
+    read_point        BIGINT NOT NULL,
+                      -- commit high-water-mark at snapshot time: the largest
+                      -- commit_scn durably committed when this snapshot was taken.
+                      -- Sole visibility bound (replaces the old xmin/xmax/xip triple) and
+                      -- the value that pins the purge watermark while the snapshot is live.
     registered_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at        TIMESTAMPTZ NOT NULL,
                       -- must renew or expires; prevents watermark pinning forever
@@ -313,21 +358,24 @@ CREATE TABLE txn_snapshots (
                       -- set when client explicitly releases the `TxnSnapshot`
 );
 
-CREATE INDEX txn_snapshot_xmin_idx ON txn_snapshots (xmin)
+CREATE INDEX txn_snapshot_read_point_idx ON txn_snapshots (read_point)
     WHERE released_at IS NULL;
 ```
 
 ### `committed_table_snapshots` — The MVCC-to-Iceberg Mapping
 
-This is the bridge between the transaction system and Iceberg's native table snapshot model. Every time a transaction commits a change to a table, a row is inserted here recording which `txn_id` produced which Iceberg `table_snapshot_id`. Without this table the catalog cannot translate a `TxnSnapshot`'s `(xmax, xip_list)` into a concrete Iceberg metadata pointer.
+This is the bridge between the transaction system and Iceberg's native table snapshot model. Every time a transaction commits a change to a table, a row is inserted here recording which `commit_scn` produced which Iceberg `table_snapshot_id`. Without this table the catalog cannot translate a `read_point` into a concrete Iceberg metadata pointer.
+
+> **Commit-timestamp invariant.** `commit_scn` is a *commit-order stamp* allocated from the per-catalog `commit_scn_counter` **inside the same transaction as the metadata-pointer swap** — never a begin-time `txn_id` and never a value from a non-transactional sequence. This is what makes `read_point` (a single cutoff) sufficient; see [Why a single `read_point`](#why-a-single-read_point-and-not-xmin-xmax-xip).
 
 ```sql
 CREATE TABLE committed_table_snapshots (
     table_uuid          UUID    NOT NULL,
     table_snapshot_id   BIGINT  NOT NULL,
                         -- Iceberg's native snapshot ID from the table metadata JSON
-    committed_txn_id    BIGINT  NOT NULL,
-                        -- the txn_id that committed this table snapshot
+    commit_scn          BIGINT  NOT NULL,
+                        -- commit-order stamp from commit_scn_counter, allocated atomically
+                        -- with the pointer swap that published this snapshot (NOT a txn_id)
     metadata_location   TEXT    NOT NULL,
                         -- path to the Iceberg metadata JSON file for this snapshot
     committed_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -336,7 +384,23 @@ CREATE TABLE committed_table_snapshots (
 
 -- Critical index: resolves "most recent visible table snapshot" in O(log n)
 CREATE INDEX cts_visibility_idx
-    ON committed_table_snapshots (table_uuid, committed_txn_id DESC);
+    ON committed_table_snapshots (table_uuid, commit_scn DESC);
+```
+
+**`commit_scn_counter` — the per-catalog commit clock.** A single row per `(realm, catalog)` whose `scn` is the source of every `commit_scn`. It is bumped transactionally (see the invariant above), which both orders commits and closes the assign-before-visible window:
+
+```sql
+CREATE TABLE commit_scn_counter (
+    realm_id   TEXT   NOT NULL,
+    catalog_id BIGINT NOT NULL,
+    scn        BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (realm_id, catalog_id)
+);
+-- Allocation (inside the commit transaction; RETURNING on Postgres):
+--   UPDATE commit_scn_counter SET scn = scn + 1 WHERE realm_id=? AND catalog_id=? RETURNING scn;
+-- A fresh read_point is just the current committed value:
+--   SELECT scn FROM commit_scn_counter WHERE realm_id=? AND catalog_id=?;
 ```
 
 The visibility resolution query — given a `TxnSnapshot` `RS`, find the Iceberg table snapshot to return for a table:
@@ -345,22 +409,20 @@ The visibility resolution query — given a `TxnSnapshot` `RS`, find the Iceberg
 SELECT table_snapshot_id, metadata_location
 FROM committed_table_snapshots
 WHERE table_uuid        = :table_uuid
-  AND committed_txn_id  < :rs_xmax           -- committed before TxnSnapshot was taken
-  AND committed_txn_id != ALL(:rs_xip_list)  -- was not in-flight at TxnSnapshot time
-ORDER BY committed_txn_id DESC
+  AND commit_scn       <= :rs_read_point     -- committed at or before RS was taken
+ORDER BY commit_scn DESC
 LIMIT 1;
 ```
 
 This query returns the most recently committed Iceberg table snapshot that is visible to the given `TxnSnapshot` — the exact Iceberg metadata pointer the reader should use to scan data files.
 
-For an unregistered read (no `txn_snapshot_id`), the equivalent is:
+For an unregistered read (no `txn_snapshot_id`), the equivalent is simply the latest committed row (no cutoff):
 
 ```sql
--- Latest committed: xmax = current, xip_list = [] (no in-flight exclusions)
 SELECT table_snapshot_id, metadata_location
 FROM committed_table_snapshots
 WHERE table_uuid = :table_uuid
-ORDER BY committed_txn_id DESC
+ORDER BY commit_scn DESC
 LIMIT 1;
 ```
 
@@ -374,8 +436,10 @@ CREATE TABLE locks (
                   -- e.g. 'table:<uuid>', 'partition:<uuid>/<spec_id>/<partition_value>'
     resource_type SMALLINT NOT NULL,
                   -- 0=TABLE, 1=PARTITION
-    lock_mode     SMALLINT NOT NULL,
-                  -- 0=APPEND, 1=ROW_DELTA, 2=OVERWRITE, 3=EXCLUSIVE, 4=ACCESS_EXCLUSIVE
+    lock_mode     TEXT NOT NULL,
+                  -- as implemented, 3 PostgreSQL-style modes (see § Lock Hierarchy note):
+                  -- 'ROW_EXCLUSIVE' (default, OCC, self-compatible),
+                  -- 'EXCLUSIVE' (table pessimistic write), 'ACCESS_EXCLUSIVE' (blocks all)
     status        SMALLINT NOT NULL DEFAULT 0,
                   -- 0=WAITING, 1=GRANTED
     requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -390,13 +454,28 @@ CREATE INDEX locks_txn_idx      ON locks (txn_id, status);
 
 ```sql
 CREATE TABLE txn_watermark (
-    id             INT PRIMARY KEY DEFAULT 1,   -- single-row table
-    watermark_txn_id BIGINT NOT NULL,
-    updated_at     TIMESTAMPTZ NOT NULL
+    realm_id         TEXT   NOT NULL,
+    catalog_id       BIGINT NOT NULL,
+    watermark_txn_id BIGINT NOT NULL,          -- a commit_scn value (per catalog)
+    updated_at       TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (realm_id, catalog_id)
 );
 ```
 
-The watermark is the oldest `txn_id` that any active snapshot or in-progress transaction still references. All CLOG entries, subtransactions, and lock records with `txn_id < watermark` and `status != IN_PROGRESS` are safe to purge.
+**Two horizons in two id spaces.** Since `commit_scn` (per-catalog commit clock) and `txn_id` (global begin-time identity) are now separate id spaces, they drive *different* purges and must not be mixed into one number:
+
+- **`committed_table_snapshots` horizon (a `commit_scn`, per catalog)** — the oldest commit point any live reader could still resolve. In-progress `REPEATABLE_READ` writers are covered automatically because their linked snapshot row stays live until the transaction ends:
+
+  ```
+  watermark(realm, catalog) = MIN(read_point) over live (unreleased, unexpired)
+                              txn_snapshots for that catalog
+  ```
+
+  With no live snapshots, everything below the current `commit_scn` is purgeable (the per-table survivor rule below still keeps each table's latest row). The reaper runs this per catalog (`commit_scn` is not comparable across catalogs).
+
+- **Lifecycle-table horizon (a `txn_id`)** — CLOG rows, subtransactions, and lock records keyed by `txn_id` are purgeable below `MIN(txn_id)` over IN_PROGRESS transactions once `status != IN_PROGRESS`. This is a separate horizon in the `txn_id` space; it is *not* comparable to `commit_scn` and does not gate CTS purging.
+
+> **Purge caveat for `committed_table_snapshots`.** A snapshot pinned exactly at the watermark must still resolve tables that have not changed recently, so the purge must **keep, per table, the newest row with `commit_scn <= watermark`** and only delete rows strictly older than that per-table survivor. Deleting all rows below the watermark unconditionally would strand an unchanged table with no visible snapshot.
 
 ---
 
@@ -440,6 +519,8 @@ Phantom reads are prevented at snapshot isolation because the read view is fixed
 ---
 
 ## Lock Hierarchy
+
+> **Implemented protocol (3 modes).** The design below presents 5 *data-semantic* modes (`APPEND` / `ROW_DELTA` / `OVERWRITE` / `EXCLUSIVE` / `ACCESS_EXCLUSIVE`) to motivate the compatibility reasoning. The shipped `LockManager` collapses these to **3 PostgreSQL-style modes**: **`ROW_EXCLUSIVE`** (default, OCC-style, self-compatible — the old "APPEND = no blocking lock" role, now a recorded-but-non-blocking row), **`EXCLUSIVE`** (table-level pessimistic write), and **`ACCESS_EXCLUSIVE`** (blocks everything). Conflict routing is keyed on metadata-location divergence at commit (merge-and-retry for `ROW_EXCLUSIVE`; first-committer-wins abort for `EXCLUSIVE`/`ACCESS_EXCLUSIVE`), not on the data-semantic mode. `LockManager.acquire` serializes its check-then-insert across nodes via the `lock_resource` anchor (`SELECT … FOR UPDATE`). Read the modes below as the conceptual rationale; the 3-mode matrix in `LockManager.java` is authoritative.
 
 ### Lock Modes
 
@@ -532,22 +613,21 @@ Simple, stateless. Equivalent to PostgreSQL `READ COMMITTED` for a single statem
 
 ```
 1. Client: POST /v1/transactions/snapshot
-   → Server atomically captures (xmin, xmax, xip_list) from current transaction state
+   → Server captures read_point = current commit high-water-mark
    → Returns snapshot_id=S
 
 2. Client: GET /v1/namespaces/ns/tables/orders?snapshot_id=S
-   → Server returns latest committed metadata for orders where committed_txn_id < S.xmax
-      AND committed_txn_id NOT IN S.xip_list
+   → Server returns latest committed metadata for orders where commit_scn <= S.read_point
 
 3. Client: GET /v1/namespaces/ns/tables/customers?snapshot_id=S
    → Same visibility rule — both tables observed at same logical point in time
 
 4. Client: DELETE /v1/transactions/snapshots/S
-   → Releases snapshot; watermark can advance past S.xmin
+   → Releases snapshot; watermark can advance past S.read_point
    → (Also released automatically when S.expires_at is reached)
 ```
 
-No `txn_id` is created. No CLOG entry. The snapshot is a pure read artifact — lightweight, lock-free, and cheap to acquire. The cost is only the watermark pin: the catalog cannot purge transaction history older than `S.xmin` until S is released.
+No `txn_id` is created. No CLOG entry. The snapshot is a pure read artifact — lightweight, lock-free, and cheap to acquire. The cost is only the watermark pin: the catalog cannot purge transaction history older than `S.read_point` until S is released.
 
 ### Single-Table Optimistic Write (Current Behavior, Unchanged)
 
@@ -622,7 +702,7 @@ This is the read analog of PostgreSQL's `pg_export_snapshot()` / `SET TRANSACTIO
 ```
 Orchestrator:
   POST /v1/txn-snapshots
-  ← { txn_snapshot_id: RS, xmin: 4990, xmax: 5050, xip_list: [...], expires_at: ... }
+  ← { txn_snapshot_id: RS, read_point: 5050, expires_at: ... }
 
   → passes txn_snapshot_id=RS to SparkApp1 (reads orders)
   → passes txn_snapshot_id=RS to SparkApp2 (reads customers)
@@ -632,8 +712,8 @@ SparkApp1: GET /tables/orders?txn_snapshot_id=RS     → table_snapshot_id=42
 SparkApp2: GET /tables/customers?txn_snapshot_id=RS  → table_snapshot_id=17   (parallel)
 SparkApp3: GET /tables/products?txn_snapshot_id=RS   → table_snapshot_id=31   (parallel)
 
-  All three apps see a consistent cross-table state as of xmax=5050.
-  RS.xmin pins the watermark for the duration.
+  All three apps see a consistent cross-table state as of read_point=5050.
+  RS.read_point pins the watermark for the duration.
 
 Orchestrator (after all apps complete):
   DELETE /v1/txn-snapshots/RS  → release; watermark advances
@@ -744,7 +824,7 @@ BEGIN;
 
   -- 3. Record the commit mapping (TxnSnapshot visibility bridge)
   INSERT INTO committed_table_snapshots
-    (table_uuid, table_snapshot_id, committed_txn_id, metadata_location)
+    (table_uuid, table_snapshot_id, commit_scn, metadata_location)
   VALUES (...), (...), ...;
 
   -- 4. Mark the transaction committed
@@ -865,12 +945,12 @@ Even if App1 and App2 each acquire their own snapshot independently, they still 
 ```
 -- Orchestrator acquires ONE snapshot before launching any app:
 Orchestrator: POST /v1/txn-snapshots
-  ← { txn_snapshot_id: RS, xmax: 5010, xip_list: [] }
-  (captured before W commits at txn_id=5011)
+  ← { txn_snapshot_id: RS, read_point: 5010 }
+  (captured before W commits at commit_scn=5011)
 
 -- Orchestrator passes RS to both apps:
 App1: GET /tables/orders?txn_snapshot_id=RS
-  → W's commit (txn_id=5011 ≥ xmax=5010) is NOT visible
+  → W's commit (commit_scn=5011 > read_point=5010) is NOT visible
   → returns table_snapshot_id=42  ✓
 
 App2: GET /tables/customers?txn_snapshot_id=RS
@@ -885,12 +965,12 @@ Orchestrator: DELETE /v1/txn-snapshots/RS  → watermark advances
 
 **What if the orchestrator wants to include W?** Acquire RS *after* W commits:
 ```
--- W commits at txn_id=5011
+-- W commits at commit_scn=5011
 Orchestrator: POST /v1/txn-snapshots
-  ← { txn_snapshot_id: RS2, xmax: 5012, xip_list: [] }
+  ← { txn_snapshot_id: RS2, read_point: 5011 }
   (captures state after W)
 
-App1: GET /tables/orders?txn_snapshot_id=RS2    → W visible (5011 < 5012)
+App1: GET /tables/orders?txn_snapshot_id=RS2    → W visible (5011 <= 5011)
 App2: GET /tables/customers?txn_snapshot_id=RS2 → W visible ✓
 ```
 
@@ -903,17 +983,17 @@ App2: GET /tables/customers?txn_snapshot_id=RS2 → W visible ✓
 **Scenario**: A Spark read job runs against `orders` while a Flink pipeline appends new records.
 
 ```
-T1 (reader, snapshot S1 pinned at txn_id=5000)
+T1 (reader, snapshot S1 pinned at read_point=5000)
 
 T2 (writer, APPEND to orders):
   writes new Parquet files to S3
-  commits → txn_id=5001, new snapshot=43 visible in catalog
+  commits → commit_scn=5001, new snapshot=43 visible in catalog
 
 T1 continues reading:
-  still uses snapshot S1 (pinned at txn_id=5000)
+  still uses snapshot S1 (pinned at read_point=5000)
   sees orders at snapshot=42 (the state before T2 committed)
   T2's new files are in the manifest at snapshot=43
-  S1's xmax=5000 < 5001 → T2 is NOT in T1's visible range
+  T2's commit_scn=5001 > S1.read_point=5000 → NOT in T1's visible range
 ```
 
 **Result**: T1 sees a perfectly consistent pre-T2 view for its entire duration. T2 commits without any awareness of T1. Neither blocks the other. This is the core MVCC guarantee — readers never block writers, writers never block readers.
@@ -1225,72 +1305,47 @@ The staged metadata files reference their data files. A cleanup job reads the st
 
 ## Transaction Table Maintenance
 
-### The Watermark
+### Two purge horizons (as implemented)
 
-The watermark is the oldest `txn_id` that any active snapshot or in-progress transaction still references. CLOG entries, subtransactions, and lock records older than the watermark can be safely purged.
+Because `commit_scn` (per-catalog commit clock) and `txn_id` (global begin-time identity) are separate id spaces, maintenance uses **two horizons**, not one blended `txn_id` watermark (see [`txn_watermark`](#txn_watermark--purge-horizon)):
 
-Two sources pin the watermark:
+1. **CTS horizon — a `commit_scn`, per catalog.** The oldest commit point any live reader could still resolve: `MIN(read_point)` over live (unreleased, unexpired) `txn_snapshots` for that catalog. In-progress REPEATABLE_READ writers are covered automatically (their linked snapshot row stays live until the transaction ends). With no live snapshots, the horizon is the catalog's current `commit_scn` (everything below the per-table survivor is purgeable). This is what `txn_watermark.watermark_txn_id` stores (per `(realm, catalog)`), and it gates purging of `committed_table_snapshots` only.
+2. **Lifecycle horizon — a `txn_id`.** CLOG rows, subtransactions/operations, and lock records keyed by `txn_id` are purgeable below `MIN(txn_id)` over IN_PROGRESS transactions once their status is terminal. This is a separate horizon in the `txn_id` space and is **not** comparable to `commit_scn`.
 
-1. **Active txn snapshots** (`snapshots` table) — a Spark read job that acquired a snapshot pins the watermark at `snapshot.xmin` for its job duration. Long-running read jobs are the primary source of watermark lag.
-2. **In-progress write transactions** (`transactions` table) — an in-progress write pins at its own `txn_id`. Released automatically on commit, abort, or expiry.
-
-```sql
--- Compute new watermark: minimum across both sources
-UPDATE txn_watermark
-SET watermark_txn_id = (
-    SELECT LEAST(
-        -- Pure readers: txn_snapshots pin at xmin
-        COALESCE(
-            MIN(s.xmin) FROM txn_snapshots s
-            WHERE s.released_at IS NULL AND s.expires_at > now(),
-            9223372036854775807
-        ),
-        -- Write transactions pin at txn_id
-        COALESCE(
-            MIN(t.txn_id) FILTER (WHERE t.status = 0),
-            9223372036854775807
-        )
-    )
-),
-updated_at = now()
-WHERE id = 1;
-```
-
-Long-running read jobs holding a snapshot pin the watermark and delay purging of old history. This is an **operational cost, not a correctness or liveness problem** — new transactions commit freely regardless. The `expires_at` on snapshots bounds how long any job can pin the watermark.
+The reaper (`TransactionReaper.advanceWatermarkAndPurge`) runs the CTS horizon **per catalog** (`commit_scn` is not comparable across catalogs). Long-running read jobs holding a `TxnSnapshot` pin the CTS horizon and slow purging of the mapping table — an **operational cost, not a correctness or liveness problem**; new transactions commit freely regardless, and `expires_at` bounds how long any job can pin it.
 
 ### Purging
 
 ```sql
--- Safe to delete: committed/aborted transactions below the watermark
+-- (A) committed_table_snapshots — gated by the per-catalog CTS horizon (a commit_scn).
+--     Keep, PER TABLE, the newest row with commit_scn <= watermark so a reader pinned exactly
+--     at the watermark can still resolve a table that has not changed recently; delete only rows
+--     strictly older than that per-table survivor. (Implemented in
+--     JdbcTransactionPersistence.purgeCommittedSnapshotsBelowWatermark.)
+DELETE FROM committed_table_snapshots c
+WHERE c.realm_id = :realm AND c.catalog_id = :catalog
+  AND c.commit_scn < (
+      SELECT MAX(c2.commit_scn) FROM committed_table_snapshots c2
+      WHERE c2.realm_id = c.realm_id AND c2.catalog_id = c.catalog_id
+        AND c2.table_uuid = c.table_uuid
+        AND c2.commit_scn <= :cts_watermark
+  );
+
+-- (B) lifecycle tables — gated by the txn_id horizon (a different id space).
 DELETE FROM transactions
-WHERE txn_id < (SELECT watermark_txn_id FROM txn_watermark)
-  AND status IN (1, 2);
+WHERE txn_id < :txnid_horizon AND status IN (1, 2);       -- COMMITTED / ABORTED
 
-DELETE FROM subtransactions
-WHERE parent_txn_id < (SELECT watermark_txn_id FROM txn_watermark);
-
--- Purge released/expired txn snapshots whose xmax is fully below the watermark
-DELETE FROM txn_snapshots
-WHERE xmax < (SELECT watermark_txn_id FROM txn_watermark)
-  AND (released_at IS NOT NULL OR expires_at < now());
+DELETE FROM transaction_operations
+WHERE txn_id < :txnid_horizon;
 
 DELETE FROM locks
-WHERE txn_id < (SELECT watermark_txn_id FROM txn_watermark);
+WHERE txn_id < :txnid_horizon;
 
--- Purge the MVCC-to-Iceberg mapping for table snapshots superseded below the watermark.
--- Keep at least one row per table (the most recent) even if it is below the watermark,
--- so that a fresh unregistered reader can always find the current table snapshot.
-DELETE FROM committed_table_snapshots c1
-WHERE committed_txn_id < (SELECT watermark_txn_id FROM txn_watermark)
-  AND EXISTS (
-      -- A more recent committed snapshot for this table exists
-      SELECT 1 FROM committed_table_snapshots c2
-      WHERE c2.table_uuid = c1.table_uuid
-        AND c2.committed_txn_id > c1.committed_txn_id
-  );
+-- Released/expired reader snapshots are no longer needed once below the CTS horizon.
+DELETE FROM txn_snapshots
+WHERE read_point < :cts_watermark
+  AND (released_at IS NOT NULL OR expires_at < now());
 ```
-
-Long-running read jobs holding a `TxnSnapshot` pin the watermark and slow purging of both the transaction history and the `committed_table_snapshots` mapping — an operational cost, not a correctness or availability problem. The `expires_at` on `TxnSnapshot` expires_at bounds how long any job can pin the watermark.
 
 ---
 
@@ -1298,11 +1353,11 @@ Long-running read jobs holding a `TxnSnapshot` pin the watermark and slow purgin
 
 ### TxnSnapshot Management
 
-Used by pure readers that need a consistent multi-table view. No `txn_id` or CLOG entry is created. The `TxnSnapshot` captures `(xmin, xmax, xip_list)` and is used by the server to resolve the correct Iceberg table snapshot via `committed_table_snapshots`.
+Used by pure readers that need a consistent multi-table view. No `txn_id` or CLOG entry is created. The `TxnSnapshot` captures a single `read_point` and is used by the server to resolve the correct Iceberg table snapshot via `committed_table_snapshots`.
 
 ```
 POST   /v1/txn-snapshots
-  ← { txn_snapshot_id, xmin, xmax, xip_list, expires_at }
+  ← { txn_snapshot_id, read_point, expires_at }
 
 DELETE /v1/txn-snapshots/{txn_snapshot_id}          Release (advance watermark)
 POST   /v1/txn-snapshots/{txn_snapshot_id}/renew    Extend expiry for long-running jobs
@@ -1319,9 +1374,8 @@ The server resolves the Iceberg table snapshot using:
 SELECT table_snapshot_id, metadata_location
 FROM committed_table_snapshots
 WHERE table_uuid = <table>
-  AND committed_txn_id < xmax
-  AND committed_txn_id != ALL(xip_list)
-ORDER BY committed_txn_id DESC LIMIT 1;
+  AND commit_scn <= read_point
+ORDER BY commit_scn DESC LIMIT 1;
 ```
 
 ### Write Transaction Management
@@ -1547,7 +1601,7 @@ Note that the reaper is the same mechanism that handles crashed clients — ther
 
 ### TxnSnapshot Watermark Pinning
 
-A client creates many `TxnSnapshot`s with the maximum allowed `expires_at`, then never releases them. The watermark (`xmin` across all active snapshots) is pinned at an old value, preventing purging of the CLOG, `committed_table_snapshots`, and `subtransactions` tables. The catalog DB grows unboundedly.
+A client creates many `TxnSnapshot`s with the maximum allowed `expires_at`, then never releases them. The watermark (`min(read_point)` across all active snapshots) is pinned at an old value, preventing purging of the CLOG, `committed_table_snapshots`, and `subtransactions` tables. The catalog DB grows unboundedly.
 
 **Mitigations:**
 

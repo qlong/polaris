@@ -19,7 +19,10 @@
 package org.apache.polaris.service.transaction;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
+import jakarta.enterprise.inject.Instance;
 import java.io.InputStream;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -30,8 +33,10 @@ import javax.sql.DataSource;
 import org.apache.polaris.persistence.relational.jdbc.DatabaseType;
 import org.apache.polaris.persistence.relational.jdbc.DatasourceOperations;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence;
+import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.CommittedTableSnapshotRow;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.LockRow;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.TransactionRow;
+import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.TxnSnapshotRow;
 import org.apache.polaris.persistence.relational.jdbc.RelationalJdbcConfiguration;
 import org.h2.jdbcx.JdbcConnectionPool;
 import org.junit.jupiter.api.BeforeEach;
@@ -55,6 +60,8 @@ class TransactionReaperTest {
 
   private JdbcTransactionPersistence persistence;
   private LockManager lockManager;
+  private DataSource dataSource;
+  private DatasourceOperations ops;
 
   @BeforeEach
   void setUp() throws Exception {
@@ -62,9 +69,9 @@ class TransactionReaperTest {
         "jdbc:h2:mem:reaper_integ_"
             + UUID.randomUUID()
             + ";DB_CLOSE_DELAY=-1;MODE=PostgreSQL;DATABASE_TO_UPPER=false";
-    DataSource dataSource = JdbcConnectionPool.create(jdbcUrl, "sa", "");
+    dataSource = JdbcConnectionPool.create(jdbcUrl, "sa", "");
 
-    DatasourceOperations ops =
+    ops =
         new DatasourceOperations(
             dataSource,
             new RelationalJdbcConfiguration() {
@@ -200,5 +207,115 @@ class TransactionReaperTest {
     long newTxnId = persistence.nextTxnId();
     long lockId = lockManager.acquire(newTxnId, RESOURCE, LockManager.MODE_EXCLUSIVE);
     assertThat(lockId).isGreaterThan(0);
+  }
+
+  // ---------------------------------------------------------------------------
+  // runOnce(): end-to-end reap + per-catalog watermark advance and survivor purge
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Exercises {@link TransactionReaper#runOnce()} through its real orchestration — catalog
+   * discovery, per-catalog horizon (MIN(read_point) over live snapshots, else current commit_scn),
+   * watermark upsert, and per-table survivor purge — plus the expired-transaction reap, all in one
+   * pass.
+   *
+   * <p>Setup, all in realm {@link #REALM}:
+   *
+   * <ul>
+   *   <li><b>Catalog A</b> ({@link #CATALOG_ID}): table t1 committed at commit_scn 1, 2, then a
+   *       <em>live</em> snapshot is pinned (read_point = 2), then t1 committed again at 3. Horizon
+   *       = 2 → keep scn 2 (survivor) and 3 (above), delete scn 1.
+   *   <li><b>Catalog B</b> ({@link #CATALOG_ID_B}): table t2 committed at 1, 2; no live snapshot.
+   *       Horizon = current commit_scn = 2 → keep scn 2 (survivor), delete scn 1.
+   *   <li>One expired IN_PROGRESS transaction in catalog A holding an EXCLUSIVE lock, to confirm
+   *       the reap path runs in the same pass.
+   * </ul>
+   */
+  @Test
+  void runOnceReapsExpiredAndPurgesPerCatalogWithSurvivor() throws Exception {
+    JdbcTransactionPersistence persistenceB =
+        new JdbcTransactionPersistence(dataSource, DatabaseType.H2, REALM, CATALOG_ID_B);
+    TransactionService serviceA = new TransactionService(persistence, lockManager);
+
+    // Catalog A: t1 @1, @2 ; pin a live snapshot at read_point=2 ; then t1 @3.
+    commitTable(persistence, "t1", "s3://a/t1-v1.json"); // scn 1
+    commitTable(persistence, "t1", "s3://a/t1-v2.json"); // scn 2
+    TxnSnapshotRow liveSnapA = serviceA.createTransactionSnapshot(3600); // read_point = 2, live
+    assertThat(liveSnapA.readPoint()).isEqualTo(2L);
+    commitTable(persistence, "t1", "s3://a/t1-v3.json"); // scn 3
+
+    // Catalog B: t2 @1, @2 ; no live snapshot.
+    commitTable(persistenceB, "t2", "s3://b/t2-v1.json"); // scn 1
+    commitTable(persistenceB, "t2", "s3://b/t2-v2.json"); // scn 2
+
+    // An expired transaction in catalog A holding a lock, to verify reap runs too.
+    TransactionRow expired = insertExpiredTransaction();
+    lockManager.acquire(expired.txnId(), RESOURCE, LockManager.MODE_EXCLUSIVE);
+
+    // Run the reaper end-to-end.
+    TransactionReaper reaper = newReaper();
+    int reaped = reaper.runOnce();
+
+    // --- Reap path ---
+    assertThat(reaped).as("the one expired transaction is reaped").isEqualTo(1);
+    assertThat(persistence.findTransaction(expired.txnId()).orElseThrow().status())
+        .isEqualTo(JdbcTransactionPersistence.TXN_STATUS_ABORTED);
+    assertThat(persistence.findGrantedLocksOnResource(RESOURCE, -1L)).isEmpty();
+
+    // --- Catalog A watermark + survivor purge (horizon = 2 from the live snapshot) ---
+    assertThat(persistence.getWatermark())
+        .as("catalog A watermark = live snapshot read_point")
+        .isEqualTo(2L);
+    // scn 1 purged (strictly below the per-table survivor at scn 2)
+    assertThat(persistence.resolveTableSnapshot("t1", syntheticSnapshot(CATALOG_ID, 1L))).isEmpty();
+    // scn 2 survives (newest <= watermark) — a reader pinned at the watermark still resolves t1
+    assertThat(persistence.resolveTableSnapshot("t1", syntheticSnapshot(CATALOG_ID, 2L)))
+        .hasValueSatisfying(r -> assertThat(r.metadataLocation()).isEqualTo("s3://a/t1-v2.json"));
+    // scn 3 (above watermark) is kept
+    assertThat(persistence.resolveTableSnapshot("t1", syntheticSnapshot(CATALOG_ID, 3L)))
+        .hasValueSatisfying(r -> assertThat(r.metadataLocation()).isEqualTo("s3://a/t1-v3.json"));
+
+    // --- Catalog B watermark + survivor purge (no live snapshot → horizon = current commit_scn =
+    // 2) ---
+    assertThat(persistenceB.getWatermark())
+        .as("catalog B watermark = current commit_scn (no live snapshot)")
+        .isEqualTo(2L);
+    assertThat(persistenceB.resolveTableSnapshot("t2", syntheticSnapshot(CATALOG_ID_B, 1L)))
+        .isEmpty();
+    assertThat(persistenceB.resolveTableSnapshot("t2", syntheticSnapshot(CATALOG_ID_B, 2L)))
+        .hasValueSatisfying(r -> assertThat(r.metadataLocation()).isEqualTo("s3://b/t2-v2.json"));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+
+  private static final long CATALOG_ID_B = 89L;
+
+  /** Builds a reaper wired to this test's datasource/ops for {@link #REALM}. */
+  @SuppressWarnings("unchecked")
+  private TransactionReaper newReaper() {
+    Instance<DataSource> dsInstance = mock(Instance.class);
+    when(dsInstance.isUnsatisfied()).thenReturn(false);
+    when(dsInstance.get()).thenReturn(dataSource);
+    return new TransactionReaper(dsInstance, ops, REALM, true);
+  }
+
+  /**
+   * Commits one table version: allocates a fresh commit_scn (advancing the per-catalog counter) and
+   * inserts the CTS row in the same transaction, mirroring a real commit.
+   */
+  private static void commitTable(
+      JdbcTransactionPersistence p, String tableUuid, String metadataLocation) throws Exception {
+    p.insertCommittedTableSnapshotRow(
+        new CommittedTableSnapshotRow(
+            tableUuid, JdbcTransactionPersistence.UNASSIGNED_SCN, null, metadataLocation));
+  }
+
+  /** A synthetic (non-persisted) snapshot handle pinned at the given read_point for resolution. */
+  private static TxnSnapshotRow syntheticSnapshot(long catalogId, long readPoint) {
+    Instant now = Instant.now();
+    return new TxnSnapshotRow(
+        1L, REALM, catalogId, readPoint, now, now.plus(1, ChronoUnit.HOURS), null);
   }
 }

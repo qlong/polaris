@@ -59,13 +59,12 @@ import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.ManifestFiles;
 import org.apache.iceberg.ManifestReader;
 import org.apache.iceberg.MetadataUpdate;
-import org.apache.iceberg.TableMetadataParser;
-import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.UpdateRequirement;
 import org.apache.iceberg.catalog.Catalog;
@@ -80,6 +79,7 @@ import org.apache.iceberg.exceptions.ForbiddenException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.exceptions.ServiceFailureException;
+import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.metrics.ScanReport;
 import org.apache.iceberg.rest.Endpoint;
 import org.apache.iceberg.rest.credentials.ImmutableCredential;
@@ -101,6 +101,7 @@ import org.apache.iceberg.rest.responses.ListTablesResponse;
 import org.apache.iceberg.rest.responses.LoadTableResponse;
 import org.apache.iceberg.rest.responses.LoadViewResponse;
 import org.apache.iceberg.rest.responses.UpdateNamespacePropertiesResponse;
+import org.apache.polaris.core.PolarisCallContext;
 import org.apache.polaris.core.PolarisDiagnostics;
 import org.apache.polaris.core.auth.PolarisAuthorizableOperation;
 import org.apache.polaris.core.catalog.FederatedCatalogFactory;
@@ -110,12 +111,14 @@ import org.apache.polaris.core.connection.ConnectionConfigInfoDpo;
 import org.apache.polaris.core.connection.ConnectionType;
 import org.apache.polaris.core.credentials.PolarisCredentialManager;
 import org.apache.polaris.core.entity.CatalogEntity;
+import org.apache.polaris.core.entity.PolarisBaseEntity;
 import org.apache.polaris.core.entity.PolarisEntity;
 import org.apache.polaris.core.entity.PolarisEntitySubType;
 import org.apache.polaris.core.entity.PolarisEntityType;
 import org.apache.polaris.core.entity.table.IcebergTableLikeEntity;
 import org.apache.polaris.core.persistence.PolarisResolvedPathWrapper;
 import org.apache.polaris.core.persistence.ResolvedPolarisEntity;
+import org.apache.polaris.core.persistence.RetryOnConcurrencyException;
 import org.apache.polaris.core.persistence.TransactionWorkspaceMetaStoreManager;
 import org.apache.polaris.core.persistence.dao.entity.EntitiesResult;
 import org.apache.polaris.core.persistence.dao.entity.EntityWithPath;
@@ -130,6 +133,7 @@ import org.apache.polaris.core.storage.StorageAccessConfig;
 import org.apache.polaris.core.storage.StorageUtil;
 import org.apache.polaris.immutables.PolarisImmutable;
 import org.apache.polaris.persistence.relational.jdbc.DatasourceOperations;
+import org.apache.polaris.persistence.relational.jdbc.JdbcBasePersistenceImpl;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence;
 import org.apache.polaris.service.catalog.AccessDelegationMode;
 import org.apache.polaris.service.catalog.AccessDelegationModeResolver;
@@ -922,9 +926,92 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
     }
   }
 
+  /**
+   * Commits a batch of buffered entity updates and records their {@code committed_table_snapshots}
+   * rows. When the metastore is JDBC-backed, the entity pointer swaps, the shared {@code
+   * commit_scn} allocation, and the CTS inserts all happen in <b>one</b> JDBC transaction (via
+   * {@link JdbcBasePersistenceImpl#writeEntitiesWithSnapshotRecords}), so all tables become visible
+   * at a single atomic commit point with a monotonic commit stamp. Otherwise it falls back to the
+   * generic {@code updateEntitiesPropertiesIfNotChanged} plus a best-effort CTS insert per table.
+   *
+   * <p>Shared by the standard {@code commitTransaction} path and the multi-table extension/inline
+   * finalize paths. {@code failureContext} is used only in the batch-commit error message.
+   */
+  private void finalizeEntitiesWithCommittedSnapshots(
+      List<EntityWithPath> pending, String failureContext) {
+    if (pending.isEmpty()) {
+      return;
+    }
+    PolarisCallContext ctx = callContext().getPolarisCallContext();
+    JdbcTransactionPersistence jdbcTxn = buildJdbcTransactionPersistenceIfActive();
+
+    // CTS templates (scn assigned later) for every Iceberg table entity with a metadata location.
+    List<JdbcTransactionPersistence.CommittedTableSnapshotRow> ctsTemplates = new ArrayList<>();
+    for (EntityWithPath ewp : pending) {
+      if (ewp.entity().getSubTypeCode() == PolarisEntitySubType.ICEBERG_TABLE.getCode()) {
+        IcebergTableLikeEntity tableEntity = new IcebergTableLikeEntity(ewp.entity());
+        String metadataLocation = tableEntity.getMetadataLocation();
+        if (metadataLocation != null) {
+          ctsTemplates.add(
+              new JdbcTransactionPersistence.CommittedTableSnapshotRow(
+                  tableEntity.getId() + "",
+                  JdbcTransactionPersistence.UNASSIGNED_SCN,
+                  null,
+                  metadataLocation));
+        }
+      }
+    }
+
+    if (jdbcTxn != null && ctx.getMetaStore() instanceof JdbcBasePersistenceImpl jdbc) {
+      // Atomic path: entity swaps + shared commit_scn + CTS rows in one JDBC transaction.
+      List<PolarisBaseEntity> updated = new ArrayList<>(pending.size());
+      List<PolarisBaseEntity> originals = new ArrayList<>(pending.size());
+      long now = System.currentTimeMillis();
+      for (EntityWithPath ewp : pending) {
+        PolarisBaseEntity original = ewp.entity();
+        long updateTs = Math.max(now, original.getCreateTimestamp());
+        PolarisBaseEntity prepared =
+            new PolarisBaseEntity.Builder(original)
+                .lastUpdateTimestamp(updateTs)
+                .entityVersion(original.getEntityVersion() + 1)
+                .build();
+        originals.add(original);
+        updated.add(prepared);
+      }
+      try {
+        jdbc.writeEntitiesWithSnapshotRecords(ctx, updated, originals, ctsTemplates, jdbcTxn);
+      } catch (RetryOnConcurrencyException e) {
+        throw new CommitFailedException(
+            "%s failed: an entity was concurrently modified: %s", failureContext, e.getMessage());
+      }
+      return;
+    }
+
+    // Fallback path: generic batch entity commit, then best-effort CTS inserts (own transactions).
+    EntitiesResult result = metaStoreManager().updateEntitiesPropertiesIfNotChanged(ctx, pending);
+    if (!result.isSuccess()) {
+      throw new CommitFailedException(
+          "%s failed with status: %s, extraInfo: %s",
+          failureContext, result.getReturnStatus(), result.getExtraInformation());
+    }
+    if (jdbcTxn != null) {
+      for (JdbcTransactionPersistence.CommittedTableSnapshotRow tmpl : ctsTemplates) {
+        try {
+          jdbcTxn.insertCommittedTableSnapshotRow(tmpl);
+        } catch (java.sql.SQLException e) {
+          LOGGER.warn(
+              "Failed to record committed_table_snapshots for table {} during {} finalize;"
+                  + " snapshot reads may miss this commit: {}",
+              tmpl.tableUuid(),
+              failureContext,
+              e.getMessage());
+        }
+      }
+    }
+  }
+
   /** Returns the raw Iceberg {@link Table} for use during transaction finalization. */
-  public org.apache.iceberg.Table loadRawTable(
-      org.apache.iceberg.catalog.TableIdentifier tableId) {
+  public org.apache.iceberg.Table loadRawTable(org.apache.iceberg.catalog.TableIdentifier tableId) {
     return baseCatalog.loadTable(tableId);
   }
 
@@ -1009,7 +1096,8 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
           String ryowKey = tableIdentifier.toString();
           metadataLocation =
               txnService.resolveRYOWMetadataLocation(ryowKey, txnId.get()).orElse(null);
-          // No staged write yet — fall back to the transaction's pinned TxnSnapshot (REPEATABLE READ)
+          // No staged write yet — fall back to the transaction's pinned TxnSnapshot (REPEATABLE
+          // READ)
           if (metadataLocation == null) {
             Long linkedSnapId = txnService.getTransaction(txnId.get()).txnSnapshotId();
             if (linkedSnapId != null) {
@@ -1364,45 +1452,10 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
           tableMetadataObjs.add(currentMetadata);
         });
 
-    // Commit the collected updates in a single atomic operation
+    // Commit the collected updates atomically and record committed_table_snapshots rows with a
+    // shared commit_scn in the same transaction (when JDBC-backed).
     List<EntityWithPath> pendingUpdates = transactionMetaStoreManager.getPendingUpdates();
-    EntitiesResult result =
-        metaStoreManager()
-            .updateEntitiesPropertiesIfNotChanged(
-                callContext().getPolarisCallContext(), pendingUpdates);
-    if (!result.isSuccess()) {
-      // TODO: Retries and server-side cleanup on failure, review possible exceptions
-      throw new CommitFailedException(
-          "Transaction commit failed with status: %s, extraInfo: %s",
-          result.getReturnStatus(), result.getExtraInformation());
-    }
-
-    // Record committed_table_snapshots rows for all Iceberg table entities in the batch,
-    // keeping the MVCC history consistent with the entity writes (best-effort: if JDBC
-    // persistence is unavailable the single-table path already skips recording too).
-    JdbcTransactionPersistence jdbcTxn = buildJdbcTransactionPersistenceIfActive();
-    if (jdbcTxn != null) {
-      for (EntityWithPath ewp : pendingUpdates) {
-        if (ewp.entity().getSubTypeCode() == PolarisEntitySubType.ICEBERG_TABLE.getCode()) {
-          IcebergTableLikeEntity tableEntity = new IcebergTableLikeEntity(ewp.entity());
-          String metadataLocation = tableEntity.getMetadataLocation();
-          if (metadataLocation != null) {
-            try {
-              long committedTxnId = jdbcTxn.nextTxnId();
-              jdbcTxn.insertCommittedTableSnapshotRow(
-                  new JdbcTransactionPersistence.CommittedTableSnapshotRow(
-                      tableEntity.getId() + "", committedTxnId, null, metadataLocation));
-            } catch (java.sql.SQLException e) {
-              LOGGER.warn(
-                  "Failed to record committed_table_snapshots for table entity {} during"
-                      + " commitTransaction finalize; snapshot reads may miss this commit: {}",
-                  tableEntity.getId(),
-                  e.getMessage());
-            }
-          }
-        }
-      }
-    }
+    finalizeEntitiesWithCommittedSnapshots(pendingUpdates, "Transaction commit");
 
     eventAttributeMap().put(EventAttributes.TABLE_METADATAS, tableMetadataObjs);
   }
@@ -1415,9 +1468,9 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
    *       each table's passthrough path registered (same pattern as {@link #finalizeInlineTables}).
    *   <li>Buffers all entity updates in a shared {@link TransactionWorkspaceMetaStoreManager}.
    *   <li>Applies direct pointer swaps and APPEND merge-and-retry commits.
-   *   <li>Commits every entity update in a single {@code updateEntitiesPropertiesIfNotChanged} call.
-   *   <li>Inserts all {@code committed_table_snapshots} rows with a shared {@code committed_txn_id}
-   *       in one JDBC transaction — giving MVCC readers an atomic commit point.
+   *   <li>Commits every entity update and inserts all {@code committed_table_snapshots} rows with a
+   *       shared {@code commit_scn} in one JDBC transaction (via {@code
+   *       finalizeEntitiesWithCommittedSnapshots}) — giving MVCC readers an atomic commit point.
    * </ol>
    *
    * @param direct subtransactions whose staged metadata can be applied as-is (no conflict)
@@ -1488,52 +1541,24 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
       }
     } finally {
       for (IcebergCatalogHandler h : openHandlers) {
-        try { h.close(); } catch (Exception ignored) {}
-      }
-    }
-
-    // Commit all entity updates atomically (one DB transaction).
-    List<EntityWithPath> pending = workspace.getPendingUpdates();
-    EntitiesResult entityResult =
-        metaStoreManager()
-            .updateEntitiesPropertiesIfNotChanged(callContext().getPolarisCallContext(), pending);
-    if (!entityResult.isSuccess()) {
-      throw new CommitFailedException(
-          "Extension transaction entity batch commit failed: %s", entityResult.getReturnStatus());
-    }
-
-    // Insert all committed_table_snapshots rows in one transaction with a shared committed_txn_id.
-    // This gives MVCC readers a single atomic visibility point for all tables, improving on the
-    // standard commitTransaction path which uses a separate nextTxnId() per table.
-    JdbcTransactionPersistence jdbcTxn = buildJdbcTransactionPersistenceIfActive();
-    if (jdbcTxn != null && !pending.isEmpty()) {
-      List<JdbcTransactionPersistence.CommittedTableSnapshotRow> ctsRows = new ArrayList<>();
-      for (EntityWithPath ewp : pending) {
-        if (ewp.entity().getSubTypeCode() == PolarisEntitySubType.ICEBERG_TABLE.getCode()) {
-          IcebergTableLikeEntity tableEntity = new IcebergTableLikeEntity(ewp.entity());
-          String metadataLocation = tableEntity.getMetadataLocation();
-          if (metadataLocation != null) {
-            ctsRows.add(
-                new JdbcTransactionPersistence.CommittedTableSnapshotRow(
-                    tableEntity.getId() + "", 0L, null, metadataLocation));
-          }
+        try {
+          h.close();
+        } catch (Exception ignored) {
         }
       }
-      try {
-        jdbcTxn.insertBatchCommittedTableSnapshots(ctsRows);
-      } catch (java.sql.SQLException e) {
-        LOGGER.warn(
-            "Failed to batch-insert committed_table_snapshots during extension txn finalize;"
-                + " MVCC snapshot reads may see stale state: {}",
-            e.getMessage());
-      }
     }
+
+    // Commit all entity updates atomically and record committed_table_snapshots rows with a shared
+    // commit_scn in the SAME JDBC transaction (when JDBC-backed) — one atomic visibility point for
+    // all tables, with a monotonic commit stamp.
+    List<EntityWithPath> pending = workspace.getPendingUpdates();
+    finalizeEntitiesWithCommittedSnapshots(pending, "Extension transaction commit");
   }
 
   /**
-   * Finalizes the inline single-session commit path (Use Case 1). Mirrors
-   * {@link #finalizeExtensionTransaction} but receives {@link TransactionService.StagedTableInfo}
-   * records built from the client-provided staged metadata paths.
+   * Finalizes the inline single-session commit path (Use Case 1). Mirrors {@link
+   * #finalizeExtensionTransaction} but receives {@link TransactionService.StagedTableInfo} records
+   * built from the client-provided staged metadata paths.
    *
    * @param direct tables with no concurrent conflict — apply staged pointer swap
    * @param mergeRetry APPEND tables that had a concurrent commit — re-parent data files onto live
@@ -1589,43 +1614,17 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
       }
     } finally {
       for (IcebergCatalogHandler h : openHandlers) {
-        try { h.close(); } catch (Exception ignored) {}
-      }
-    }
-
-    // Commit all entity updates atomically and insert committed_table_snapshots rows.
-    List<EntityWithPath> pending = workspace.getPendingUpdates();
-    EntitiesResult entityResult =
-        metaStoreManager()
-            .updateEntitiesPropertiesIfNotChanged(callContext().getPolarisCallContext(), pending);
-    if (!entityResult.isSuccess()) {
-      throw new CommitFailedException(
-          "Inline transaction entity batch commit failed: %s", entityResult.getReturnStatus());
-    }
-
-    JdbcTransactionPersistence jdbcTxn = buildJdbcTransactionPersistenceIfActive();
-    if (jdbcTxn != null && !pending.isEmpty()) {
-      List<JdbcTransactionPersistence.CommittedTableSnapshotRow> ctsRows = new ArrayList<>();
-      for (EntityWithPath ewp : pending) {
-        if (ewp.entity().getSubTypeCode() == PolarisEntitySubType.ICEBERG_TABLE.getCode()) {
-          IcebergTableLikeEntity tableEntity = new IcebergTableLikeEntity(ewp.entity());
-          String metadataLocation = tableEntity.getMetadataLocation();
-          if (metadataLocation != null) {
-            ctsRows.add(
-                new JdbcTransactionPersistence.CommittedTableSnapshotRow(
-                    tableEntity.getId() + "", 0L, null, metadataLocation));
-          }
+        try {
+          h.close();
+        } catch (Exception ignored) {
         }
       }
-      try {
-        jdbcTxn.insertBatchCommittedTableSnapshots(ctsRows);
-      } catch (java.sql.SQLException e) {
-        LOGGER.warn(
-            "Failed to batch-insert committed_table_snapshots during inline txn finalize;"
-                + " MVCC snapshot reads may see stale state: {}",
-            e.getMessage());
-      }
     }
+
+    // Commit all entity updates atomically and record committed_table_snapshots rows with a shared
+    // commit_scn in the SAME JDBC transaction (when JDBC-backed).
+    List<EntityWithPath> pending = workspace.getPendingUpdates();
+    finalizeEntitiesWithCommittedSnapshots(pending, "Inline transaction commit");
   }
 
   /** Parses a dot-separated subtransaction tableUuid into an Iceberg {@link TableIdentifier}. */

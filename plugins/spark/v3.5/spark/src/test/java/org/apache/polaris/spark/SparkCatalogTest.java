@@ -32,21 +32,21 @@ import java.util.Optional;
 import java.util.UUID;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.BaseTable;
+import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.TableOperations;
-import org.apache.iceberg.hadoop.HadoopFileIO;
-import org.apache.iceberg.types.Types;
-import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.actions.DeleteReachableFiles;
 import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.hadoop.HadoopFileIO;
 import org.apache.iceberg.spark.SparkUtil;
 import org.apache.iceberg.spark.actions.DeleteReachableFilesSparkAction;
 import org.apache.iceberg.spark.actions.SparkActions;
 import org.apache.iceberg.spark.source.SparkTable;
+import org.apache.iceberg.types.Types;
 import org.apache.polaris.spark.utils.DeltaHelper;
 import org.apache.polaris.spark.utils.HudiHelper;
 import org.apache.polaris.spark.utils.PaimonHelper;
@@ -663,8 +663,7 @@ public class SparkCatalogTest {
     // Write a standalone metadata file to disk — this is the "pinned" snapshot the txn sees.
     Path tempDir = Files.createTempDirectory("polaris-pinned-ops-");
     String pinnedMetaPath = tempDir.resolve("v1.metadata.json").toUri().toString();
-    Schema pinnedSchema =
-        new Schema(Types.NestedField.required(1, "id", Types.LongType.get()));
+    Schema pinnedSchema = new Schema(Types.NestedField.required(1, "id", Types.LongType.get()));
     TableMetadata pinnedMeta =
         TableMetadata.newTableMetadata(
             pinnedSchema,
@@ -697,8 +696,8 @@ public class SparkCatalogTest {
   }
 
   /**
-   * When inside a transaction, current() and refresh() must return the PINNED snapshot's metadata
-   * — not the live table's current state. This guarantees REPEATABLE_READ semantics.
+   * When inside a transaction, current() and refresh() must return the PINNED snapshot's metadata —
+   * not the live table's current state. This guarantees REPEATABLE_READ semantics.
    */
   @Test
   void testLoadTableInTransactionPinsReadsToSpecifiedSnapshot() throws Exception {
@@ -712,8 +711,7 @@ public class SparkCatalogTest {
     Path tempDir = Files.createTempDirectory("polaris-pinned-read-");
     String pinnedMetaPath = tempDir.resolve("v1.metadata.json").toUri().toString();
     Schema pinnedSchema =
-        new Schema(
-            Types.NestedField.required(99, "txn_pinned_sentinel", Types.IntegerType.get()));
+        new Schema(Types.NestedField.required(99, "txn_pinned_sentinel", Types.IntegerType.get()));
     TableMetadata pinnedMeta =
         TableMetadata.newTableMetadata(
             pinnedSchema,
@@ -755,13 +753,13 @@ public class SparkCatalogTest {
    */
   @Test
   void testLoadTableInTransactionFallsBackToStaticOpsWhenLiveUnreachable() throws Exception {
-    // No table created in the catalog — icebergsSparkCatalog.loadTable will throw NoSuchTableException.
+    // No table created in the catalog — icebergsSparkCatalog.loadTable will throw
+    // NoSuchTableException.
     Identifier ident = Identifier.of(defaultNS, "txn-fallback-test");
 
     Path tempDir = Files.createTempDirectory("polaris-fallback-");
     String pinnedMetaPath = tempDir.resolve("v1.metadata.json").toUri().toString();
-    Schema schema =
-        new Schema(Types.NestedField.required(1, "id", Types.LongType.get()));
+    Schema schema = new Schema(Types.NestedField.required(1, "id", Types.LongType.get()));
     TableMetadata pinnedMeta =
         TableMetadata.newTableMetadata(
             schema,

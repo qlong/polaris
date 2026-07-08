@@ -23,7 +23,6 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.LockRow;
@@ -61,13 +60,6 @@ import org.slf4j.LoggerFactory;
 public class LockManager {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(LockManager.class);
-
-  /**
-   * Per-resource mutex used to serialize concurrent {@link #acquire} calls within the same JVM.
-   * Keyed by "realmId/catalogId/resource". Static so that it outlives per-request bean instances.
-   */
-  private static final ConcurrentHashMap<String, Object> ACQUIRE_MUTEXES =
-      new ConcurrentHashMap<>();
 
   // Lock mode constants — must match the lock_mode column in the locks table.
   public static final String MODE_ROW_EXCLUSIVE = "ROW_EXCLUSIVE";
@@ -125,15 +117,17 @@ public class LockManager {
 
   /**
    * Attempts to acquire a lock for {@code txnId} on {@code resource} with the given {@code
-   * lockMode}. Grants immediately if no conflict exists; throws {@link LockConflictException}
-   * (HTTP 409) on conflict.
+   * lockMode}. Grants immediately if no conflict exists; throws {@link LockConflictException} (HTTP
+   * 409) on conflict.
    *
    * <p>Conflict semantics by mode:
+   *
    * <ul>
    *   <li>ROW_EXCLUSIVE: inserts a lock row so EXCLUSIVE can detect it. If EXCLUSIVE or
-   *       ACCESS_EXCLUSIVE is already held, throws immediately (no retry hint — client should fail).
-   *   <li>EXCLUSIVE / ACCESS_EXCLUSIVE: if any conflicting lock is held, throws with a
-   *       {@link LockConflictException#retryAfterMs()} hint so the client can retry with backoff.
+   *       ACCESS_EXCLUSIVE is already held, throws immediately (no retry hint — client should
+   *       fail).
+   *   <li>EXCLUSIVE / ACCESS_EXCLUSIVE: if any conflicting lock is held, throws with a {@link
+   *       LockConflictException#retryAfterMs()} hint so the client can retry with backoff.
    * </ul>
    *
    * @throws LockConflictException if a conflicting lock is held; check {@code retryAfterMs()} to
@@ -141,31 +135,53 @@ public class LockManager {
    */
   public long acquire(long txnId, String resource, String lockMode)
       throws SQLException, LockConflictException {
-    // Serialize concurrent acquire calls for the same resource within this JVM.
-    // Each LockManager is per-request, so the mutex map must be static.
-    String mutexKey = persistence.getRealmId() + "/" + persistence.getCatalogId() + "/" + resource;
-    Object mutex = ACQUIRE_MUTEXES.computeIfAbsent(mutexKey, k -> new Object());
-    synchronized (mutex) {
-      List<LockRow> conflicts = persistence.findGrantedLocksOnResource(resource, txnId);
-      for (LockRow held : conflicts) {
-        if (!compatible(held.lockMode(), lockMode)) {
-          String msg =
-              String.format(
-                  "Lock conflict: txn=%d resource=%s mode=%s blocked by txn=%d mode=%s",
-                  txnId, resource, lockMode, held.txnId(), held.lockMode());
-          if (MODE_ROW_EXCLUSIVE.equals(lockMode)) {
-            // ROW_EXCLUSIVE blocked by an EXCLUSIVE/ACCESS_EXCLUSIVE: fail immediately.
-            throw new LockConflictException(msg);
-          } else {
-            // EXCLUSIVE/ACCESS_EXCLUSIVE: signal client to retry with backoff.
-            throw new LockConflictException(msg, DEFAULT_RETRY_AFTER_MS);
-          }
-        }
+    // The check-then-insert runs under a per-resource anchor row lock (SELECT ... FOR UPDATE),
+    // which serializes concurrent acquirers of the SAME resource across ALL Polaris nodes — not
+    // just within one JVM. This closes the multi-node race where two nodes each observe "no
+    // conflict" and both insert a conflicting lock row. The anchor lock is released as soon as this
+    // returns (its transaction commits); the long-lived lock is the `locks` row itself.
+    AcquireResult result =
+        persistence.runWithResourceAnchor(
+            resource,
+            conn -> {
+              List<LockRow> conflicts =
+                  persistence.findGrantedLocksOnResource(conn, resource, txnId);
+              for (LockRow held : conflicts) {
+                if (!compatible(held.lockMode(), lockMode)) {
+                  return AcquireResult.conflict(held.txnId(), held.lockMode());
+                }
+              }
+              long lockId = persistence.insertGrantedLock(conn, txnId, resource, lockMode);
+              return AcquireResult.granted(lockId);
+            });
+
+    if (result.conflict()) {
+      String msg =
+          String.format(
+              "Lock conflict: txn=%d resource=%s mode=%s blocked by txn=%d mode=%s",
+              txnId, resource, lockMode, result.blockingTxnId(), result.blockingMode());
+      if (MODE_ROW_EXCLUSIVE.equals(lockMode)) {
+        // ROW_EXCLUSIVE blocked by an EXCLUSIVE/ACCESS_EXCLUSIVE: fail immediately (no retry).
+        throw new LockConflictException(msg);
       }
-      long lockId = persistence.insertLock(txnId, resource, lockMode);
-      persistence.grantLock(lockId);
-      LOGGER.debug("Lock granted: txn={} resource={} mode={}", txnId, resource, lockMode);
-      return lockId;
+      // EXCLUSIVE/ACCESS_EXCLUSIVE: signal client to retry with backoff.
+      throw new LockConflictException(msg, DEFAULT_RETRY_AFTER_MS);
+    }
+    LOGGER.debug("Lock granted: txn={} resource={} mode={}", txnId, resource, lockMode);
+    return result.lockId();
+  }
+
+  /**
+   * Outcome of the anchored check-then-insert: either a granted lock id or a conflict descriptor.
+   */
+  private record AcquireResult(
+      long lockId, boolean conflict, long blockingTxnId, String blockingMode) {
+    static AcquireResult granted(long lockId) {
+      return new AcquireResult(lockId, false, -1L, null);
+    }
+
+    static AcquireResult conflict(long blockingTxnId, String blockingMode) {
+      return new AcquireResult(-1L, true, blockingTxnId, blockingMode);
     }
   }
 
@@ -247,5 +263,4 @@ public class LockManager {
       return retryAfterMs;
     }
   }
-
 }

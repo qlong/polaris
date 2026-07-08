@@ -166,8 +166,7 @@ class LockAcquireReleaseTest {
 
     lockManager.acquire(txn1, RESOURCE, LockManager.MODE_EXCLUSIVE);
 
-    assertThatThrownBy(
-            () -> lockManager.acquire(txn2, RESOURCE, LockManager.MODE_ACCESS_EXCLUSIVE))
+    assertThatThrownBy(() -> lockManager.acquire(txn2, RESOURCE, LockManager.MODE_ACCESS_EXCLUSIVE))
         .isInstanceOf(LockManager.LockConflictException.class);
   }
 
@@ -178,8 +177,7 @@ class LockAcquireReleaseTest {
 
     lockManager.acquire(txn1, RESOURCE, LockManager.MODE_ACCESS_EXCLUSIVE);
 
-    assertThatThrownBy(
-            () -> lockManager.acquire(txn2, RESOURCE, LockManager.MODE_ROW_EXCLUSIVE))
+    assertThatThrownBy(() -> lockManager.acquire(txn2, RESOURCE, LockManager.MODE_ROW_EXCLUSIVE))
         .isInstanceOf(LockManager.LockConflictException.class);
   }
 }

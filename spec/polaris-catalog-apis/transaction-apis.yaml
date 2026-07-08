@@ -32,7 +32,7 @@ paths:
         - Transaction API
       summary: Acquire a consistent read snapshot
       description: >
-        Creates a TxnSnapshot capturing (xmin, xmax, xip_list) atomically.
+        Creates a TxnSnapshot capturing a single read_point (a commit-order cutoff).
         The caller can pass txn_snapshot_id on subsequent loadTable calls to
         get a consistent multi-table view pinned to this snapshot.
       operationId: createTransactionSnapshot
@@ -657,28 +657,18 @@ components:
       type: object
       required:
         - txn_snapshot_id
-        - xmin
-        - xmax
-        - xip_list
+        - read_point
         - expires_at
       properties:
         txn_snapshot_id:
           type: integer
           format: int64
-        xmin:
+        read_point:
           type: integer
           format: int64
-          description: Lowest txn_id that may still be in-progress
-        xmax:
-          type: integer
-          format: int64
-          description: First txn_id not yet assigned at snapshot time
-        xip_list:
-          type: array
-          items:
-            type: integer
-            format: int64
-          description: Transaction IDs in-progress at snapshot creation time
+          description: >
+            Commit-order high-water-mark at snapshot time. A committed table snapshot
+            is visible under this handle iff its commit_scn <= read_point.
         expires_at:
           type: string
           format: date-time

@@ -154,7 +154,17 @@ public class JdbcBasePersistenceImpl implements BasePersistence, IntegrationPers
           connection -> {
             persistEntity(
                 callCtx, entity, originalEntity, connection, datasourceOperations::execute);
-            jdbcTxn.insertCommittedTableSnapshot(connection, snapshotRow);
+            // Allocate the commit_scn INSIDE this transaction so the scn advance and the CTS row
+            // become durable together with the entity pointer swap (commit-order == scn-order).
+            // The scn carried on the incoming template row (if any) is ignored.
+            long commitScn = jdbcTxn.allocateCommitScn(connection);
+            jdbcTxn.insertCommittedTableSnapshot(
+                connection,
+                new JdbcTransactionPersistence.CommittedTableSnapshotRow(
+                    snapshotRow.tableUuid(),
+                    commitScn,
+                    snapshotRow.icebergSnapshotId(),
+                    snapshotRow.metadataLocation()));
             return true;
           });
     } catch (RetryOnConcurrencyException e) {
@@ -162,6 +172,57 @@ public class JdbcBasePersistenceImpl implements BasePersistence, IntegrationPers
     } catch (SQLException e) {
       throw new RuntimeException(
           "Error persisting entity with snapshot record: " + e.getMessage(), e);
+    }
+  }
+
+  /**
+   * Batch analog of {@link #writeEntityWithSnapshotRecord}: writes every entity AND inserts a
+   * {@code committed_table_snapshots} row for each, sharing a <b>single</b> {@code commit_scn}
+   * allocated inside the one JDBC transaction. This gives all tables of a multi-table transaction
+   * one atomic commit point: an MVCC snapshot taken before this call sees none of the new states,
+   * one taken after sees all of them, and the scn advances atomically with the pointer swaps.
+   *
+   * <p>{@code entities}/{@code originalEntities} are index-aligned (the caller has already prepared
+   * each updated entity, e.g. bumped its version). {@code snapshotRowTemplates} carry table_uuid /
+   * iceberg_snapshot_id / metadata_location; their scn field is ignored (the shared scn is stamped
+   * here).
+   */
+  public void writeEntitiesWithSnapshotRecords(
+      @Nonnull PolarisCallContext callCtx,
+      @Nonnull List<PolarisBaseEntity> entities,
+      @Nullable List<PolarisBaseEntity> originalEntities,
+      @Nonnull List<JdbcTransactionPersistence.CommittedTableSnapshotRow> snapshotRowTemplates,
+      @Nonnull JdbcTransactionPersistence jdbcTxn) {
+    try {
+      datasourceOperations.runWithinTransaction(
+          connection -> {
+            for (int i = 0; i < entities.size(); i++) {
+              PolarisBaseEntity entity = entities.get(i);
+              PolarisBaseEntity originalEntity =
+                  originalEntities != null ? originalEntities.get(i) : null;
+              persistEntity(
+                  callCtx, entity, originalEntity, connection, datasourceOperations::execute);
+            }
+            if (!snapshotRowTemplates.isEmpty()) {
+              long commitScn = jdbcTxn.allocateCommitScn(connection);
+              for (JdbcTransactionPersistence.CommittedTableSnapshotRow tmpl :
+                  snapshotRowTemplates) {
+                jdbcTxn.insertCommittedTableSnapshot(
+                    connection,
+                    new JdbcTransactionPersistence.CommittedTableSnapshotRow(
+                        tmpl.tableUuid(),
+                        commitScn,
+                        tmpl.icebergSnapshotId(),
+                        tmpl.metadataLocation()));
+              }
+            }
+            return true;
+          });
+    } catch (RetryOnConcurrencyException e) {
+      throw e;
+    } catch (SQLException e) {
+      throw new RuntimeException(
+          "Error persisting entities with snapshot records: " + e.getMessage(), e);
     }
   }
 

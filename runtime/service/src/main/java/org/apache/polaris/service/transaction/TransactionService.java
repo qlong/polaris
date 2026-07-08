@@ -26,14 +26,12 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.UUID;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.UUID;
 import org.apache.iceberg.util.LocationUtil;
-import java.util.stream.Collectors;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.CommittedTableSnapshotRow;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.OperationRow;
@@ -79,18 +77,13 @@ public class TransactionService {
   // ---------------------------------------------------------------------------
 
   /**
-   * Acquires a new read-consistent snapshot. The returned {@link TxnSnapshotRow} contains (xmin,
-   * xmax, xip_list) captured atomically, giving the caller a pinned view across all subsequent
-   * {@code loadTable?txn_snapshot_id=X} calls.
+   * Acquires a new read-consistent snapshot. The returned {@link TxnSnapshotRow} carries a single
+   * {@code read_point} (a commit-order cutoff) captured atomically, giving the caller a pinned view
+   * across all subsequent {@code loadTable?txn_snapshot_id=X} calls.
    */
   public TxnSnapshotRow createTransactionSnapshot(int leaseSeconds) throws SQLException {
     long id = persistence.nextTxnId();
-    long[] xState = persistence.captureXminXmax();
-    long xmin = xState[0];
-    long xmax = xState[1];
-    long[] xipArr = Arrays.copyOfRange(xState, 2, xState.length);
-    String xipList =
-        Arrays.stream(xipArr).mapToObj(Long::toString).collect(Collectors.joining(","));
+    long readPoint = persistence.captureReadPoint();
 
     int effectiveLease = leaseSeconds > 0 ? leaseSeconds : DEFAULT_SNAPSHOT_LEASE_SECONDS;
     Instant now = Instant.now();
@@ -99,14 +92,12 @@ public class TransactionService {
             id,
             persistence.getRealmId(),
             persistence.getCatalogId(),
-            xmin,
-            xmax,
-            xipList,
+            readPoint,
             now,
             now.plus(effectiveLease, ChronoUnit.SECONDS),
             null);
     persistence.insertTxnSnapshot(row);
-    LOGGER.info("TxnSnapshot created: id={} xmin={} xmax={} xip=[{}]", id, xmin, xmax, xipList);
+    LOGGER.info("TxnSnapshot created: id={} read_point={}", id, readPoint);
     return row;
   }
 
@@ -159,28 +150,19 @@ public class TransactionService {
     Instant now = Instant.now();
     Instant expiresAt = now.plus(effective, ChronoUnit.SECONDS);
 
-    Long snapXmin = null, snapXmax = null;
-    String snapXipList = null;
     Long linkedTxnSnapshotId = null;
     if ("REPEATABLE_READ".equalsIgnoreCase(isolation)) {
-      long[] xs = persistence.captureXminXmax();
-      snapXmin = xs[0];
-      snapXmax = xs[1];
-      long[] xipArr = Arrays.copyOfRange(xs, 2, xs.length);
-      snapXipList = Arrays.stream(xipArr).mapToObj(Long::toString).collect(Collectors.joining(","));
+      long readPoint = persistence.captureReadPoint();
 
       // Create a real txn_snapshots row so the orchestrator can use txn_snapshot_id for
       // consistent reads (loadTable?txn_snapshot_id=X) with the same pinned view.
       long snapId = persistence.nextTxnId();
-      String xipListForSnap = snapXipList;
       TxnSnapshotRow snapRow =
           new TxnSnapshotRow(
               snapId,
               persistence.getRealmId(),
               persistence.getCatalogId(),
-              snapXmin,
-              snapXmax,
-              xipListForSnap != null ? xipListForSnap : "",
+              readPoint,
               now,
               expiresAt,
               null);
@@ -267,9 +249,8 @@ public class TransactionService {
     // ROW_EXCLUSIVE: inserts a lock row so in-flight EXCLUSIVE requests can detect it and wait;
     //   fails immediately if EXCLUSIVE/ACCESS_EXCLUSIVE is already held.
     // EXCLUSIVE/ACCESS_EXCLUSIVE: returns a retry hint (409) if any conflict is found.
-    String normalizedMode = lockMode == null
-        ? LockManager.MODE_ROW_EXCLUSIVE
-        : lockMode.toUpperCase(Locale.ROOT);
+    String normalizedMode =
+        lockMode == null ? LockManager.MODE_ROW_EXCLUSIVE : lockMode.toUpperCase(Locale.ROOT);
     lockManager.acquire(txnId, tableUuid, normalizedMode);
 
     long opId = persistence.nextTxnId();
@@ -288,8 +269,7 @@ public class TransactionService {
 
     // Capture the table's current committed metadata-location so we can detect concurrent commits
     // at finalization time (conflict detection for merge-and-retry / serialization failure).
-    String serverBase =
-        persistence.findLatestCommittedMetadataLocation(tableUuid).orElse(null);
+    String serverBase = persistence.findLatestCommittedMetadataLocation(tableUuid).orElse(null);
 
     OperationRow row =
         new OperationRow(
@@ -319,8 +299,7 @@ public class TransactionService {
     return row;
   }
 
-  public void commitOperation(
-      long txnId, long opId, String opToken, String stagedMetadataLocation)
+  public void commitOperation(long txnId, long opId, String opToken, String stagedMetadataLocation)
       throws SQLException {
     OperationRow op = validateOpToken(opId, opToken);
     if (op.txnId() != txnId) {
@@ -372,24 +351,23 @@ public class TransactionService {
   }
 
   /**
-   * Looks up a subtransaction by ID + token. Returns the parent transaction's ID,
-   * snapshot ID (REPEATABLE_READ only), the assigned staging path, and the table UUID.
-   * Used by the worker's {@code BEGIN SUBTRANSACTION} command to avoid passing those
-   * values through the orchestrator's SQL output.
+   * Looks up a subtransaction by ID + token. Returns the parent transaction's ID, snapshot ID
+   * (REPEATABLE_READ only), the assigned staging path, and the table UUID. Used by the worker's
+   * {@code BEGIN SUBTRANSACTION} command to avoid passing those values through the orchestrator's
+   * SQL output.
    */
   public record OperationInfo(
       long txnId, Long txnSnapshotId, String assignedStagingPath, String tableUuid) {}
 
-  public OperationInfo getOperation(long opId, String opToken)
-      throws SQLException {
+  public OperationInfo getOperation(long opId, String opToken) throws SQLException {
     OperationRow op = validateOpToken(opId, opToken);
     TransactionRow txn = getTransaction(op.txnId());
     return new OperationInfo(
         txn.txnId(), txn.txnSnapshotId(), op.assignedStagingPath(), op.tableUuid());
   }
 
-  public OperationRow renewOperation(
-      long txnId, long opId, String opToken, int leaseSeconds) throws SQLException {
+  public OperationRow renewOperation(long txnId, long opId, String opToken, int leaseSeconds)
+      throws SQLException {
     validateOpToken(opId, opToken);
     int effective = leaseSeconds > 0 ? leaseSeconds : DEFAULT_TXN_LEASE_SECONDS;
     persistence.renewTransaction(txnId, Instant.now().plus(effective, ChronoUnit.SECONDS));
@@ -426,11 +404,13 @@ public class TransactionService {
    * <p>Conflict detection mirrors {@link #prepareCommit}: for REPEATABLE_READ transactions the
    * snapshot-time metadata location is compared against the current committed location. A
    * difference means a concurrent commit occurred:
+   *
    * <ul>
    *   <li>APPEND → merge-and-retry
-   *   <li>ROW_DELTA → first-committer-wins; aborts the transaction and throws
-   *       {@link SerializationFailureException}
+   *   <li>ROW_DELTA → first-committer-wins; aborts the transaction and throws {@link
+   *       SerializationFailureException}
    * </ul>
+   *
    * For READ_COMMITTED all tables are routed directly (no snapshot baseline).
    */
   public PrepareInlineResult prepareInlineCommit(
@@ -463,7 +443,8 @@ public class TransactionService {
       } else if (LockManager.MODE_ROW_EXCLUSIVE.equals(info.lockMode())) {
         LOGGER.info(
             "ROW_EXCLUSIVE conflict detected for table {} in inline txn {}: scheduling merge-and-retry",
-            info.tableIdentifier(), txnId);
+            info.tableIdentifier(),
+            txnId);
         mergeRetry.add(
             new StagedTableInfo(
                 info.tableIdentifier(), info.stagedMetadataLocation(), null, info.lockMode()));
@@ -472,7 +453,11 @@ public class TransactionService {
         lockManager.releaseAll(txnId);
         LOGGER.info(
             "Serialization failure (inline): txn={} table={} lock_mode={} base={} current={}",
-            txnId, info.tableIdentifier(), info.lockMode(), baselineMeta, currentMeta);
+            txnId,
+            info.tableIdentifier(),
+            info.lockMode(),
+            baselineMeta,
+            currentMeta);
         throw new SerializationFailureException(
             "could not serialize access due to concurrent update on table "
                 + info.tableIdentifier());
@@ -481,7 +466,9 @@ public class TransactionService {
     return new PrepareInlineResult(direct, mergeRetry);
   }
 
-  /** Thrown by {@link #prepareCommit} when a non-APPEND subtransaction detects a concurrent write. */
+  /**
+   * Thrown by {@link #prepareCommit} when a non-APPEND subtransaction detects a concurrent write.
+   */
   public static class SerializationFailureException extends RuntimeException {
     public SerializationFailureException(String message) {
       super(message);
@@ -490,13 +477,13 @@ public class TransactionService {
 
   /**
    * Result of {@link #prepareCommit}. Subtransactions are split by required finalization action:
+   *
    * <ul>
    *   <li>{@code direct} — no concurrent write detected; do a straightforward pointer swap.
    *   <li>{@code mergeRetry} — APPEND with a concurrent commit; server must re-parent data files.
    * </ul>
    */
-  public record PrepareCommitResult(
-      List<OperationRow> direct, List<OperationRow> mergeRetry) {}
+  public record PrepareCommitResult(List<OperationRow> direct, List<OperationRow> mergeRetry) {}
 
   /**
    * Validates and classifies all SUB_COMMITTED subtransactions for finalization.
@@ -504,10 +491,11 @@ public class TransactionService {
    * <p>For each subtransaction, compares {@code server_base_metadata_location} (captured at
    * creation time) against the latest entry in {@code committed_table_snapshots}. A difference
    * means another writer committed to the same table since this subtransaction started:
+   *
    * <ul>
    *   <li>APPEND: routed to {@link PrepareCommitResult#mergeRetry()} for server-side re-parenting.
-   *   <li>ROW_DELTA / OVERWRITE / EXCLUSIVE: transaction is aborted immediately and a
-   *       {@link SerializationFailureException} is thrown (HTTP 409, first-committer-wins).
+   *   <li>ROW_DELTA / OVERWRITE / EXCLUSIVE: transaction is aborted immediately and a {@link
+   *       SerializationFailureException} is thrown (HTTP 409, first-committer-wins).
    * </ul>
    */
   public PrepareCommitResult prepareCommit(long txnId, String txnToken) throws SQLException {
@@ -550,16 +538,31 @@ public class TransactionService {
                   || !s.serverBaseMetadataLocation().equals(currentMeta));
       if (!conflict) {
         direct.add(s);
-      } else {
-        // Conflict: a concurrent writer committed between this subtransaction's creation and the
-        // parent COMMIT. For all lock modes use merge-and-retry: extract this transaction's added
-        // data files from the staged metadata and re-parent them onto the current table state.
-        // This correctly handles the window where a ROW_EXCLUSIVE writer released its lock just
-        // before EXCLUSIVE was acquired but finished its parent COMMIT after.
+      } else if (LockManager.MODE_ROW_EXCLUSIVE.equals(s.lockMode())) {
+        // ROW_EXCLUSIVE (additive/OCC): a concurrent writer committed between this subtransaction's
+        // creation and the parent COMMIT. Merge-and-retry — extract this transaction's added data
+        // files from the staged metadata and re-parent them onto the current table state.
         LOGGER.info(
-            "Conflict detected for table {} in txn {} (mode={}): scheduling merge-and-retry",
-            s.tableUuid(), txnId, s.lockMode());
+            "ROW_EXCLUSIVE conflict detected for table {} in txn {}: scheduling merge-and-retry",
+            s.tableUuid(),
+            txnId);
         mergeRetry.add(s);
+      } else {
+        // EXCLUSIVE / ACCESS_EXCLUSIVE (pessimistic, potentially destructive): a concurrent writer
+        // advanced the table since this op was created. First-committer-wins — abort the whole
+        // transaction and surface a serialization failure (mirrors prepareInlineCommit and the
+        // PostgreSQL 40001 semantics documented in multi-table-transaction-design.md).
+        persistence.updateTransactionStatus(txnId, JdbcTransactionPersistence.TXN_STATUS_ABORTED);
+        lockManager.releaseAll(txnId);
+        LOGGER.info(
+            "Serialization failure: txn={} table={} lock_mode={} base={} current={}",
+            txnId,
+            s.tableUuid(),
+            s.lockMode(),
+            s.serverBaseMetadataLocation(),
+            currentMeta);
+        throw new SerializationFailureException(
+            "could not serialize access due to concurrent update on table " + s.tableUuid());
       }
     }
     return new PrepareCommitResult(direct, mergeRetry);
@@ -646,8 +649,7 @@ public class TransactionService {
     return txn;
   }
 
-  private OperationRow validateOpToken(long opId, String opToken)
-      throws SQLException {
+  private OperationRow validateOpToken(long opId, String opToken) throws SQLException {
     OperationRow op =
         persistence
             .findOperation(opId)

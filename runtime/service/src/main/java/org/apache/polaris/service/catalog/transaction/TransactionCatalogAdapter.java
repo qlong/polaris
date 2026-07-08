@@ -24,8 +24,8 @@ import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.SecurityContext;
 import java.sql.SQLException;
 import java.util.Arrays;
-import java.util.List;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -45,12 +45,11 @@ import org.apache.polaris.service.catalog.iceberg.IcebergCatalogHandlerFactory;
 import org.apache.polaris.service.transaction.LockManager.LockConflictException;
 import org.apache.polaris.service.transaction.TransactionService;
 import org.apache.polaris.service.types.BeginTransactionRequest;
-import org.apache.polaris.service.types.GetSubtransactionResponse;
 import org.apache.polaris.service.types.CommitSubtransactionRequest;
 import org.apache.polaris.service.types.CommitTransactionRequest;
 import org.apache.polaris.service.types.CreateSubtransactionRequest;
-import org.apache.polaris.service.types.StagedTableCommit;
 import org.apache.polaris.service.types.CreateTransactionSnapshotRequest;
+import org.apache.polaris.service.types.GetSubtransactionResponse;
 import org.apache.polaris.service.types.LockMode;
 import org.apache.polaris.service.types.RenewLeaseRequest;
 import org.apache.polaris.service.types.Subtransaction;
@@ -286,7 +285,9 @@ public class TransactionCatalogAdapter
               txnService.prepareInlineCommit(txnId, xTxnToken, inputTables);
           LOGGER.info(
               "Committing txn={} (inline): {} direct, {} merge-and-retry",
-              txnId, result.direct().size(), result.mergeRetry().size());
+              txnId,
+              result.direct().size(),
+              result.mergeRetry().size());
           handler.finalizeInlineTables(
               result.direct(), result.mergeRetry(), handlerFactory, catalogName, principal);
         } else {
@@ -295,7 +296,9 @@ public class TransactionCatalogAdapter
               txnService.prepareCommit(txnId, xTxnToken);
           LOGGER.info(
               "Committing txn={} (subtxn): {} direct, {} merge-and-retry",
-              txnId, result.direct().size(), result.mergeRetry().size());
+              txnId,
+              result.direct().size(),
+              result.mergeRetry().size());
           handler.finalizeExtensionTransaction(
               result.direct(), result.mergeRetry(), handlerFactory, catalogName, principal);
         }
@@ -345,8 +348,7 @@ public class TransactionCatalogAdapter
     }
     try {
       TransactionService txnService = openTxnService(securityContext, prefix);
-      TransactionService.OperationInfo info =
-          txnService.getOperation(subtxnId, xSubtxnToken);
+      TransactionService.OperationInfo info = txnService.getOperation(subtxnId, xSubtxnToken);
       return Response.ok(
               new GetSubtransactionResponse(
                   info.txnId(), info.txnSnapshotId(),
@@ -423,9 +425,12 @@ public class TransactionCatalogAdapter
     try {
       handler.listNamespaces(Namespace.of());
       TransactionService txnService = handler.newTransactionServiceForCatalog();
-      String tableMetadataDir = resolveTableMetadataDir(
-          handlerFactory, catalogName, principal,
-          createSubtransactionRequest.getTableIdentifier());
+      String tableMetadataDir =
+          resolveTableMetadataDir(
+              handlerFactory,
+              catalogName,
+              principal,
+              createSubtransactionRequest.getTableIdentifier());
       LockMode lockModeEnum = createSubtransactionRequest.getOperation();
       String lockMode = (lockModeEnum != null ? lockModeEnum : LockMode.ROW_EXCLUSIVE).name();
       OperationRow op =
@@ -553,9 +558,7 @@ public class TransactionCatalogAdapter
   private static TransactionSnapshot toSnapshot(TxnSnapshotRow snap) {
     return new TransactionSnapshot(
         snap.txnSnapshotId(),
-        snap.xmin(),
-        snap.xmax(),
-        JdbcTransactionPersistence.parseXipList(snap.xipList()),
+        snap.readPoint(),
         Date.from(snap.expiresAt()),
         snap.releasedAt() != null ? Date.from(snap.releasedAt()) : null);
   }

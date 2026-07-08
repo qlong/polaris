@@ -22,7 +22,7 @@
 TxnSnapshot provides consistent multi-table reads without opening a write
 transaction.  Endpoint: POST /transaction-snapshots
 
-The snapshot pins a visibility window (xmin, xmax, xip_list) so that all
+The snapshot pins a single read_point (a commit-order cutoff) so that all
 loadTable calls with the same txn_snapshot_id see the same logical timestamp,
 regardless of concurrent writers.
 """
@@ -34,14 +34,12 @@ class TestTransactionSnapshotCRUD:
     def test_create_returns_required_fields(self, snapshot):
         """POST /transaction-snapshots returns all required fields."""
         assert snapshot["txn_snapshot_id"] > 0
-        assert isinstance(snapshot["xmin"], int)
-        assert isinstance(snapshot["xmax"], int)
-        assert isinstance(snapshot["xip_list"], list)
+        assert isinstance(snapshot["read_point"], int)
         assert "expires_at" in snapshot
 
-    def test_xmax_at_least_xmin(self, snapshot):
-        """xmax >= xmin (the visibility window is non-negative)."""
-        assert snapshot["xmax"] >= snapshot["xmin"]
+    def test_read_point_is_non_negative(self, snapshot):
+        """read_point is a non-negative commit-order cutoff."""
+        assert snapshot["read_point"] >= 0
 
     def test_get_snapshot_returns_same_id(self, client, snapshot):
         """GET /transaction-snapshots/{id} echoes the same txn_snapshot_id."""

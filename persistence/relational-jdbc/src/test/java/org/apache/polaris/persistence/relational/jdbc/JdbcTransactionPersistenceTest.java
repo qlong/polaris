@@ -293,7 +293,7 @@ class JdbcTransactionPersistenceTest {
     Instant now = Instant.now();
     JdbcTransactionPersistence.TxnSnapshotRow snap =
         new JdbcTransactionPersistence.TxnSnapshotRow(
-            snapId, REALM, CATALOG_ID, 10L, 20L, "11,12", now, now.plusSeconds(60), null);
+            snapId, REALM, CATALOG_ID, 20L, now, now.plusSeconds(60), null);
 
     persistence.insertTxnSnapshot(snap);
 
@@ -301,9 +301,7 @@ class JdbcTransactionPersistenceTest {
     assertThat(found).isPresent();
     JdbcTransactionPersistence.TxnSnapshotRow r = found.get();
     assertThat(r.txnSnapshotId()).isEqualTo(snapId);
-    assertThat(r.xmin()).isEqualTo(10L);
-    assertThat(r.xmax()).isEqualTo(20L);
-    assertThat(r.xipList()).isEqualTo("11,12");
+    assertThat(r.readPoint()).isEqualTo(20L);
     assertThat(r.releasedAt()).isNull();
   }
 
@@ -313,7 +311,7 @@ class JdbcTransactionPersistenceTest {
     Instant now = Instant.now();
     persistence.insertTxnSnapshot(
         new JdbcTransactionPersistence.TxnSnapshotRow(
-            snapId, REALM, CATALOG_ID, 1L, 2L, "", now, now.plusSeconds(60), null));
+            snapId, REALM, CATALOG_ID, 2L, now, now.plusSeconds(60), null));
 
     persistence.releaseTxnSnapshot(snapId);
 
@@ -328,7 +326,7 @@ class JdbcTransactionPersistenceTest {
     Instant now = Instant.now();
     persistence.insertTxnSnapshot(
         new JdbcTransactionPersistence.TxnSnapshotRow(
-            snapId, REALM, CATALOG_ID, 1L, 2L, "", now, now.plusSeconds(60), null));
+            snapId, REALM, CATALOG_ID, 2L, now, now.plusSeconds(60), null));
 
     Instant newExpiry = now.plusSeconds(7200);
     persistence.renewTxnSnapshot(snapId, newExpiry);
@@ -343,11 +341,18 @@ class JdbcTransactionPersistenceTest {
 
   @Test
   void insertCommittedTableSnapshotRowAndResolveSnapshot() throws SQLException {
-    long txnId = persistence.nextTxnId();
-    JdbcTransactionPersistence.CommittedTableSnapshotRow cts =
-        new JdbcTransactionPersistence.CommittedTableSnapshotRow(
-            "uuid-tbl-1", txnId, 555L, "s3://bucket/metadata.json");
-    persistence.insertCommittedTableSnapshotRow(cts);
+    // Insert with an explicit commit_scn via the connection primitive
+    // (insertCommittedTableSnapshotRow
+    // auto-allocates, so use the primitive when the test needs a known scn).
+    long scn = 100L;
+    try (Connection conn = dataSource.getConnection()) {
+      conn.setAutoCommit(false);
+      persistence.insertCommittedTableSnapshot(
+          conn,
+          new JdbcTransactionPersistence.CommittedTableSnapshotRow(
+              "uuid-tbl-1", scn, 555L, "s3://bucket/metadata.json"));
+      conn.commit();
+    }
 
     Instant now = Instant.now();
     JdbcTransactionPersistence.TxnSnapshotRow snap =
@@ -355,9 +360,7 @@ class JdbcTransactionPersistenceTest {
             persistence.nextTxnId(),
             REALM,
             CATALOG_ID,
-            txnId, // xmin
-            txnId + 10, // xmax
-            "", // no xip
+            scn + 10, // read_point >= commit_scn → visible
             now,
             now.plusSeconds(60),
             null);
@@ -366,34 +369,36 @@ class JdbcTransactionPersistenceTest {
         persistence.resolveTableSnapshot("uuid-tbl-1", snap);
     assertThat(resolved).isPresent();
     assertThat(resolved.get().tableUuid()).isEqualTo("uuid-tbl-1");
-    assertThat(resolved.get().committedTxnId()).isEqualTo(txnId);
+    assertThat(resolved.get().commitScn()).isEqualTo(scn);
     assertThat(resolved.get().metadataLocation()).isEqualTo("s3://bucket/metadata.json");
   }
 
   @Test
-  void resolveTableSnapshotRespectsXipList() throws SQLException {
-    long txnId = persistence.nextTxnId();
-    JdbcTransactionPersistence.CommittedTableSnapshotRow cts =
-        new JdbcTransactionPersistence.CommittedTableSnapshotRow(
-            "uuid-tbl-xip", txnId, null, "s3://bucket/v1.json");
-    persistence.insertCommittedTableSnapshotRow(cts);
+  void resolveTableSnapshotExcludesCommitsAboveReadPoint() throws SQLException {
+    long scn = 100L;
+    try (Connection conn = dataSource.getConnection()) {
+      conn.setAutoCommit(false);
+      persistence.insertCommittedTableSnapshot(
+          conn,
+          new JdbcTransactionPersistence.CommittedTableSnapshotRow(
+              "uuid-tbl-above", scn, null, "s3://bucket/v1.json"));
+      conn.commit();
+    }
 
-    // Snapshot that has txnId in the xip_list (in-progress, not visible)
+    // read_point is below the commit's commit_scn → the commit is not yet visible.
     Instant now = Instant.now();
     JdbcTransactionPersistence.TxnSnapshotRow snap =
         new JdbcTransactionPersistence.TxnSnapshotRow(
             persistence.nextTxnId(),
             REALM,
             CATALOG_ID,
-            txnId, // xmin
-            txnId + 10, // xmax
-            String.valueOf(txnId), // txnId is in xip → not visible
+            scn - 1, // read_point < commit_scn → not visible
             now,
             now.plusSeconds(60),
             null);
 
     Optional<JdbcTransactionPersistence.CommittedTableSnapshotRow> resolved =
-        persistence.resolveTableSnapshot("uuid-tbl-xip", snap);
+        persistence.resolveTableSnapshot("uuid-tbl-above", snap);
     assertThat(resolved).isEmpty();
   }
 
@@ -471,58 +476,54 @@ class JdbcTransactionPersistenceTest {
   }
 
   @Test
-  void purgeCommittedSnapshotsBelowWatermarkDeletesOldRows() throws SQLException {
-    long old = persistence.nextTxnId();
-    long recent = persistence.nextTxnId();
+  void purgeCommittedSnapshotsBelowWatermarkKeepsPerTableSurvivor() throws SQLException {
+    // Three versions of the same table at scn 10, 20, 30, plus another table's row at 15.
+    insertCtsWithScn("uuid-purge", 10L, "s3://v10.json");
+    insertCtsWithScn("uuid-purge", 20L, "s3://v20.json");
+    insertCtsWithScn("uuid-purge", 30L, "s3://v30.json");
+    insertCtsWithScn("uuid-other", 15L, "s3://other15.json");
 
-    persistence.insertCommittedTableSnapshotRow(
-        new JdbcTransactionPersistence.CommittedTableSnapshotRow(
-            "uuid-purge", old, null, "s3://old.json"));
-    persistence.insertCommittedTableSnapshotRow(
-        new JdbcTransactionPersistence.CommittedTableSnapshotRow(
-            "uuid-purge", recent, null, "s3://recent.json"));
+    // Watermark = 25. For uuid-purge, the newest row <= 25 is scn=20 (the survivor); scn=10 is
+    // strictly older and must be deleted; scn=30 is above the watermark and must be kept. For
+    // uuid-other, the only row (15) is the survivor and is kept.
+    persistence.purgeCommittedSnapshotsBelowWatermark(25L);
 
-    persistence.upsertWatermark(old);
-    // Purge everything below old (exclusive), so only `old` row remains
-    persistence.purgeCommittedSnapshotsBelowWatermark(old);
-
-    // recent > old should still be resolvable; old should too since purge is < watermark
+    // A snapshot pinned exactly at the watermark still resolves uuid-purge (to the survivor, v20)
+    // and uuid-other (v15).
     Instant now = Instant.now();
-    JdbcTransactionPersistence.TxnSnapshotRow snapForOld =
+    JdbcTransactionPersistence.TxnSnapshotRow atWatermark =
         new JdbcTransactionPersistence.TxnSnapshotRow(
-            persistence.nextTxnId(),
-            REALM,
-            CATALOG_ID,
-            old,
-            recent + 1,
-            "",
-            now,
-            now.plusSeconds(60),
-            null);
-    assertThat(persistence.resolveTableSnapshot("uuid-purge", snapForOld)).isPresent();
+            persistence.nextTxnId(), REALM, CATALOG_ID, 25L, now, now.plusSeconds(60), null);
+    assertThat(persistence.resolveTableSnapshot("uuid-purge", atWatermark))
+        .hasValueSatisfying(r -> assertThat(r.metadataLocation()).isEqualTo("s3://v20.json"));
+    assertThat(persistence.resolveTableSnapshot("uuid-other", atWatermark))
+        .hasValueSatisfying(r -> assertThat(r.metadataLocation()).isEqualTo("s3://other15.json"));
+
+    // A snapshot above everything sees the latest uuid-purge (v30, kept because > watermark).
+    JdbcTransactionPersistence.TxnSnapshotRow above =
+        new JdbcTransactionPersistence.TxnSnapshotRow(
+            persistence.nextTxnId(), REALM, CATALOG_ID, 40L, now, now.plusSeconds(60), null);
+    assertThat(persistence.resolveTableSnapshot("uuid-purge", above))
+        .hasValueSatisfying(r -> assertThat(r.metadataLocation()).isEqualTo("s3://v30.json"));
+
+    // The purged scn=10 row is gone: a snapshot at read_point=10 no longer resolves it.
+    JdbcTransactionPersistence.TxnSnapshotRow atTen =
+        new JdbcTransactionPersistence.TxnSnapshotRow(
+            persistence.nextTxnId(), REALM, CATALOG_ID, 10L, now, now.plusSeconds(60), null);
+    assertThat(persistence.resolveTableSnapshot("uuid-purge", atTen)).isEmpty();
   }
 
-  // ---------------------------------------------------------------------------
-  // parseXipList helper
-  // ---------------------------------------------------------------------------
-
-  @Test
-  void parseXipListHandlesNullAndEmpty() {
-    assertThat(JdbcTransactionPersistence.parseXipList(null)).isEmpty();
-    assertThat(JdbcTransactionPersistence.parseXipList("")).isEmpty();
-    assertThat(JdbcTransactionPersistence.parseXipList("  ")).isEmpty();
-  }
-
-  @Test
-  void parseXipListParsesCommaSeparatedIds() {
-    List<Long> ids = JdbcTransactionPersistence.parseXipList("10,20,30");
-    assertThat(ids).containsExactly(10L, 20L, 30L);
-  }
-
-  @Test
-  void parseXipListHandlesWhitespace() {
-    List<Long> ids = JdbcTransactionPersistence.parseXipList(" 5 , 6 , 7 ");
-    assertThat(ids).containsExactly(5L, 6L, 7L);
+  /** Inserts a committed_table_snapshots row with an explicit commit_scn (via the primitive). */
+  private void insertCtsWithScn(String tableUuid, long scn, String metadataLocation)
+      throws SQLException {
+    try (Connection conn = dataSource.getConnection()) {
+      conn.setAutoCommit(false);
+      persistence.insertCommittedTableSnapshot(
+          conn,
+          new JdbcTransactionPersistence.CommittedTableSnapshotRow(
+              tableUuid, scn, null, metadataLocation));
+      conn.commit();
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -548,9 +549,7 @@ class JdbcTransactionPersistenceTest {
             persistence.nextTxnId(),
             REALM,
             CATALOG_ID,
-            txnId,
-            txnId + 5,
-            "",
+            txnId + 5, // read_point above the committed txn
             now,
             now.plusSeconds(60),
             null);

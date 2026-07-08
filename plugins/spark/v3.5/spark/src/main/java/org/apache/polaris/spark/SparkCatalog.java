@@ -30,15 +30,15 @@ import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.LocationProviders;
+import org.apache.iceberg.StaticTableOperations;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableMetadataParser;
-import org.apache.iceberg.StaticTableOperations;
 import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.encryption.EncryptionManager;
+import org.apache.iceberg.hadoop.HadoopFileIO;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.LocationProvider;
-import org.apache.iceberg.hadoop.HadoopFileIO;
 import org.apache.iceberg.rest.auth.OAuth2Util;
 import org.apache.iceberg.spark.SparkUtil;
 import org.apache.iceberg.spark.SupportsReplaceView;
@@ -185,12 +185,17 @@ public class SparkCatalog
             TableOperations liveOps = baseTable.operations();
             TableOperations ops =
                 new PinnedTableOperations(
-                    pinnedMetadata, fileIO, locationProvider, liveOps,
-                    txnManager, spark, icebergIdent, txnId);
+                    pinnedMetadata,
+                    fileIO,
+                    locationProvider,
+                    liveOps,
+                    txnManager,
+                    spark,
+                    icebergIdent,
+                    txnId);
             org.apache.iceberg.Table icebergTable =
                 new BaseTable(
-                    ops,
-                    ident.namespace()[ident.namespace().length - 1] + "." + ident.name());
+                    ops, ident.namespace()[ident.namespace().length - 1] + "." + ident.name());
             return newSparkTable(icebergTable);
           }
         }
@@ -201,8 +206,7 @@ public class SparkCatalog
       StaticTableOperations ops =
           new StaticTableOperations(pinnedMetadata, fileIO, locationProvider);
       org.apache.iceberg.Table icebergTable =
-          new BaseTable(
-              ops, ident.namespace()[ident.namespace().length - 1] + "." + ident.name());
+          new BaseTable(ops, ident.namespace()[ident.namespace().length - 1] + "." + ident.name());
       return newSparkTable(icebergTable);
     }
 
@@ -220,7 +224,9 @@ public class SparkCatalog
   private static Table newSparkTable(org.apache.iceberg.Table icebergTable) {
     try {
       // Iceberg 1.12+: single-arg constructor
-      return SparkTable.class.getConstructor(org.apache.iceberg.Table.class).newInstance(icebergTable);
+      return SparkTable.class
+          .getConstructor(org.apache.iceberg.Table.class)
+          .newInstance(icebergTable);
     } catch (java.lang.NoSuchMethodException e) {
       // Iceberg 1.10: SparkTable(Table, boolean refreshEagerly)
       try {

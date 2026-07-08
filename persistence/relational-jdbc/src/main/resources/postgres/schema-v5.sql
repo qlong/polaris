@@ -307,10 +307,15 @@ CREATE INDEX IF NOT EXISTS idx_commit_report_timestamp ON commit_metrics_report(
 CREATE INDEX IF NOT EXISTS idx_commit_report_lookup ON commit_metrics_report(realm_id, catalog_id, table_id, timestamp_ms);
 
 -- ---------------------------------------------------------------------------
--- Global monotone sequence for TxnIDs and TxnSnapshot IDs.
--- Using a Postgres sequence guarantees strict monotonicity and durability
--- across server restarts. Polaris entity IDs (entities table) continue to
--- use IdGenerator (random longs) and are unaffected.
+-- Global monotone sequence for begin-time identity: txn_id, txn_snapshot_id,
+-- and op_id. Using a Postgres sequence guarantees strict monotonicity and
+-- durability across server restarts. Polaris entity IDs (entities table)
+-- continue to use IdGenerator (random longs) and are unaffected.
+-- NOTE: this sequence no longer feeds commit stamps. The commit-order stamp
+-- (commit_scn) is a *transactional* counter (commit_scn_counter) allocated
+-- inside the commit transaction so it is monotonic in true commit order; a
+-- non-transactional SEQUENCE cannot provide that. See commit_scn_counter below
+-- and multi-table-transaction-design.md (§ Why a single read_point).
 -- ---------------------------------------------------------------------------
 CREATE SEQUENCE IF NOT EXISTS txn_id_seq
     AS BIGINT
@@ -322,7 +327,7 @@ CREATE SEQUENCE IF NOT EXISTS txn_id_seq
 -- transactions: top-level write transactions.
 -- parent_txn_id is NULL for top-level; non-NULL for nested transactions.
 -- txn_snapshot_id references txn_snapshots; NULL for READ_COMMITTED.
--- snap_xmin/xmax/xip live in txn_snapshots, not here.
+-- The read_point (visibility cutoff) lives in txn_snapshots, referenced via txn_snapshot_id.
 -- status: 0=IN_PROGRESS, 1=COMMITTED, 2=ABORTED
 -- isolation: 'READ_COMMITTED', 'REPEATABLE_READ'
 -- ---------------------------------------------------------------------------
@@ -380,17 +385,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_ops_token
     ON transaction_operations (op_token);
 
 -- ---------------------------------------------------------------------------
--- txn_snapshots: exportable consistent-read handles
--- Analogous to pg_snapshot. Clients acquire one to get a pinned view across
--- multiple tables. released_at is set on DELETE (explicit release) or reaper.
+-- txn_snapshots: exportable consistent-read handles.
+-- Clients acquire one to get a pinned view across multiple tables. read_point is
+-- a single commit-order cutoff (a commit SCN): a committed table snapshot is
+-- visible iff its commit_scn <= read_point. read_point is captured as the current
+-- value of the catalog's commit_scn_counter, so it can never exceed a not-yet-
+-- committed commit_scn. This replaces the PostgreSQL-style (snap_xmin, snap_xmax,
+-- snap_xip_list) triple; see multi-table-transaction-design.md
+-- (§ Why a single read_point). released_at is set on DELETE (explicit release) or reaper.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS txn_snapshots (
     txn_snapshot_id BIGINT PRIMARY KEY,
     realm_id        TEXT NOT NULL,
     catalog_id      BIGINT NOT NULL,
-    snap_xmin       BIGINT NOT NULL,   -- lowest txn_id that may be in-progress
-    snap_xmax       BIGINT NOT NULL,   -- first txn_id not yet assigned at snapshot time
-    snap_xip_list   TEXT NOT NULL,     -- comma-separated txn_ids in-progress at snapshot time
+    read_point      BIGINT NOT NULL,   -- commit high-water-mark at snapshot time; sole visibility bound
     created_at      TIMESTAMP NOT NULL DEFAULT now(),
     expires_at      TIMESTAMP NOT NULL,
     released_at     TIMESTAMP
@@ -403,25 +411,45 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_realm_expires
 -- ---------------------------------------------------------------------------
 -- committed_table_snapshots: MVCC-to-Iceberg bridge
 -- Every successful table commit (old or new API) records the Iceberg snapshot
--- ID that became visible at committed_txn_id. Used to resolve a TxnSnapshot
--- to per-table Iceberg snapshot IDs.
+-- ID that became visible at commit_scn. Used to resolve a TxnSnapshot to
+-- per-table Iceberg snapshot IDs.
+-- commit_scn is a commit-order stamp allocated from commit_scn_counter *inside*
+-- the same transaction as the metadata-pointer swap, so it is monotonic in true
+-- commit order and durable atomically with the row (never a begin-time txn_id).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS committed_table_snapshots (
     id                  BIGSERIAL PRIMARY KEY,
     realm_id            TEXT NOT NULL,
     catalog_id          BIGINT NOT NULL,
     table_uuid          TEXT NOT NULL,
-    committed_txn_id    BIGINT NOT NULL,          -- from txn_id_seq
+    commit_scn          BIGINT NOT NULL,          -- from commit_scn_counter (transactional)
     iceberg_snapshot_id BIGINT,                   -- NULL for DROP or schema-only changes
     metadata_location   TEXT NOT NULL,
     committed_at        TIMESTAMP NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_cts_table_txn
-    ON committed_table_snapshots (realm_id, catalog_id, table_uuid, committed_txn_id DESC);
+    ON committed_table_snapshots (realm_id, catalog_id, table_uuid, commit_scn DESC);
 
 CREATE INDEX IF NOT EXISTS idx_cts_txn
-    ON committed_table_snapshots (committed_txn_id);
+    ON committed_table_snapshots (commit_scn);
+
+-- ---------------------------------------------------------------------------
+-- commit_scn_counter: per-(realm, catalog) transactional commit clock.
+-- Allocated as `UPDATE ... SET scn = scn + 1 RETURNING scn` INSIDE the commit
+-- transaction; the row lock is held until that transaction commits, so a higher
+-- commit_scn is guaranteed to become visible after a lower one (commit order ==
+-- scn order). This is what makes read_point (a single cutoff) sound without an
+-- xip set, and closes the assign-before-visible window that a non-transactional
+-- SEQUENCE would leave open. Serializes commits within a catalog.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS commit_scn_counter (
+    realm_id   TEXT NOT NULL,
+    catalog_id BIGINT NOT NULL,
+    scn        BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP NOT NULL DEFAULT now(),
+    PRIMARY KEY (realm_id, catalog_id)
+);
 
 -- ---------------------------------------------------------------------------
 -- locks: pessimistic lock state.
@@ -447,9 +475,31 @@ CREATE INDEX IF NOT EXISTS idx_locks_txn
     ON locks (txn_id, status);
 
 -- ---------------------------------------------------------------------------
--- txn_watermark: single-row purge horizon
--- All committed_table_snapshots rows with committed_txn_id < watermark_txn_id
--- are safe to purge (no live TxnSnapshot references them any more).
+-- lock_resource: per-(realm, catalog, resource) serialization anchor.
+-- One always-present row per lockable resource, used ONLY as a SELECT ... FOR
+-- UPDATE gate around the check-then-insert critical section in LockManager.acquire.
+-- A held EXCLUSIVE/ACCESS_EXCLUSIVE lock is a NEW row in `locks`; two acquirers on
+-- two Polaris nodes could both SELECT zero conflicts and both insert (phantom) —
+-- locking rows that don't exist yet cannot prevent that. Locking this anchor row
+-- (which always exists) serializes the grant decision fleet-wide. The anchor lock
+-- is held only for the microsecond critical section (released at that txn's commit);
+-- the long-lived lock remains the `locks` row. Per-resource granularity means
+-- acquisitions on different tables never serialize against each other.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS lock_resource (
+    realm_id   TEXT NOT NULL,
+    catalog_id BIGINT NOT NULL,
+    resource   TEXT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT now(),
+    PRIMARY KEY (realm_id, catalog_id, resource)
+);
+
+-- ---------------------------------------------------------------------------
+-- txn_watermark: per-(realm, catalog) purge horizon
+-- committed_table_snapshots rows with commit_scn < watermark_txn_id are safe to
+-- purge, EXCEPT the newest surviving row per table (see reaper: a snapshot pinned
+-- exactly at the watermark must still resolve tables that have not changed since).
+-- The horizon is MIN(read_point over live snapshots, txn_id over in-progress txns).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS txn_watermark (
     realm_id         TEXT NOT NULL,

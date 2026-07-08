@@ -34,8 +34,8 @@ import org.apache.spark.sql.types.StructType;
 import scala.collection.immutable.Seq;
 
 /**
- * Spark SQL parser extension that intercepts Polaris transaction commands:
- * BEGIN, COMMIT, ROLLBACK, SET TRANSACTION ISOLATION LEVEL.
+ * Spark SQL parser extension that intercepts Polaris transaction commands: BEGIN, COMMIT, ROLLBACK,
+ * SET TRANSACTION ISOLATION LEVEL.
  *
  * <p>All other SQL is forwarded to the delegate parser unchanged.
  *
@@ -58,8 +58,7 @@ public class PolarisSparkSqlParser implements ParserInterface {
   TransactionManager txnManager(SparkSession spark) {
     try {
       SparkCatalog catalog =
-          (SparkCatalog)
-              spark.sessionState().catalogManager().catalog(catalogName);
+          (SparkCatalog) spark.sessionState().catalogManager().catalog(catalogName);
       return catalog.txnManager;
     } catch (Exception e) {
       throw new IllegalStateException(
@@ -87,14 +86,17 @@ public class PolarisSparkSqlParser implements ParserInterface {
 
     if (normalized.startsWith("BEGIN TRANSACTION ISOLATION LEVEL ")) {
       SparkSession spark = SparkSession.active();
-      String isolation = parseIsolation(normalized.substring("BEGIN TRANSACTION ISOLATION LEVEL ".length()).trim());
+      String isolation =
+          parseIsolation(
+              normalized.substring("BEGIN TRANSACTION ISOLATION LEVEL ".length()).trim());
       txnManager(spark).begin(spark, isolation);
       return delegate.parsePlan(statusSql("Transaction pending -- isolation: " + isolation));
     }
 
     if (normalized.startsWith("SET TRANSACTION ISOLATION LEVEL ")) {
       SparkSession spark = SparkSession.active();
-      String isolation = parseIsolation(normalized.substring("SET TRANSACTION ISOLATION LEVEL ".length()).trim());
+      String isolation =
+          parseIsolation(normalized.substring("SET TRANSACTION ISOLATION LEVEL ".length()).trim());
       txnManager(spark).setIsolationLevel(spark, isolation);
       return delegate.parsePlan(statusSql("Isolation level set: " + isolation));
     }
@@ -133,7 +135,8 @@ public class PolarisSparkSqlParser implements ParserInterface {
     // e.g.  CREATE SUBTRANSACTION FOR ns.orders WITH EXCLUSIVE
     if (normalized.startsWith("CREATE SUBTRANSACTION FOR ")) {
       SparkSession spark = SparkSession.active();
-      // Use original sql to preserve the table name's natural case (server lookup is case-sensitive).
+      // Use original sql to preserve the table name's natural case (server lookup is
+      // case-sensitive).
       String rawSql = sql.trim();
       if (rawSql.endsWith(";")) rawSql = rawSql.substring(0, rawSql.length() - 1).trim();
       String rawUpper = rawSql.toUpperCase(Locale.ROOT);
@@ -206,8 +209,7 @@ public class PolarisSparkSqlParser implements ParserInterface {
       }
 
       txnManager(spark).beginWorkerSubtransaction(spark, subtxnId, subtxnToken, ident, operation);
-      return delegate.parsePlan(
-          statusSql("Worker subtransaction started, subtxn_id=" + subtxnId));
+      return delegate.parsePlan(statusSql("Worker subtransaction started, subtxn_id=" + subtxnId));
     }
 
     // -------------------------------------------------------------------------
@@ -256,14 +258,14 @@ public class PolarisSparkSqlParser implements ParserInterface {
   private static String parseIsolation(String token) {
     if (token.equals("REPEATABLE READ")) return "REPEATABLE_READ";
     if (token.equals("READ COMMITTED")) return "READ_COMMITTED";
-    throw new IllegalArgumentException("Unknown isolation level: " + token
-        + ". Use REPEATABLE READ or READ COMMITTED.");
+    throw new IllegalArgumentException(
+        "Unknown isolation level: " + token + ". Use REPEATABLE READ or READ COMMITTED.");
   }
 
   /**
-   * Parses a dot-separated table identifier string (e.g. {@code "NS.ORDERS"} or
-   * {@code "NS.SUB.ORDERS"}) into an Iceberg {@link org.apache.iceberg.catalog.TableIdentifier}.
-   * The string is expected to already be upper-cased by the caller (via the normalized form).
+   * Parses a dot-separated table identifier string (e.g. {@code "NS.ORDERS"} or {@code
+   * "NS.SUB.ORDERS"}) into an Iceberg {@link org.apache.iceberg.catalog.TableIdentifier}. The
+   * string is expected to already be upper-cased by the caller (via the normalized form).
    */
   private static org.apache.iceberg.catalog.TableIdentifier parseTableIdentifierPolaris(
       String tableStr) {
@@ -278,8 +280,8 @@ public class PolarisSparkSqlParser implements ParserInterface {
   }
 
   /**
-   * Extracts a long value from a key=value token in the SQL string.
-   * Searches case-insensitively using {@code upperSql} for the key position.
+   * Extracts a long value from a key=value token in the SQL string. Searches case-insensitively
+   * using {@code upperSql} for the key position.
    */
   private static long parseLongParam(String sql, String upperSql, String key) {
     // Use " KEY=" (space prefix) to avoid matching "SUBTXN_ID=" when looking for "TXN_ID=".
@@ -298,9 +300,9 @@ public class PolarisSparkSqlParser implements ParserInterface {
   }
 
   /**
-   * Extracts a string value from a {@code KEY='value'} or {@code KEY=value} token.
-   * The key search is case-insensitive (via {@code upperSql}). Single quotes are optional;
-   * an unquoted value ends at the next space.
+   * Extracts a string value from a {@code KEY='value'} or {@code KEY=value} token. The key search
+   * is case-insensitive (via {@code upperSql}). Single quotes are optional; an unquoted value ends
+   * at the next space.
    */
   private static String parseStringParam(String sql, String upperSql, String key) {
     // Try quoted form first: " KEY='"
@@ -310,8 +312,7 @@ public class PolarisSparkSqlParser implements ParserInterface {
       int start = idx + keyEqQuoted.length();
       int end = sql.indexOf('\'', start);
       if (end < 0) {
-        throw new IllegalArgumentException(
-            "BEGIN SUBTRANSACTION: unterminated quote for " + key);
+        throw new IllegalArgumentException("BEGIN SUBTRANSACTION: unterminated quote for " + key);
       }
       return sql.substring(start, end);
     }
@@ -319,8 +320,7 @@ public class PolarisSparkSqlParser implements ParserInterface {
     String keyEq = " " + key + "=";
     int idx2 = upperSql.indexOf(keyEq);
     if (idx2 < 0) {
-      throw new IllegalArgumentException(
-          "BEGIN SUBTRANSACTION: missing " + key + "=<value>");
+      throw new IllegalArgumentException("BEGIN SUBTRANSACTION: missing " + key + "=<value>");
     }
     int start = idx2 + keyEq.length();
     int end = sql.indexOf(' ', start);

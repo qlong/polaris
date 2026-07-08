@@ -301,7 +301,9 @@ CREATE INDEX IF NOT EXISTS idx_commit_report_timestamp ON commit_metrics_report(
 -- Index for query lookups by catalog_id and table_id
 CREATE INDEX IF NOT EXISTS idx_commit_report_lookup ON commit_metrics_report(realm_id, catalog_id, table_id, timestamp_ms);
 
--- Monotone sequence for TxnIDs and TxnSnapshot IDs
+-- Monotone sequence for begin-time identity: txn_id, txn_snapshot_id, op_id.
+-- Does NOT feed commit stamps; commit_scn uses the transactional commit_scn_counter
+-- (a non-transactional sequence cannot be monotonic in true commit order).
 CREATE SEQUENCE IF NOT EXISTS txn_id_seq
     START WITH 1
     INCREMENT BY 1
@@ -357,9 +359,7 @@ CREATE TABLE IF NOT EXISTS txn_snapshots (
     txn_snapshot_id BIGINT PRIMARY KEY,
     realm_id        TEXT NOT NULL,
     catalog_id      BIGINT NOT NULL,
-    snap_xmin       BIGINT NOT NULL,
-    snap_xmax       BIGINT NOT NULL,
-    snap_xip_list   TEXT NOT NULL,
+    read_point      BIGINT NOT NULL,   -- commit high-water-mark at snapshot time; sole visibility bound
     created_at      TIMESTAMP NOT NULL DEFAULT now(),
     expires_at      TIMESTAMP NOT NULL,
     released_at     TIMESTAMP
@@ -375,7 +375,7 @@ CREATE TABLE IF NOT EXISTS committed_table_snapshots (
     realm_id            TEXT NOT NULL,
     catalog_id          BIGINT NOT NULL,
     table_uuid          TEXT NOT NULL,
-    committed_txn_id    BIGINT NOT NULL,
+    commit_scn          BIGINT NOT NULL,   -- from commit_scn_counter (transactional)
     iceberg_snapshot_id BIGINT,
     metadata_location   TEXT NOT NULL,
     committed_at        TIMESTAMP NOT NULL DEFAULT now(),
@@ -383,9 +383,21 @@ CREATE TABLE IF NOT EXISTS committed_table_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_cts_table_txn
-    ON committed_table_snapshots (realm_id, catalog_id, table_uuid, committed_txn_id);
+    ON committed_table_snapshots (realm_id, catalog_id, table_uuid, commit_scn);
 CREATE INDEX IF NOT EXISTS idx_cts_txn
-    ON committed_table_snapshots (committed_txn_id);
+    ON committed_table_snapshots (commit_scn);
+
+-- Per-(realm, catalog) transactional commit clock. Allocated as
+-- `UPDATE ... SET scn = scn + 1` inside the commit transaction; the row lock is
+-- held until commit, so commit_scn order == commit order. See postgres schema
+-- and multi-table-transaction-design.md (§ Why a single read_point).
+CREATE TABLE IF NOT EXISTS commit_scn_counter (
+    realm_id   TEXT NOT NULL,
+    catalog_id BIGINT NOT NULL,
+    scn        BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP NOT NULL DEFAULT now(),
+    PRIMARY KEY (realm_id, catalog_id)
+);
 
 CREATE SEQUENCE IF NOT EXISTS lock_id_seq START WITH 1 INCREMENT BY 1;
 
@@ -406,6 +418,18 @@ CREATE INDEX IF NOT EXISTS idx_locks_resource
     ON locks (realm_id, catalog_id, resource, status);
 CREATE INDEX IF NOT EXISTS idx_locks_txn
     ON locks (txn_id, status);
+
+-- Per-(realm, catalog, resource) serialization anchor for LockManager.acquire.
+-- SELECT ... FOR UPDATE on this always-present row makes the check-then-insert of a
+-- `locks` row atomic across Polaris nodes (a plain FOR UPDATE on `locks` can't stop
+-- two phantom inserts). See postgres/schema-v5.sql for the full rationale.
+CREATE TABLE IF NOT EXISTS lock_resource (
+    realm_id   TEXT NOT NULL,
+    catalog_id BIGINT NOT NULL,
+    resource   TEXT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT now(),
+    PRIMARY KEY (realm_id, catalog_id, resource)
+);
 
 CREATE TABLE IF NOT EXISTS txn_watermark (
     realm_id         TEXT NOT NULL,

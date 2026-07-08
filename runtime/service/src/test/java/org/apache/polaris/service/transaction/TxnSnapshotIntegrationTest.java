@@ -152,7 +152,8 @@ class TxnSnapshotIntegrationTest {
     // Commit a row BEFORE beginning the transaction
     long preTxnCommit = persistence.nextTxnId();
     persistence.insertCommittedTableSnapshotRow(
-        new CommittedTableSnapshotRow(TABLE_UUID, preTxnCommit, null, "s3://bucket/pre-begin.json"));
+        new CommittedTableSnapshotRow(
+            TABLE_UUID, preTxnCommit, null, "s3://bucket/pre-begin.json"));
 
     // Begin a REPEATABLE_READ transaction — captures TxnSnapshot at this moment
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, "owner");

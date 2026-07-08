@@ -26,7 +26,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.polaris.spark.rest.CommitTransactionRESTRequest;
 import org.apache.polaris.spark.rest.GetSubtransactionRESTResponse;
 import org.apache.polaris.spark.rest.StagedTableCommitRESTRequest;
 import org.apache.polaris.spark.rest.SubtransactionRESTResponse;
@@ -73,8 +72,7 @@ public class TransactionManager {
   // NOT the same as the RYOW staged-path key — that key is only set AFTER the metadata file
   // has been written (by PinnedTableOperations.commit), so the RYOW check in
   // resolveMetadataLocation cannot fire prematurely on the first loadTable call.
-  static final String CONF_WORKER_STAGING_PATH =
-      "spark.sql.catalog.%s.active_worker_staging_path";
+  static final String CONF_WORKER_STAGING_PATH = "spark.sql.catalog.%s.active_worker_staging_path";
 
   static final String DEFAULT_ISOLATION = "REPEATABLE_READ";
   static final int DEFAULT_LEASE_SECONDS = 3600;
@@ -106,8 +104,7 @@ public class TransactionManager {
   public void begin(SparkSession spark, String isolation) {
     String pendingIsolation = getConf(spark, CONF_PENDING_ISOLATION);
     if (pendingIsolation != null) {
-      throw new IllegalStateException(
-          "Transaction already in progress. COMMIT or ROLLBACK first.");
+      throw new IllegalStateException("Transaction already in progress. COMMIT or ROLLBACK first.");
     }
     setConf(spark, CONF_PENDING_ISOLATION, isolation);
   }
@@ -235,11 +232,11 @@ public class TransactionManager {
 
   /**
    * Transitions the session from PENDING to ACTIVE by firing the {@code beginTransaction} REST
-   * call, storing the returned txn_id / txn_token / txn_snapshot_id in Spark conf, and printing
-   * the "Transaction started" status line.
+   * call, storing the returned txn_id / txn_token / txn_snapshot_id in Spark conf, and printing the
+   * "Transaction started" status line.
    *
-   * <p>This is a no-op if the session is already ACTIVE (txn_id already set). Called by both
-   * {@link #resolveMetadataLocation} (first {@code loadTable}) and {@link
+   * <p>This is a no-op if the session is already ACTIVE (txn_id already set). Called by both {@link
+   * #resolveMetadataLocation} (first {@code loadTable}) and {@link
    * #createSubtransactionForOrchestrator} (first {@code CREATE SUBTRANSACTION FOR}), so that the
    * snapshot is pinned at the first real statement — consistent with PostgreSQL REPEATABLE READ
    * semantics.
@@ -283,8 +280,7 @@ public class TransactionManager {
     String tableKey = identToKey(ident);
     spark.conf().set(stagedPathConfKey(tableKey), stagingPath);
     // Upgrade operation: EXCLUSIVE takes precedence over ROW_EXCLUSIVE
-    String currentOp =
-        spark.conf().getOption(stagedOpConfKey(tableKey)).getOrElse(() -> null);
+    String currentOp = spark.conf().getOption(stagedOpConfKey(tableKey)).getOrElse(() -> null);
     String finalOp =
         ("EXCLUSIVE".equals(currentOp) || "EXCLUSIVE".equals(operation)) ? "EXCLUSIVE" : operation;
     spark.conf().set(stagedOpConfKey(tableKey), finalOp);
@@ -302,8 +298,7 @@ public class TransactionManager {
 
   /** Returns the current staged metadata path for the given table, if any. Used for RYOW. */
   public Optional<String> getStagedPath(SparkSession spark, TableIdentifier ident) {
-    String val =
-        spark.conf().getOption(stagedPathConfKey(identToKey(ident))).getOrElse(() -> null);
+    String val = spark.conf().getOption(stagedPathConfKey(identToKey(ident))).getOrElse(() -> null);
     return Optional.ofNullable(val);
   }
 
@@ -324,8 +319,7 @@ public class TransactionManager {
       String operation) {
     String pending = getConf(spark, CONF_PENDING_ISOLATION);
     if (pending != null) {
-      throw new IllegalStateException(
-          "Transaction already in progress. COMMIT or ROLLBACK first.");
+      throw new IllegalStateException("Transaction already in progress. COMMIT or ROLLBACK first.");
     }
     GetSubtransactionRESTResponse info = restCatalog.getSubtransaction(subtxnId, subtxnToken);
     setConf(spark, CONF_PENDING_ISOLATION, DEFAULT_ISOLATION);
@@ -351,8 +345,7 @@ public class TransactionManager {
   public void commitWorkerSubtransaction(SparkSession spark) {
     String subtxnIdStr = getConf(spark, CONF_WORKER_SUBTXN_ID);
     if (subtxnIdStr == null) {
-      throw new IllegalStateException(
-          "Not in worker mode. Use BEGIN WORKER SUBTRANSACTION first.");
+      throw new IllegalStateException("Not in worker mode. Use BEGIN WORKER SUBTRANSACTION first.");
     }
     String subtxnToken = getConf(spark, CONF_WORKER_SUBTXN_TOKEN);
     String txnId = getConf(spark, CONF_TXN_ID);
@@ -380,7 +373,8 @@ public class TransactionManager {
     String subtxnToken = getConf(spark, CONF_WORKER_SUBTXN_TOKEN);
     String txnId = getConf(spark, CONF_TXN_ID);
     try {
-      restCatalog.abortSubtransaction(Long.parseLong(txnId), Long.parseLong(subtxnIdStr), subtxnToken);
+      restCatalog.abortSubtransaction(
+          Long.parseLong(txnId), Long.parseLong(subtxnIdStr), subtxnToken);
     } finally {
       clearConf(spark);
     }
@@ -402,11 +396,11 @@ public class TransactionManager {
   }
 
   /**
-   * Calls {@code createSubtransaction} with retry-with-backoff for EXCLUSIVE lock conflicts.
-   * The server returns HTTP 409 with type={@code LockConflictError} and a {@code retry_after_ms}
-   * hint when an EXCLUSIVE request finds in-flight ROW_EXCLUSIVE holders. This method sleeps the
-   * suggested delay and retries up to {@link #MAX_LOCK_WAIT_RETRIES} times before throwing
-   * {@link PolarisRESTCatalog.LockWaitTimeoutException}.
+   * Calls {@code createSubtransaction} with retry-with-backoff for EXCLUSIVE lock conflicts. The
+   * server returns HTTP 409 with type={@code LockConflictError} and a {@code retry_after_ms} hint
+   * when an EXCLUSIVE request finds in-flight ROW_EXCLUSIVE holders. This method sleeps the
+   * suggested delay and retries up to {@link #MAX_LOCK_WAIT_RETRIES} times before throwing {@link
+   * PolarisRESTCatalog.LockWaitTimeoutException}.
    */
   SubtransactionRESTResponse createSubtransactionWithRetry(
       long txnId, String txnToken, String tableKey, String operation) {
@@ -427,7 +421,10 @@ public class TransactionManager {
         }
         LOG.info(
             "Lock conflict on {} (attempt {}/{}); retrying after {} ms",
-            tableKey, attempt + 1, MAX_LOCK_WAIT_RETRIES, e.retryAfterMs);
+            tableKey,
+            attempt + 1,
+            MAX_LOCK_WAIT_RETRIES,
+            e.retryAfterMs);
         try {
           Thread.sleep(e.retryAfterMs);
         } catch (InterruptedException ie) {
@@ -473,8 +470,7 @@ public class TransactionManager {
     String tablesStr = getConf(spark, CONF_STAGED_TABLES);
     if (tablesStr != null && !tablesStr.isEmpty()) {
       for (String tableKey : tablesStr.split(",")) {
-        String path =
-            spark.conf().getOption(stagedPathConfKey(tableKey)).getOrElse(() -> null);
+        String path = spark.conf().getOption(stagedPathConfKey(tableKey)).getOrElse(() -> null);
         String op = spark.conf().getOption(stagedOpConfKey(tableKey)).getOrElse(() -> null);
         if (path != null) {
           snapshot.put(tableKey, new String[] {path, op != null ? op : "ROW_EXCLUSIVE"});
@@ -523,8 +519,7 @@ public class TransactionManager {
     }
     List<StagedTableCommitRESTRequest> result = new ArrayList<>();
     for (String tableKey : tablesStr.split(",")) {
-      String path =
-          spark.conf().getOption(stagedPathConfKey(tableKey)).getOrElse(() -> null);
+      String path = spark.conf().getOption(stagedPathConfKey(tableKey)).getOrElse(() -> null);
       String op = spark.conf().getOption(stagedOpConfKey(tableKey)).getOrElse(() -> null);
       if (path != null) {
         result.add(

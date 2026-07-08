@@ -42,8 +42,8 @@ import scala.Option;
 /**
  * Tests for PolarisSparkSqlParser SQL routing.
  *
- * <p>Uses a test subclass that injects a mocked TransactionManager directly, bypassing the
- * catalog lookup that would require a running SparkSession.
+ * <p>Uses a test subclass that injects a mocked TransactionManager directly, bypassing the catalog
+ * lookup that would require a running SparkSession.
  */
 public class PolarisSparkSqlParserTest {
 
@@ -162,8 +162,7 @@ public class PolarisSparkSqlParserTest {
         org.mockito.Mockito.mockStatic(SparkSession.class)) {
       staticMock.when(SparkSession::active).thenReturn(mockSpark);
 
-      assertThatThrownBy(
-              () -> parser.parsePlan("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+      assertThatThrownBy(() -> parser.parsePlan("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
           .isInstanceOf(IllegalArgumentException.class)
           .hasMessageContaining("Unknown isolation level");
     }
@@ -301,9 +300,7 @@ public class PolarisSparkSqlParserTest {
 
       verify(mockTxnManager)
           .createSubtransactionForOrchestrator(
-              eq(mockSpark),
-              eq(TableIdentifier.of(Namespace.of("ns"), "orders")),
-              eq("EXCLUSIVE"));
+              eq(mockSpark), eq(TableIdentifier.of(Namespace.of("ns"), "orders")), eq("EXCLUSIVE"));
     }
   }
 
@@ -317,8 +314,7 @@ public class PolarisSparkSqlParserTest {
         org.mockito.Mockito.mockStatic(SparkSession.class)) {
       staticMock.when(SparkSession::active).thenReturn(mockSpark);
 
-      parser.parsePlan(
-          "BEGIN SUBTRANSACTION ns.orders SUBTXN_ID=100, SUBTXN_TOKEN='secret-tok'");
+      parser.parsePlan("BEGIN SUBTRANSACTION ns.orders SUBTXN_ID=100, SUBTXN_TOKEN='secret-tok'");
 
       verify(mockTxnManager)
           .beginWorkerSubtransaction(
@@ -358,8 +354,7 @@ public class PolarisSparkSqlParserTest {
         org.mockito.Mockito.mockStatic(SparkSession.class)) {
       staticMock.when(SparkSession::active).thenReturn(mockSpark);
 
-      parser.parsePlan(
-          "BEGIN SUBTRANSACTION ns.orders\t" + "SUBTXN_ID=100  SUBTXN_TOKEN='tok'");
+      parser.parsePlan("BEGIN SUBTRANSACTION ns.orders\t" + "SUBTXN_ID=100  SUBTXN_TOKEN='tok'");
 
       verify(mockTxnManager)
           .beginWorkerSubtransaction(
@@ -378,9 +373,7 @@ public class PolarisSparkSqlParserTest {
       staticMock.when(SparkSession::active).thenReturn(mockSpark);
 
       assertThatThrownBy(
-              () ->
-                  parser.parsePlan(
-                      "BEGIN SUBTRANSACTION ns.orders SUBTXN_TOKEN='tok'"))
+              () -> parser.parsePlan("BEGIN SUBTRANSACTION ns.orders SUBTXN_TOKEN='tok'"))
           .isInstanceOf(IllegalArgumentException.class)
           .hasMessageContaining("SUBTXN_ID");
     }

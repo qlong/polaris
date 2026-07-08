@@ -32,7 +32,8 @@ public class CreateSubtransactionRESTRequest implements RESTRequest {
   @JsonProperty("lease_seconds")
   private final int leaseSeconds;
 
-  public CreateSubtransactionRESTRequest(String tableIdentifier, String operation, int leaseSeconds) {
+  public CreateSubtransactionRESTRequest(
+      String tableIdentifier, String operation, int leaseSeconds) {
     this.tableIdentifier = tableIdentifier;
     this.operation = operation;
     this.leaseSeconds = leaseSeconds;

@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 import javax.sql.DataSource;
@@ -54,8 +55,8 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
  *
  * <ol>
  *   <li><b>Torn-read prevention</b>: a concurrent writer commits to two tables with a delay between
- *       them; a reader that acquires a {@code TxnSnapshot} between the two commits sees a consistent
- *       one-or-the-other view, never a mix.
+ *       them; a reader that acquires a {@code TxnSnapshot} between the two commits sees a
+ *       consistent one-or-the-other view, never a mix.
  *   <li><b>Lock conflict serialization</b>: an EXCLUSIVE lock blocks a conflicting second writer;
  *       after the first transaction aborts the second acquires the lock successfully.
  *   <li><b>ROW_EXCLUSIVE non-blocking</b>: concurrent ROW_EXCLUSIVE operations on the same table
@@ -77,6 +78,7 @@ class TxnConcurrencyTest {
 
   private JdbcTransactionPersistence persistence;
   private TransactionService service;
+  private String realm;
 
   @BeforeAll
   static void startContainerAndInitSchema() throws Exception {
@@ -119,9 +121,20 @@ class TxnConcurrencyTest {
   @BeforeEach
   void setUp() {
     // Unique realm per test — isolates data without dropping/recreating tables
-    String realm = "realm-" + UUID.randomUUID();
-    persistence = new JdbcTransactionPersistence(dataSource, DatabaseType.POSTGRES, realm, CATALOG_ID);
+    realm = "realm-" + UUID.randomUUID();
+    persistence =
+        new JdbcTransactionPersistence(dataSource, DatabaseType.POSTGRES, realm, CATALOG_ID);
     service = new TransactionService(persistence, new LockManager(persistence));
+  }
+
+  /**
+   * Builds an independent {@link TransactionService} backed by its own persistence + LockManager on
+   * the same DB/realm/catalog — i.e. a second Polaris node sharing the backing database.
+   */
+  private TransactionService newNodeService() {
+    JdbcTransactionPersistence p =
+        new JdbcTransactionPersistence(dataSource, DatabaseType.POSTGRES, realm, CATALOG_ID);
+    return new TransactionService(p, new LockManager(p));
   }
 
   // ---------------------------------------------------------------------------
@@ -150,19 +163,26 @@ class TxnConcurrencyTest {
         new Thread(
             () -> {
               try {
-                long t1 = persistence.nextTxnId();
+                // commit_scn is allocated by insertCommittedTableSnapshotRow itself (monotonic);
+                // the latches enforce commit order: orders (lower scn) before customers (higher).
                 persistence.insertCommittedTableSnapshotRow(
-                    new CommittedTableSnapshotRow(ordersUuid, t1, null, "s3://orders/v2.json"));
+                    new CommittedTableSnapshotRow(
+                        ordersUuid,
+                        JdbcTransactionPersistence.UNASSIGNED_SCN,
+                        null,
+                        "s3://orders/v2.json"));
                 ordersCommitted.countDown(); // signal: orders committed
 
                 assertThat(snapshotAcquired.await(5, TimeUnit.SECONDS))
                     .as("reader should acquire snapshot within 5s")
                     .isTrue();
 
-                long t3 = persistence.nextTxnId();
                 persistence.insertCommittedTableSnapshotRow(
                     new CommittedTableSnapshotRow(
-                        customersUuid, t3, null, "s3://customers/v2.json"));
+                        customersUuid,
+                        JdbcTransactionPersistence.UNASSIGNED_SCN,
+                        null,
+                        "s3://customers/v2.json"));
               } catch (Throwable e) {
                 writerErrors.add(e);
               }
@@ -212,7 +232,14 @@ class TxnConcurrencyTest {
     // T1 acquires EXCLUSIVE lock by creating an operation
     var txn1 = service.beginTransaction("REPEATABLE_READ", 3600, "owner1");
     service.createOperation(
-        txn1.txnId(), txn1.txnToken(), tableUuid, "EXCLUSIVE", null, null, 3600, TABLE_METADATA_DIR);
+        txn1.txnId(),
+        txn1.txnToken(),
+        tableUuid,
+        "EXCLUSIVE",
+        null,
+        null,
+        3600,
+        TABLE_METADATA_DIR);
 
     // T2 tries EXCLUSIVE on the same resource — must throw immediately
     var txn2 = service.beginTransaction("REPEATABLE_READ", 3600, "owner2");
@@ -251,27 +278,41 @@ class TxnConcurrencyTest {
   }
 
   /**
-   * ROW_EXCLUSIVE does not call {@link LockManager#acquire}, so it never blocks on a conflicting
-   * EXCLUSIVE lock held by another transaction. The conflict is detected at commit time via OCC.
+   * Under the 3-mode lock protocol, ROW_EXCLUSIVE records a lock row and is incompatible with a
+   * held EXCLUSIVE. Requesting ROW_EXCLUSIVE while another transaction holds EXCLUSIVE fails fast
+   * with {@link LockManager.LockConflictException} (no retry hint) rather than blocking or being
+   * silently granted.
    */
   @Test
-  void rowExclusiveDoesNotBlockWhenExclusiveLockHeld() throws Exception {
+  void rowExclusiveFailsFastWhenExclusiveLockHeld() throws Exception {
     String tableUuid = "table-" + UUID.randomUUID();
 
     // T1 holds EXCLUSIVE lock
     var txn1 = service.beginTransaction("REPEATABLE_READ", 3600, "owner1");
     service.createOperation(
-        txn1.txnId(), txn1.txnToken(), tableUuid, "EXCLUSIVE", null, null, 3600, TABLE_METADATA_DIR);
+        txn1.txnId(),
+        txn1.txnToken(),
+        tableUuid,
+        "EXCLUSIVE",
+        null,
+        null,
+        3600,
+        TABLE_METADATA_DIR);
 
-    // T2 ROW_EXCLUSIVE on same table — must succeed (ROW_EXCLUSIVE never acquires a lock)
+    // T2 ROW_EXCLUSIVE on the same table — must fail fast while EXCLUSIVE is held.
     var txn2 = service.beginTransaction("REPEATABLE_READ", 3600, "owner2");
-    var op =
-        service.createOperation(
-            txn2.txnId(), txn2.txnToken(), tableUuid, "ROW_EXCLUSIVE", null, null, 3600, TABLE_METADATA_DIR);
-
-    assertThat(op.status())
-        .as("ROW_EXCLUSIVE must not be blocked by an EXCLUSIVE lock on the same table")
-        .isEqualTo(JdbcTransactionPersistence.OP_STATUS_IN_PROGRESS);
+    assertThatThrownBy(
+            () ->
+                service.createOperation(
+                    txn2.txnId(),
+                    txn2.txnToken(),
+                    tableUuid,
+                    "ROW_EXCLUSIVE",
+                    null,
+                    null,
+                    3600,
+                    TABLE_METADATA_DIR))
+        .isInstanceOf(LockManager.LockConflictException.class);
   }
 
   // ---------------------------------------------------------------------------
@@ -297,9 +338,7 @@ class TxnConcurrencyTest {
           new Thread(
               () -> {
                 try {
-                  var txn =
-                      service.beginTransaction(
-                          "REPEATABLE_READ", 3600, "writer-" + idx);
+                  var txn = service.beginTransaction("REPEATABLE_READ", 3600, "writer-" + idx);
                   var op =
                       service.createOperation(
                           txn.txnId(),
@@ -327,6 +366,181 @@ class TxnConcurrencyTest {
     assertThat(errors)
         .as("all %d concurrent ROW_EXCLUSIVE operations must succeed without any error", N)
         .isEmpty();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 4: commit_scn is a transactional, serialized, monotonic commit clock
+  // ---------------------------------------------------------------------------
+
+  /**
+   * N threads each open a transaction, allocate a {@code commit_scn}, insert a CTS row, and commit.
+   * The per-catalog counter row lock serializes the allocate→commit intervals, so every thread must
+   * receive a <b>distinct</b> scn and, after all commit, {@code captureReadPoint()} equals the
+   * highest scn — no gaps from aborts, no duplicates.
+   */
+  @Test
+  void commitScnAllocationIsSerializedAndMonotonic() throws Exception {
+    int n = 8;
+    List<Long> scns = Collections.synchronizedList(new ArrayList<>());
+    List<Throwable> errors = Collections.synchronizedList(new ArrayList<>());
+    List<Thread> threads = new ArrayList<>();
+    for (int i = 0; i < n; i++) {
+      final int idx = i;
+      Thread t =
+          new Thread(
+              () -> {
+                try (Connection conn = dataSource.getConnection()) {
+                  conn.setAutoCommit(false);
+                  long scn = persistence.allocateCommitScn(conn);
+                  persistence.insertCommittedTableSnapshot(
+                      conn,
+                      new CommittedTableSnapshotRow(
+                          "tbl-" + idx, scn, null, "s3://t/" + idx + ".json"));
+                  conn.commit();
+                  scns.add(scn);
+                } catch (Throwable e) {
+                  errors.add(e);
+                }
+              });
+      threads.add(t);
+    }
+    threads.forEach(Thread::start);
+    for (Thread t : threads) {
+      t.join(20_000);
+    }
+
+    assertThat(errors).as("no thread should error allocating commit_scn").isEmpty();
+    assertThat(scns).hasSize(n);
+    assertThat(scns.stream().distinct().count())
+        .as("every commit must receive a distinct commit_scn (serialized on the counter row)")
+        .isEqualTo((long) n);
+    assertThat(persistence.captureReadPoint())
+        .as("read_point after all commits equals the highest allocated commit_scn")
+        .isEqualTo(scns.stream().mapToLong(Long::longValue).max().orElse(-1));
+  }
+
+  /**
+   * The assign-before-visible window is closed: while a committer holds the counter lock (scn
+   * allocated but transaction not yet committed), a concurrent reader's {@code captureReadPoint()}
+   * must NOT observe that scn — it reads the last <em>committed</em> counter value. Only after the
+   * committer commits does a fresh read_point include it.
+   */
+  @Test
+  void readPointNeverExceedsNotYetCommittedScn() throws Exception {
+    long before = persistence.captureReadPoint();
+
+    CountDownLatch allocated = new CountDownLatch(1);
+    CountDownLatch readerDone = new CountDownLatch(1);
+    List<Throwable> errors = Collections.synchronizedList(new ArrayList<>());
+    long[] committerScn = new long[1];
+
+    Thread committer =
+        new Thread(
+            () -> {
+              try (Connection conn = dataSource.getConnection()) {
+                conn.setAutoCommit(false);
+                committerScn[0] = persistence.allocateCommitScn(conn); // holds counter row lock
+                persistence.insertCommittedTableSnapshot(
+                    conn,
+                    new CommittedTableSnapshotRow(
+                        "tbl-window", committerScn[0], null, "s3://t/window.json"));
+                allocated.countDown();
+                assertThat(readerDone.await(10, TimeUnit.SECONDS)).isTrue();
+                conn.commit(); // scn + row become visible together here
+              } catch (Throwable e) {
+                errors.add(e);
+              }
+            });
+    committer.start();
+
+    assertThat(allocated.await(10, TimeUnit.SECONDS)).isTrue();
+    // Committer has allocated (and holds the lock) but has NOT committed. A reader reads the last
+    // committed value — never the in-flight scn.
+    long midReadPoint = persistence.captureReadPoint();
+    readerDone.countDown();
+    committer.join(10_000);
+
+    assertThat(errors).isEmpty();
+    assertThat(committerScn[0]).isGreaterThan(before);
+    assertThat(midReadPoint)
+        .as("read_point during an in-flight commit must not include the uncommitted commit_scn")
+        .isEqualTo(before);
+    assertThat(persistence.captureReadPoint())
+        .as("after the committer commits, a fresh read_point includes its commit_scn")
+        .isEqualTo(committerScn[0]);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 5: multi-node lock-acquisition serialization (anchor-row FOR UPDATE)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Two independent Polaris nodes (separate {@link TransactionService}/{@link LockManager}
+   * instances, distinct connections — the old per-JVM mutex cannot help across them) race to
+   * acquire an EXCLUSIVE lock on the <b>same</b> table at the same instant. The per-resource {@code
+   * lock_resource} anchor (SELECT ... FOR UPDATE) must serialize the grant decision so that
+   * <b>exactly one</b> node is granted and the other gets a {@link
+   * LockManager.LockConflictException}.
+   *
+   * <p>Before the anchor fix this test fails: both nodes observe zero conflicts and both insert an
+   * EXCLUSIVE lock row (phantom), granting two exclusive locks on one table.
+   */
+  @Test
+  void concurrentExclusiveAcquireAcrossNodesGrantsExactlyOne() throws Exception {
+    String tableUuid = "table-" + UUID.randomUUID();
+    int nodes = 6;
+
+    CyclicBarrier startLine = new CyclicBarrier(nodes);
+    java.util.concurrent.atomic.AtomicInteger granted =
+        new java.util.concurrent.atomic.AtomicInteger();
+    java.util.concurrent.atomic.AtomicInteger conflicts =
+        new java.util.concurrent.atomic.AtomicInteger();
+    List<Throwable> unexpected = Collections.synchronizedList(new ArrayList<>());
+    List<Thread> threads = new ArrayList<>();
+
+    for (int i = 0; i < nodes; i++) {
+      final int idx = i;
+      Thread t =
+          new Thread(
+              () -> {
+                TransactionService node = newNodeService();
+                try {
+                  var txn = node.beginTransaction("REPEATABLE_READ", 3600, "node-" + idx);
+                  startLine.await(10, TimeUnit.SECONDS); // all nodes fire acquire together
+                  node.createOperation(
+                      txn.txnId(),
+                      txn.txnToken(),
+                      tableUuid,
+                      "EXCLUSIVE",
+                      null,
+                      null,
+                      3600,
+                      TABLE_METADATA_DIR);
+                  granted.incrementAndGet();
+                } catch (LockManager.LockConflictException e) {
+                  conflicts.incrementAndGet();
+                } catch (Throwable e) {
+                  unexpected.add(e);
+                }
+              });
+      threads.add(t);
+    }
+    threads.forEach(Thread::start);
+    for (Thread t : threads) {
+      t.join(30_000);
+    }
+
+    assertThat(unexpected).as("no unexpected errors").isEmpty();
+    assertThat(granted.get())
+        .as("exactly one node may hold EXCLUSIVE on the same table")
+        .isEqualTo(1);
+    assertThat(conflicts.get())
+        .as("every other node must observe a lock conflict")
+        .isEqualTo(nodes - 1);
+    // The DB agrees: exactly one granted EXCLUSIVE lock row exists for the resource.
+    assertThat(persistence.findGrantedLocksOnResource(tableUuid, -1L))
+        .as("exactly one granted lock row in the DB")
+        .hasSize(1);
   }
 
   // ---------------------------------------------------------------------------

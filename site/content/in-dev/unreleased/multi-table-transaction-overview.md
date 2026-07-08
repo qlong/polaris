@@ -88,7 +88,7 @@ At a high level:
 - Nothing becomes visible until the catalog performs a single **atomic publish** step that updates all involved tables' metadata pointers together.
 - Readers get an explicit **multi-table read snapshot handle** so that all tables resolve to a consistent point in time.
 
-This is conceptually analogous to PostgreSQL's MVCC architecture (transaction IDs + visibility snapshots), but adapted to Iceberg's snapshot-based tables and long-running distributed jobs.
+This borrows the *ideas* of MVCC (monotonic transaction IDs + a pinned read view), but adapts them to Iceberg's snapshot-based tables. Because Iceberg publishes each commit as one atomic, immutable table snapshot — rather than per-row tuple versions that coexist with aborted ones — a reader's view is captured as a single **`read_point`** (a commit timestamp), not PostgreSQL's `(xmin, xmax, xip)` triple. This is closer to a timestamp-oracle model (cf. Google Percolator) than to per-row heap MVCC. See the design doc's [Why a single `read_point`](multi-table-transaction-design.md) for the full rationale.
 
 ---
 

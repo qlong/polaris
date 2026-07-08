@@ -180,7 +180,14 @@ class TransactionServiceUnitTest {
 
     var op =
         service.createOperation(
-            txn.txnId(), txn.txnToken(), "table-uuid-1", "ROW_EXCLUSIVE", null, null, 3600, TABLE_METADATA_DIR);
+            txn.txnId(),
+            txn.txnToken(),
+            "table-uuid-1",
+            "ROW_EXCLUSIVE",
+            null,
+            null,
+            3600,
+            TABLE_METADATA_DIR);
 
     assertThat(op.opId()).isGreaterThan(0);
     assertThat(op.opToken()).isNotBlank();
@@ -194,7 +201,14 @@ class TransactionServiceUnitTest {
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
     var op =
         service.createOperation(
-            txn.txnId(), txn.txnToken(), "table-uuid-2", "ROW_EXCLUSIVE", null, null, 3600, TABLE_METADATA_DIR);
+            txn.txnId(),
+            txn.txnToken(),
+            "table-uuid-2",
+            "ROW_EXCLUSIVE",
+            null,
+            null,
+            3600,
+            TABLE_METADATA_DIR);
 
     // assignedStagingPath is the exact file path — pass it directly
     String metadataLocation = op.assignedStagingPath();
@@ -210,7 +224,14 @@ class TransactionServiceUnitTest {
   void prepareCommitFailsWhenOpStillInProgress() throws Exception {
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
     service.createOperation(
-        txn.txnId(), txn.txnToken(), "table-uuid-3", "ROW_EXCLUSIVE", null, null, 3600, TABLE_METADATA_DIR);
+        txn.txnId(),
+        txn.txnToken(),
+        "table-uuid-3",
+        "ROW_EXCLUSIVE",
+        null,
+        null,
+        3600,
+        TABLE_METADATA_DIR);
 
     assertThatThrownBy(() -> service.prepareCommit(txn.txnId(), txn.txnToken()))
         .isInstanceOf(BadRequestException.class)
@@ -222,7 +243,14 @@ class TransactionServiceUnitTest {
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
     var op =
         service.createOperation(
-            txn.txnId(), txn.txnToken(), "ns.orders", "ROW_EXCLUSIVE", null, null, 3600, TABLE_METADATA_DIR);
+            txn.txnId(),
+            txn.txnToken(),
+            "ns.orders",
+            "ROW_EXCLUSIVE",
+            null,
+            null,
+            3600,
+            TABLE_METADATA_DIR);
 
     var info = service.getOperation(op.opId(), op.opToken());
 
@@ -237,7 +265,14 @@ class TransactionServiceUnitTest {
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
     var op =
         service.createOperation(
-            txn.txnId(), txn.txnToken(), "ns.orders", "ROW_EXCLUSIVE", null, null, 3600, TABLE_METADATA_DIR);
+            txn.txnId(),
+            txn.txnToken(),
+            "ns.orders",
+            "ROW_EXCLUSIVE",
+            null,
+            null,
+            3600,
+            TABLE_METADATA_DIR);
 
     assertThatThrownBy(() -> service.getOperation(op.opId(), "wrong-token"))
         .isInstanceOf(ForbiddenException.class)
@@ -264,7 +299,7 @@ class TransactionServiceUnitTest {
     var snap = persistence.findTxnSnapshot(txn.txnSnapshotId());
     assertThat(snap).isPresent();
     assertThat(snap.get().txnSnapshotId()).isEqualTo(txn.txnSnapshotId());
-    assertThat(snap.get().xmax()).isGreaterThan(0);
+    assertThat(snap.get().readPoint()).isGreaterThanOrEqualTo(0);
     assertThat(snap.get().releasedAt()).isNull();
   }
 

@@ -27,11 +27,9 @@ import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.stream.Collectors;
 import javax.sql.DataSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -114,27 +112,92 @@ public class JdbcTransactionPersistence {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // commit_scn_counter: per-(realm, catalog) transactional commit clock
+  // ---------------------------------------------------------------------------
+
   /**
-   * Returns the next-to-be-allocated value of {@code txn_id_seq} (i.e., xmax) without advancing it.
+   * Allocates the next {@code commit_scn} for this realm+catalog on the <b>caller's</b> connection
+   * — it MUST be invoked inside the same transaction that performs the durable metadata-pointer
+   * swap (autocommit off). The {@code UPDATE ... SET scn = scn + 1} takes a row lock on the counter
+   * that is held until the caller commits, so a higher {@code commit_scn} is guaranteed to become
+   * visible only after every lower one has committed — i.e. {@code commit_scn} order equals true
+   * commit order. This is the coordination that makes {@code read_point} (a single cutoff) sound
+   * and closes the assign-before-visible window a non-transactional sequence would leave open.
+   * Commits within a catalog serialize on this row.
    *
-   * <p>PostgreSQL: {@code last_value + 1} (last_value is the last allocated value). H2: {@code
-   * BASE_VALUE} from INFORMATION_SCHEMA.SEQUENCES, which is already the next value. Returns 1 if
-   * the sequence has never been used.
+   * <p>The counter row is created lazily (initialized to {@code 0}) the first time a catalog
+   * commits, so no bootstrap seeding is required.
    */
-  private long sequenceXmax(Connection conn) throws SQLException {
+  public long allocateCommitScn(@Nonnull Connection conn) throws SQLException {
     if (dbType == DatabaseType.H2) {
-      String sql =
-          "SELECT BASE_VALUE FROM INFORMATION_SCHEMA.SEQUENCES"
-              + " WHERE SEQUENCE_SCHEMA = 'POLARIS_SCHEMA' AND SEQUENCE_NAME = 'txn_id_seq'";
-      try (PreparedStatement ps = conn.prepareStatement(sql);
-          ResultSet rs = ps.executeQuery()) {
-        return rs.next() ? rs.getLong(1) : 1L;
+      // H2 has no ON CONFLICT ... RETURNING; init-if-absent, then increment, then read — all on the
+      // same connection/transaction so the UPDATE's row lock is held to commit.
+      try (PreparedStatement init =
+          conn.prepareStatement(
+              "INSERT INTO POLARIS_SCHEMA.commit_scn_counter (realm_id, catalog_id, scn) "
+                  + "SELECT ?, ?, 0 WHERE NOT EXISTS ("
+                  + "SELECT 1 FROM POLARIS_SCHEMA.commit_scn_counter "
+                  + "WHERE realm_id = ? AND catalog_id = ?)")) {
+        init.setString(1, realmId);
+        init.setLong(2, catalogId);
+        init.setString(3, realmId);
+        init.setLong(4, catalogId);
+        init.executeUpdate();
+      }
+      try (PreparedStatement upd =
+          conn.prepareStatement(
+              "UPDATE POLARIS_SCHEMA.commit_scn_counter SET scn = scn + 1, updated_at = now() "
+                  + "WHERE realm_id = ? AND catalog_id = ?")) {
+        upd.setString(1, realmId);
+        upd.setLong(2, catalogId);
+        upd.executeUpdate();
+      }
+      try (PreparedStatement sel =
+          conn.prepareStatement(
+              "SELECT scn FROM POLARIS_SCHEMA.commit_scn_counter "
+                  + "WHERE realm_id = ? AND catalog_id = ?")) {
+        sel.setString(1, realmId);
+        sel.setLong(2, catalogId);
+        try (ResultSet rs = sel.executeQuery()) {
+          if (rs.next()) return rs.getLong(1);
+          throw new SQLException("commit_scn_counter row missing after upsert");
+        }
       }
     } else {
-      String sql = "SELECT last_value FROM POLARIS_SCHEMA.txn_id_seq";
-      try (PreparedStatement ps = conn.prepareStatement(sql);
-          ResultSet rs = ps.executeQuery()) {
-        return rs.next() ? rs.getLong(1) + 1 : 1L;
+      String sql =
+          "INSERT INTO POLARIS_SCHEMA.commit_scn_counter (realm_id, catalog_id, scn) "
+              + "VALUES (?, ?, 1) "
+              + "ON CONFLICT (realm_id, catalog_id) DO UPDATE "
+              + "SET scn = POLARIS_SCHEMA.commit_scn_counter.scn + 1, updated_at = now() "
+              + "RETURNING scn";
+      try (PreparedStatement ps = conn.prepareStatement(sql)) {
+        ps.setString(1, realmId);
+        ps.setLong(2, catalogId);
+        try (ResultSet rs = ps.executeQuery()) {
+          if (rs.next()) return rs.getLong(1);
+          throw new SQLException("commit_scn_counter upsert returned no rows");
+        }
+      }
+    }
+  }
+
+  /**
+   * Returns the current committed {@code commit_scn} for this realm+catalog (the value used as a
+   * fresh {@code read_point}), or {@code 0} if the catalog has never committed. This is a plain
+   * (non-locking) read: under MVCC it returns the last committed {@code scn} without blocking on an
+   * in-flight committer's row lock, and — because the counter advances atomically with the CTS row
+   * — it can never exceed a {@code commit_scn} whose row is not yet visible.
+   */
+  public long currentCommitScn(@Nonnull Connection conn) throws SQLException {
+    try (PreparedStatement ps =
+        conn.prepareStatement(
+            "SELECT scn FROM POLARIS_SCHEMA.commit_scn_counter "
+                + "WHERE realm_id = ? AND catalog_id = ?")) {
+      ps.setString(1, realmId);
+      ps.setLong(2, catalogId);
+      try (ResultSet rs = ps.executeQuery()) {
+        return rs.next() ? rs.getLong(1) : 0L;
       }
     }
   }
@@ -419,13 +482,16 @@ public class JdbcTransactionPersistence {
   // txn_snapshots
   // ---------------------------------------------------------------------------
 
+  /**
+   * A read visibility handle. {@code readPoint} is a single commit-order cutoff (a commit SCN): a
+   * committed table snapshot is visible iff {@code commit_scn <= readPoint}. This replaces the
+   * former PostgreSQL-style {@code (xmin, xmax, xipList)} triple.
+   */
   public record TxnSnapshotRow(
       long txnSnapshotId,
       String realmId,
       long catalogId,
-      long xmin,
-      long xmax,
-      String xipList,
+      long readPoint,
       Instant createdAt,
       Instant expiresAt,
       @Nullable Instant releasedAt) {}
@@ -433,26 +499,24 @@ public class JdbcTransactionPersistence {
   public void insertTxnSnapshot(@Nonnull TxnSnapshotRow row) throws SQLException {
     String sql =
         "INSERT INTO POLARIS_SCHEMA.txn_snapshots "
-            + "(txn_snapshot_id, realm_id, catalog_id, snap_xmin, snap_xmax, snap_xip_list, created_at, expires_at) "
-            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+            + "(txn_snapshot_id, realm_id, catalog_id, read_point, created_at, expires_at) "
+            + "VALUES (?, ?, ?, ?, ?, ?)";
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
       conn.setAutoCommit(true);
       ps.setLong(1, row.txnSnapshotId());
       ps.setString(2, row.realmId());
       ps.setLong(3, row.catalogId());
-      ps.setLong(4, row.xmin());
-      ps.setLong(5, row.xmax());
-      ps.setString(6, row.xipList());
-      ps.setTimestamp(7, Timestamp.from(row.createdAt()));
-      ps.setTimestamp(8, Timestamp.from(row.expiresAt()));
+      ps.setLong(4, row.readPoint());
+      ps.setTimestamp(5, Timestamp.from(row.createdAt()));
+      ps.setTimestamp(6, Timestamp.from(row.expiresAt()));
       ps.executeUpdate();
     }
   }
 
   public Optional<TxnSnapshotRow> findTxnSnapshot(long txnSnapshotId) throws SQLException {
     String sql =
-        "SELECT txn_snapshot_id, realm_id, catalog_id, snap_xmin, snap_xmax, snap_xip_list, "
+        "SELECT txn_snapshot_id, realm_id, catalog_id, read_point, "
             + "created_at, expires_at, released_at "
             + "FROM POLARIS_SCHEMA.txn_snapshots "
             + "WHERE txn_snapshot_id = ? AND realm_id = ?";
@@ -494,73 +558,18 @@ public class JdbcTransactionPersistence {
   }
 
   /**
-   * Captures the current MVCC visibility state: (xmin, xmax, xip_list) atomically.
+   * Captures the current {@code read_point}: the highest {@code commit_scn} that has durably
+   * committed in this realm+catalog. A committed table snapshot is visible to this snapshot iff
+   * {@code commit_scn <= read_point}.
    *
-   * <p>Result layout: {@code [xmin, xmax, xip0, xip1, ...]}.
+   * <p>Read directly from {@code commit_scn_counter} (the current committed value). Because that
+   * counter advances atomically with the CTS row inside the commit transaction, the captured {@code
+   * read_point} can never exceed a {@code commit_scn} whose row is not yet visible — the
+   * assign-before-visible window is closed.
    */
-  public long[] captureXminXmax() throws SQLException {
-    String xipSql =
-        "SELECT txn_id FROM POLARIS_SCHEMA.transactions "
-            + "WHERE realm_id = ? AND catalog_id = ? AND status = ?";
-
+  public long captureReadPoint() throws SQLException {
     try (Connection conn = dataSource.getConnection()) {
-      conn.setAutoCommit(false);
-      try {
-        long xmax = sequenceXmax(conn);
-        List<Long> xip = new ArrayList<>();
-        try (PreparedStatement ps = conn.prepareStatement(xipSql)) {
-          ps.setString(1, realmId);
-          ps.setLong(2, catalogId);
-          ps.setInt(3, TXN_STATUS_IN_PROGRESS);
-          try (ResultSet rs = ps.executeQuery()) {
-            while (rs.next()) xip.add(rs.getLong(1));
-          }
-        }
-        conn.commit();
-        long xmin = xip.stream().mapToLong(Long::longValue).min().orElse(1L);
-        long[] result = new long[2 + xip.size()];
-        result[0] = xmin;
-        result[1] = xmax;
-        for (int i = 0; i < xip.size(); i++) result[2 + i] = xip.get(i);
-        return result;
-      } catch (SQLException e) {
-        conn.rollback();
-        throw e;
-      }
-    }
-  }
-
-  /**
-   * Like {@link #captureXminXmax()} but includes in-progress transactions for this {@link #realmId}
-   * across all catalogs (ignores {@link #catalogId}).
-   */
-  public long[] captureXminXmaxForRealm() throws SQLException {
-    String xipSql =
-        "SELECT txn_id FROM POLARIS_SCHEMA.transactions " + "WHERE realm_id = ? AND status = ?";
-
-    try (Connection conn = dataSource.getConnection()) {
-      conn.setAutoCommit(false);
-      try {
-        long xmax = sequenceXmax(conn);
-        List<Long> xip = new ArrayList<>();
-        try (PreparedStatement ps = conn.prepareStatement(xipSql)) {
-          ps.setString(1, realmId);
-          ps.setInt(2, TXN_STATUS_IN_PROGRESS);
-          try (ResultSet rs = ps.executeQuery()) {
-            while (rs.next()) xip.add(rs.getLong(1));
-          }
-        }
-        conn.commit();
-        long xmin = xip.stream().mapToLong(Long::longValue).min().orElse(1L);
-        long[] result = new long[2 + xip.size()];
-        result[0] = xmin;
-        result[1] = xmax;
-        for (int i = 0; i < xip.size(); i++) result[2 + i] = xip.get(i);
-        return result;
-      } catch (SQLException e) {
-        conn.rollback();
-        throw e;
-      }
+      return currentCommitScn(conn);
     }
   }
 
@@ -569,9 +578,7 @@ public class JdbcTransactionPersistence {
         rs.getLong("txn_snapshot_id"),
         rs.getString("realm_id"),
         rs.getLong("catalog_id"),
-        rs.getLong("snap_xmin"),
-        rs.getLong("snap_xmax"),
-        rs.getString("snap_xip_list"),
+        rs.getLong("read_point"),
         toInstant(rs.getTimestamp("created_at")),
         toInstant(rs.getTimestamp("expires_at")),
         toInstant(rs.getTimestamp("released_at")));
@@ -581,27 +588,38 @@ public class JdbcTransactionPersistence {
   // committed_table_snapshots
   // ---------------------------------------------------------------------------
 
+  /**
+   * A committed table state. {@code commitScn} is the commit-order stamp allocated from {@code
+   * commit_scn_counter}. When a caller builds a row as a <i>template</i> for insertion (before the
+   * scn is known), it passes {@link #UNASSIGNED_SCN}; the insert path allocates the real scn inside
+   * the commit transaction and stamps it on the persisted row.
+   */
   public record CommittedTableSnapshotRow(
       String tableUuid,
-      long committedTxnId,
+      long commitScn,
       @Nullable Long icebergSnapshotId,
       String metadataLocation) {}
 
+  /** Placeholder scn for rows built before the commit transaction allocates the real value. */
+  public static final long UNASSIGNED_SCN = 0L;
+
   /**
-   * Records a table commit atomically with the entity update. Must be called on a connection that
-   * is already inside a transaction (autocommit=false). The commit/rollback is owned by the caller.
+   * Records a table commit on a connection that is already inside a transaction (autocommit=false).
+   * The commit/rollback is owned by the caller. {@code row.commitScn()} must already be a value
+   * allocated via {@link #allocateCommitScn(Connection)} <b>on the same connection/transaction</b>,
+   * so the scn advance and this row become durable together.
    */
   public void insertCommittedTableSnapshot(
       @Nonnull Connection conn, @Nonnull CommittedTableSnapshotRow row) throws SQLException {
     String sql =
         "INSERT INTO POLARIS_SCHEMA.committed_table_snapshots "
-            + "(realm_id, catalog_id, table_uuid, committed_txn_id, iceberg_snapshot_id, metadata_location) "
+            + "(realm_id, catalog_id, table_uuid, commit_scn, iceberg_snapshot_id, metadata_location) "
             + "VALUES (?, ?, ?, ?, ?, ?)";
     try (PreparedStatement ps = conn.prepareStatement(sql)) {
       ps.setString(1, realmId);
       ps.setLong(2, catalogId);
       ps.setString(3, row.tableUuid());
-      ps.setLong(4, row.committedTxnId());
+      ps.setLong(4, row.commitScn());
       setNullableLong(ps, 5, row.icebergSnapshotId());
       ps.setString(6, row.metadataLocation());
       ps.executeUpdate();
@@ -609,44 +627,21 @@ public class JdbcTransactionPersistence {
   }
 
   /**
-   * Inserts a committed snapshot row in its own transaction. Used after the Polaris entity row has
-   * been updated so the JDBC transaction scope does not have to match the metastore transaction.
+   * Best-effort fallback for the non-JDBC / in-memory metastore path (which cannot share a
+   * transaction with the entity write). Allocates a {@code commit_scn} and inserts the row in its
+   * own transaction, so the scn advance and the row are at least durable together. The {@code
+   * commitScn} on the input row is ignored — a fresh one is allocated here.
    */
   public void insertCommittedTableSnapshotRow(@Nonnull CommittedTableSnapshotRow row)
       throws SQLException {
     try (Connection conn = dataSource.getConnection()) {
       conn.setAutoCommit(false);
       try {
-        insertCommittedTableSnapshot(conn, row);
-        conn.commit();
-      } catch (SQLException e) {
-        conn.rollback();
-        throw e;
-      }
-    }
-  }
-
-  /**
-   * Inserts all CTS rows for a multi-table transaction atomically: one {@code nextTxnId()} call
-   * shared across every row, all rows inserted in a single JDBC transaction. This ensures an MVCC
-   * snapshot taken before this call sees none of the tables' new states, and a snapshot taken after
-   * sees all of them.
-   */
-  public void insertBatchCommittedTableSnapshots(@Nonnull List<CommittedTableSnapshotRow> rows)
-      throws SQLException {
-    if (rows.isEmpty()) {
-      return;
-    }
-    long sharedTxnId = nextTxnId();
-    try (Connection conn = dataSource.getConnection()) {
-      conn.setAutoCommit(false);
-      try {
-        for (CommittedTableSnapshotRow row : rows) {
-          insertCommittedTableSnapshot(
-              conn,
-              new CommittedTableSnapshotRow(
-                  row.tableUuid(), sharedTxnId, row.icebergSnapshotId(), row.metadataLocation()));
-        }
+        long scn = allocateCommitScn(conn);
+        insertCommittedTableSnapshot(
+            conn,
+            new CommittedTableSnapshotRow(
+                row.tableUuid(), scn, row.icebergSnapshotId(), row.metadataLocation()));
         conn.commit();
       } catch (SQLException e) {
         conn.rollback();
@@ -658,25 +653,20 @@ public class JdbcTransactionPersistence {
   /**
    * Resolves a TxnSnapshot to the per-table metadata location visible under {@code snapshot}.
    *
-   * <p>Visibility rule: {@code committed_txn_id >= xmin AND < xmax AND NOT IN (xip_list)}.
+   * <p>Visibility rule: the newest commit with {@code commit_scn <= read_point}. A {@code
+   * committed_table_snapshots} row exists only for committed transactions, and {@code commit_scn}
+   * is monotonic in commit order, so a single commit-order cutoff is sufficient — there is nothing
+   * in-flight/aborted to exclude.
    */
   public Optional<CommittedTableSnapshotRow> resolveTableSnapshot(
       @Nonnull String tableUuid, @Nonnull TxnSnapshotRow snapshot) throws SQLException {
 
-    List<Long> xip = parseXipList(snapshot.xipList());
-    String notInClause =
-        xip.isEmpty() ? "" : " AND committed_txn_id NOT IN (" + placeholders(xip.size()) + ")";
-
-    // MVCC visibility: a commit is visible if committed_txn_id < xmax and not in xip_list.
-    // The xmin lower-bound is NOT used as a filter — it would incorrectly exclude rows committed
-    // before any transaction was in-flight at snapshot time.
     String sql =
-        "SELECT table_uuid, committed_txn_id, iceberg_snapshot_id, metadata_location "
+        "SELECT table_uuid, commit_scn, iceberg_snapshot_id, metadata_location "
             + "FROM POLARIS_SCHEMA.committed_table_snapshots "
             + "WHERE realm_id = ? AND catalog_id = ? AND table_uuid = ? "
-            + "AND committed_txn_id < ?"
-            + notInClause
-            + " ORDER BY committed_txn_id DESC LIMIT 1";
+            + "AND commit_scn <= ?"
+            + " ORDER BY commit_scn DESC LIMIT 1";
 
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -684,15 +674,14 @@ public class JdbcTransactionPersistence {
       ps.setString(idx++, realmId);
       ps.setLong(idx++, catalogId);
       ps.setString(idx++, tableUuid);
-      ps.setLong(idx++, snapshot.xmax());
-      for (long xipId : xip) ps.setLong(idx++, xipId);
+      ps.setLong(idx++, snapshot.readPoint());
 
       try (ResultSet rs = ps.executeQuery()) {
         if (rs.next()) {
           return Optional.of(
               new CommittedTableSnapshotRow(
                   rs.getString("table_uuid"),
-                  rs.getLong("committed_txn_id"),
+                  rs.getLong("commit_scn"),
                   getNullableLong(rs, "iceberg_snapshot_id"),
                   rs.getString("metadata_location")));
         }
@@ -710,7 +699,7 @@ public class JdbcTransactionPersistence {
     String sql =
         "SELECT metadata_location FROM POLARIS_SCHEMA.committed_table_snapshots "
             + "WHERE realm_id = ? AND catalog_id = ? AND table_uuid = ? "
-            + "ORDER BY committed_txn_id DESC LIMIT 1";
+            + "ORDER BY commit_scn DESC LIMIT 1";
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
       ps.setString(1, realmId);
@@ -798,6 +787,18 @@ public class JdbcTransactionPersistence {
 
   public List<LockRow> findGrantedLocksOnResource(@Nonnull String resource, long excludeTxnId)
       throws SQLException {
+    try (Connection conn = dataSource.getConnection()) {
+      return findGrantedLocksOnResource(conn, resource, excludeTxnId);
+    }
+  }
+
+  /**
+   * Connection-scoped variant of {@link #findGrantedLocksOnResource(String, long)} — reads on the
+   * caller's connection so it can participate in the anchor-locked critical section (see {@link
+   * #runWithResourceAnchor}).
+   */
+  public List<LockRow> findGrantedLocksOnResource(
+      @Nonnull Connection conn, @Nonnull String resource, long excludeTxnId) throws SQLException {
     String sql =
         "SELECT lock_id, txn_id, realm_id, catalog_id, resource, lock_mode, status, "
             + "requested_at, granted_at "
@@ -805,8 +806,7 @@ public class JdbcTransactionPersistence {
             + "WHERE realm_id = ? AND catalog_id = ? AND resource = ? "
             + "AND status = ? AND txn_id <> ?";
     List<LockRow> rows = new ArrayList<>();
-    try (Connection conn = dataSource.getConnection();
-        PreparedStatement ps = conn.prepareStatement(sql)) {
+    try (PreparedStatement ps = conn.prepareStatement(sql)) {
       ps.setString(1, realmId);
       ps.setLong(2, catalogId);
       ps.setString(3, resource);
@@ -817,6 +817,110 @@ public class JdbcTransactionPersistence {
       }
     }
     return rows;
+  }
+
+  /**
+   * Inserts an already-GRANTED lock row on the caller's connection (for use inside {@link
+   * #runWithResourceAnchor}, where the grant decision has already been made under the anchor lock).
+   * Returns the generated {@code lock_id}.
+   */
+  public long insertGrantedLock(
+      @Nonnull Connection conn, long txnId, @Nonnull String resource, @Nonnull String lockMode)
+      throws SQLException {
+    String sql =
+        "INSERT INTO POLARIS_SCHEMA.locks "
+            + "(txn_id, realm_id, catalog_id, resource, lock_mode, status, requested_at, granted_at) "
+            + "VALUES (?, ?, ?, ?, ?, ?, now(), now())";
+    try (PreparedStatement ps = conn.prepareStatement(sql, new String[] {"lock_id"})) {
+      ps.setLong(1, txnId);
+      ps.setString(2, realmId);
+      ps.setLong(3, catalogId);
+      ps.setString(4, resource);
+      ps.setString(5, lockMode);
+      ps.setInt(6, LOCK_STATUS_GRANTED);
+      ps.executeUpdate();
+      try (ResultSet keys = ps.getGeneratedKeys()) {
+        if (keys.next()) return keys.getLong(1);
+      }
+    }
+    throw new SQLException("insertGrantedLock returned no generated key");
+  }
+
+  /** A unit of work executed while holding the per-resource anchor lock. */
+  @FunctionalInterface
+  public interface ResourceAnchorCallback<T> {
+    T run(@Nonnull Connection conn) throws SQLException;
+  }
+
+  /**
+   * Runs {@code cb} inside a single transaction that holds an exclusive row lock on the {@code
+   * lock_resource} anchor for {@code (realmId, catalogId, resource)}, serializing the lock-grant
+   * critical section across all Polaris nodes. The anchor row is created on first use. The anchor
+   * lock is released when this transaction commits (right after {@code cb} returns) — it guards
+   * only the check-then-insert, not the lifetime of the granted lock.
+   *
+   * <p>Because every acquirer of the same resource must take this same row lock, two nodes can no
+   * longer both observe "no conflict" and both insert a conflicting {@code locks} row (the phantom
+   * a plain {@code SELECT ... FOR UPDATE} on {@code locks} cannot prevent).
+   */
+  public <T> T runWithResourceAnchor(
+      @Nonnull String resource, @Nonnull ResourceAnchorCallback<T> cb) throws SQLException {
+    try (Connection conn = dataSource.getConnection()) {
+      conn.setAutoCommit(false);
+      try {
+        lockResourceAnchor(conn, resource);
+        T result = cb.run(conn);
+        conn.commit();
+        return result;
+      } catch (SQLException | RuntimeException e) {
+        conn.rollback();
+        throw e;
+      }
+    }
+  }
+
+  /** Ensures the anchor row exists and takes its row lock (held until the caller commits). */
+  private void lockResourceAnchor(@Nonnull Connection conn, @Nonnull String resource)
+      throws SQLException {
+    if (dbType == DatabaseType.H2) {
+      try (PreparedStatement init =
+          conn.prepareStatement(
+              "INSERT INTO POLARIS_SCHEMA.lock_resource (realm_id, catalog_id, resource) "
+                  + "SELECT ?, ?, ? WHERE NOT EXISTS ("
+                  + "SELECT 1 FROM POLARIS_SCHEMA.lock_resource "
+                  + "WHERE realm_id = ? AND catalog_id = ? AND resource = ?)")) {
+        init.setString(1, realmId);
+        init.setLong(2, catalogId);
+        init.setString(3, resource);
+        init.setString(4, realmId);
+        init.setLong(5, catalogId);
+        init.setString(6, resource);
+        init.executeUpdate();
+      }
+      // H2 holds a write lock on the updated row until commit.
+      try (PreparedStatement lock =
+          conn.prepareStatement(
+              "UPDATE POLARIS_SCHEMA.lock_resource SET updated_at = now() "
+                  + "WHERE realm_id = ? AND catalog_id = ? AND resource = ?")) {
+        lock.setString(1, realmId);
+        lock.setLong(2, catalogId);
+        lock.setString(3, resource);
+        lock.executeUpdate();
+      }
+    } else {
+      // Postgres: ON CONFLICT DO UPDATE creates-or-locks the row atomically and holds the row lock
+      // to commit, even on the conflict (existing-row) path.
+      try (PreparedStatement ps =
+          conn.prepareStatement(
+              "INSERT INTO POLARIS_SCHEMA.lock_resource (realm_id, catalog_id, resource) "
+                  + "VALUES (?, ?, ?) "
+                  + "ON CONFLICT (realm_id, catalog_id, resource) DO UPDATE SET updated_at = now()")) {
+        ps.setString(1, realmId);
+        ps.setLong(2, catalogId);
+        ps.setString(3, resource);
+        ps.executeUpdate();
+      }
+    }
   }
 
   private LockRow rowToLock(ResultSet rs) throws SQLException {
@@ -833,45 +937,54 @@ public class JdbcTransactionPersistence {
   }
 
   // ---------------------------------------------------------------------------
-  // txn_watermark
+  // txn_watermark — purge horizon (in commit_scn space)
   // ---------------------------------------------------------------------------
 
   /**
-   * Raises {@code txn_watermark.watermark_txn_id} for every catalog in this realm up to {@code
-   * newWatermark} when the current value is lower. Used by the background reaper.
+   * Distinct {@code catalog_id}s that have transaction state (committed snapshots or live
+   * snapshots) in this realm. The reaper iterates these to run per-catalog purges, since {@code
+   * commit_scn} is per-catalog and not comparable across catalogs.
    */
-  public void raiseWatermarkAcrossRealm(long newWatermark) throws SQLException {
-    if (newWatermark <= 0) {
-      return;
-    }
+  public List<Long> findCatalogIdsForRealm() throws SQLException {
     String sql =
-        "UPDATE POLARIS_SCHEMA.txn_watermark SET watermark_txn_id = ?, updated_at = now() "
-            + "WHERE realm_id = ? AND watermark_txn_id < ?";
+        "SELECT DISTINCT catalog_id FROM POLARIS_SCHEMA.committed_table_snapshots WHERE realm_id = ? "
+            + "UNION "
+            + "SELECT DISTINCT catalog_id FROM POLARIS_SCHEMA.txn_snapshots WHERE realm_id = ?";
+    List<Long> ids = new ArrayList<>();
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
-      conn.setAutoCommit(true);
-      ps.setLong(1, newWatermark);
+      ps.setString(1, realmId);
       ps.setString(2, realmId);
-      ps.setLong(3, newWatermark);
-      ps.executeUpdate();
+      try (ResultSet rs = ps.executeQuery()) {
+        while (rs.next()) ids.add(rs.getLong(1));
+      }
     }
+    return ids;
   }
 
-  /** Deletes committed snapshot rows for this realm older than {@code watermark} (any catalog). */
-  public void purgeCommittedSnapshotsRealmWideBelow(long watermark) throws SQLException {
+  /**
+   * The {@code MIN(read_point)} over live (unreleased, unexpired) {@code txn_snapshots} for this
+   * realm+catalog, or {@code -1} if there are none. This is the retention horizon: no live reader
+   * can resolve a {@code commit_scn} below it (in-progress REPEATABLE_READ writers are covered
+   * because their linked snapshot row stays live until the transaction ends).
+   */
+  public long minLiveReadPointForCatalog() throws SQLException {
     String sql =
-        "DELETE FROM POLARIS_SCHEMA.committed_table_snapshots "
-            + "WHERE realm_id = ? AND committed_txn_id < ?";
+        "SELECT MIN(read_point) FROM POLARIS_SCHEMA.txn_snapshots "
+            + "WHERE realm_id = ? AND catalog_id = ? AND released_at IS NULL AND expires_at > now()";
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
-      conn.setAutoCommit(true);
       ps.setString(1, realmId);
-      ps.setLong(2, watermark);
-      int deleted = ps.executeUpdate();
-      LOGGER.debug(
-          "Purged {} committed_table_snapshots rows realm-wide below watermark {}",
-          deleted,
-          watermark);
+      ps.setLong(2, catalogId);
+      try (ResultSet rs = ps.executeQuery()) {
+        if (rs.next()) {
+          long v = rs.getLong(1);
+          if (!rs.wasNull()) {
+            return v;
+          }
+        }
+        return -1L;
+      }
     }
   }
 
@@ -889,6 +1002,7 @@ public class JdbcTransactionPersistence {
     }
   }
 
+  /** Records the current purge horizon for this realm+catalog (monotonically non-decreasing). */
   public void upsertWatermark(long newWatermark) throws SQLException {
     String sql;
     if (dbType == DatabaseType.H2) {
@@ -913,10 +1027,23 @@ public class JdbcTransactionPersistence {
     }
   }
 
+  /**
+   * Purges {@code committed_table_snapshots} rows for this realm+catalog that no live snapshot can
+   * resolve, while honoring the per-table survivor rule: for each table it keeps the newest row
+   * with {@code commit_scn <= watermark} (a snapshot pinned exactly at the watermark must still
+   * resolve tables that have not changed since), plus every row above the watermark, and deletes
+   * only the rows strictly older than that per-table survivor.
+   */
   public void purgeCommittedSnapshotsBelowWatermark(long watermark) throws SQLException {
+    if (watermark <= 0) {
+      return;
+    }
     String sql =
-        "DELETE FROM POLARIS_SCHEMA.committed_table_snapshots "
-            + "WHERE realm_id = ? AND catalog_id = ? AND committed_txn_id < ?";
+        "DELETE FROM POLARIS_SCHEMA.committed_table_snapshots c "
+            + "WHERE c.realm_id = ? AND c.catalog_id = ? AND c.commit_scn < ("
+            + "  SELECT MAX(c2.commit_scn) FROM POLARIS_SCHEMA.committed_table_snapshots c2 "
+            + "  WHERE c2.realm_id = c.realm_id AND c2.catalog_id = c.catalog_id "
+            + "    AND c2.table_uuid = c.table_uuid AND c2.commit_scn <= ?)";
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
       conn.setAutoCommit(true);
@@ -925,7 +1052,10 @@ public class JdbcTransactionPersistence {
       ps.setLong(3, watermark);
       int deleted = ps.executeUpdate();
       LOGGER.debug(
-          "Purged {} committed_table_snapshots rows below watermark {}", deleted, watermark);
+          "Purged {} committed_table_snapshots rows for catalog {} below watermark {} (per-table survivor kept)",
+          deleted,
+          catalogId,
+          watermark);
     }
   }
 
@@ -946,18 +1076,5 @@ public class JdbcTransactionPersistence {
 
   private static @Nullable Instant toInstant(@Nullable Timestamp ts) {
     return ts == null ? null : ts.toInstant();
-  }
-
-  public static List<Long> parseXipList(@Nullable String xipList) {
-    if (xipList == null || xipList.isBlank()) return List.of();
-    return Arrays.stream(xipList.split(","))
-        .map(String::trim)
-        .filter(s -> !s.isEmpty())
-        .map(Long::parseLong)
-        .collect(Collectors.toList());
-  }
-
-  private static String placeholders(int count) {
-    return "?,".repeat(count).replaceAll(",$", "");
   }
 }

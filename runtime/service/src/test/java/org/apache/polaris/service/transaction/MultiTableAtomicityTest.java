@@ -40,19 +40,19 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 /**
- * Unit tests for the multi-table write atomicity fix.
+ * Unit tests for multi-table write atomicity under the {@code commit_scn} model.
  *
- * <p>Covers:
+ * <p>In the new model a multi-table commit allocates a <b>single</b> {@code commit_scn} inside one
+ * JDBC transaction and stamps it on every table's {@code committed_table_snapshots} row (see {@code
+ * JdbcBasePersistenceImpl.writeEntitiesWithSnapshotRecords}). These tests exercise that contract at
+ * the persistence layer via {@link #batchCommitWithSharedScn} — allocate one scn, insert all rows
+ * in one transaction — and verify:
  *
  * <ul>
- *   <li>All rows in a batch commit share a single {@code committed_txn_id}.
- *   <li>A MVCC snapshot taken <em>before</em> {@link
- *       JdbcTransactionPersistence#insertBatchCommittedTableSnapshots} sees <em>neither</em>
- *       table's new state.
- *   <li>A snapshot taken <em>after</em> the batch insert sees <em>both</em> tables.
- *   <li>Contrast: the legacy per-row insert path gives each table a distinct {@code
- *       committed_txn_id}, which would allow a snapshot taken between two inserts to see a
- *       partial state.
+ *   <li>All rows in a batch commit share a single {@code commit_scn}.
+ *   <li>A snapshot taken <em>before</em> the batch commit sees <em>neither</em> table's new state.
+ *   <li>A snapshot taken <em>after</em> the batch commit sees <em>both</em> tables.
+ *   <li>Contrast: separate single-table commits get distinct {@code commit_scn}s.
  * </ul>
  */
 class MultiTableAtomicityTest {
@@ -105,84 +105,95 @@ class MultiTableAtomicityTest {
     service = new TransactionService(persistence, new LockManager(persistence));
   }
 
+  /**
+   * Commits several tables atomically: allocates one {@code commit_scn} and inserts all rows in a
+   * single JDBC transaction, mirroring {@code writeEntitiesWithSnapshotRecords}. Returns the shared
+   * scn.
+   */
+  private long batchCommitWithSharedScn(CommittedTableSnapshotRow... rows) throws Exception {
+    if (rows.length == 0) {
+      return 0L;
+    }
+    try (Connection conn = dataSource.getConnection()) {
+      conn.setAutoCommit(false);
+      long scn = persistence.allocateCommitScn(conn);
+      for (CommittedTableSnapshotRow row : rows) {
+        persistence.insertCommittedTableSnapshot(
+            conn,
+            new CommittedTableSnapshotRow(
+                row.tableUuid(), scn, row.icebergSnapshotId(), row.metadataLocation()));
+      }
+      conn.commit();
+      return scn;
+    }
+  }
+
+  /** Commits a single table on its own, allocating its own commit_scn. */
+  private void singleCommit(String tableUuid, String metadataLocation) throws Exception {
+    persistence.insertCommittedTableSnapshotRow(
+        new CommittedTableSnapshotRow(
+            tableUuid, JdbcTransactionPersistence.UNASSIGNED_SCN, null, metadataLocation));
+  }
+
   // ---------------------------------------------------------------------------
-  // Shared committed_txn_id
+  // Shared commit_scn
   // ---------------------------------------------------------------------------
 
-  /**
-   * All rows inserted via {@code insertBatchCommittedTableSnapshots} must share a single
-   * committed_txn_id. This is the core MVCC atomicity guarantee: readers see all-or-nothing.
-   */
   @Test
-  void batchInsertAllRowsShareSingleCommittedTxnId() throws Exception {
+  void batchInsertAllRowsShareSingleCommitScn() throws Exception {
     String table1 = "entity-101";
     String table2 = "entity-102";
     String table3 = "entity-103";
 
-    List<CommittedTableSnapshotRow> rows =
-        List.of(
-            new CommittedTableSnapshotRow(table1, 0L, null, "s3://t1/v2.json"),
-            new CommittedTableSnapshotRow(table2, 0L, null, "s3://t2/v2.json"),
-            new CommittedTableSnapshotRow(table3, 0L, null, "s3://t3/v2.json"));
+    batchCommitWithSharedScn(
+        new CommittedTableSnapshotRow(table1, 0L, null, "s3://t1/v2.json"),
+        new CommittedTableSnapshotRow(table2, 0L, null, "s3://t2/v2.json"),
+        new CommittedTableSnapshotRow(table3, 0L, null, "s3://t3/v2.json"));
 
-    persistence.insertBatchCommittedTableSnapshots(rows);
-
-    // All three rows should share the same committed_txn_id
-    List<Long> txnIds = readAllCommittedTxnIds(table1, table2, table3);
-    assertThat(txnIds).hasSize(3);
-    assertThat(txnIds.stream().distinct().count())
-        .as("all batch rows must share a single committed_txn_id")
+    List<Long> scns = readAllCommitScns(table1, table2, table3);
+    assertThat(scns).hasSize(3);
+    assertThat(scns.stream().distinct().count())
+        .as("all batch rows must share a single commit_scn")
         .isEqualTo(1);
   }
 
   @Test
-  void batchInsertUsesNewTxnIdNotPlaceholder() throws Exception {
+  void batchInsertUsesNonZeroCommitScn() throws Exception {
     String table = "entity-200";
-    persistence.insertBatchCommittedTableSnapshots(
-        List.of(new CommittedTableSnapshotRow(table, 0L, null, "s3://t/v1.json")));
+    batchCommitWithSharedScn(new CommittedTableSnapshotRow(table, 0L, null, "s3://t/v1.json"));
 
-    List<Long> ids = readAllCommittedTxnIds(table);
-    assertThat(ids).hasSize(1);
-    assertThat(ids.get(0)).as("committed_txn_id must be a real sequence value, not 0").isNotZero();
+    List<Long> scns = readAllCommitScns(table);
+    assertThat(scns).hasSize(1);
+    assertThat(scns.get(0)).as("commit_scn must be a real allocated value, not 0").isNotZero();
   }
 
   @Test
   void emptyBatchIsNoOp() throws Exception {
-    // Should not throw
-    persistence.insertBatchCommittedTableSnapshots(List.of());
+    // Should not throw and should allocate nothing.
+    assertThat(batchCommitWithSharedScn()).isEqualTo(0L);
   }
 
   // ---------------------------------------------------------------------------
   // MVCC snapshot isolation: pre-snapshot sees neither table
   // ---------------------------------------------------------------------------
 
-  /**
-   * A TxnSnapshot acquired <em>before</em> the batch insert must see <em>neither</em> table's new
-   * state. Without the batch insert, the old per-row path would write rows with separate txn IDs,
-   * and a snapshot taken between two inserts would see a partial update.
-   */
   @Test
   void preSnapshotSeesNeitherTableAfterBatchCommit() throws Exception {
     String orders = "entity-orders-1";
     String customers = "entity-customers-1";
 
-    // Establish baseline visibility (previous versions)
-    persistence.insertCommittedTableSnapshotRow(
-        new CommittedTableSnapshotRow(orders, persistence.nextTxnId(), null, "s3://orders/v1.json"));
-    persistence.insertCommittedTableSnapshotRow(
-        new CommittedTableSnapshotRow(
-            customers, persistence.nextTxnId(), null, "s3://customers/v1.json"));
+    // Baseline (v1) for both tables — committed before the snapshot.
+    singleCommit(orders, "s3://orders/v1.json");
+    singleCommit(customers, "s3://customers/v1.json");
 
-    // Snapshot acquired BEFORE the multi-table commit
+    // Snapshot acquired BEFORE the multi-table commit.
     TxnSnapshotRow snap = service.createTransactionSnapshot(3600);
 
-    // Batch commit of new versions for both tables — single committed_txn_id after snap.xmax
-    persistence.insertBatchCommittedTableSnapshots(
-        List.of(
-            new CommittedTableSnapshotRow(orders, 0L, null, "s3://orders/v2.json"),
-            new CommittedTableSnapshotRow(customers, 0L, null, "s3://customers/v2.json")));
+    // Batch commit of new versions — single commit_scn above the snapshot's read_point.
+    batchCommitWithSharedScn(
+        new CommittedTableSnapshotRow(orders, 0L, null, "s3://orders/v2.json"),
+        new CommittedTableSnapshotRow(customers, 0L, null, "s3://customers/v2.json"));
 
-    // Pre-snapshot must still see v1 for both tables — v2 committed after snap.xmax
     assertThat(service.resolveTableMetadataLocation(orders, snap.txnSnapshotId()))
         .as("orders: pre-snapshot must see v1, not v2")
         .hasValue("s3://orders/v1.json");
@@ -191,22 +202,17 @@ class MultiTableAtomicityTest {
         .hasValue("s3://customers/v1.json");
   }
 
-  /**
-   * A TxnSnapshot acquired <em>before</em> the first commit must see <em>no</em> state for either
-   * table (not just the old version — here there is no old version at all).
-   */
   @Test
   void preSnapshotSeesNothingWhenTablesNotYetCommitted() throws Exception {
     String orders = "entity-orders-fresh-1";
     String customers = "entity-customers-fresh-1";
 
-    // Snapshot BEFORE any commit
+    // Snapshot BEFORE any commit (read_point = 0).
     TxnSnapshotRow snap = service.createTransactionSnapshot(3600);
 
-    persistence.insertBatchCommittedTableSnapshots(
-        List.of(
-            new CommittedTableSnapshotRow(orders, 0L, null, "s3://orders/v1.json"),
-            new CommittedTableSnapshotRow(customers, 0L, null, "s3://customers/v1.json")));
+    batchCommitWithSharedScn(
+        new CommittedTableSnapshotRow(orders, 0L, null, "s3://orders/v1.json"),
+        new CommittedTableSnapshotRow(customers, 0L, null, "s3://customers/v1.json"));
 
     assertThat(service.resolveTableMetadataLocation(orders, snap.txnSnapshotId()))
         .as("orders: no commit visible before snapshot")
@@ -220,21 +226,16 @@ class MultiTableAtomicityTest {
   // MVCC snapshot isolation: post-snapshot sees BOTH tables
   // ---------------------------------------------------------------------------
 
-  /**
-   * A TxnSnapshot acquired <em>after</em> the batch insert must see <em>both</em> tables' new
-   * state. This confirms the batch insert committed successfully and MVCC picks it up.
-   */
   @Test
   void postSnapshotSeesBothTablesAfterBatchCommit() throws Exception {
     String orders = "entity-orders-2";
     String customers = "entity-customers-2";
 
-    persistence.insertBatchCommittedTableSnapshots(
-        List.of(
-            new CommittedTableSnapshotRow(orders, 0L, null, "s3://orders/v2.json"),
-            new CommittedTableSnapshotRow(customers, 0L, null, "s3://customers/v2.json")));
+    batchCommitWithSharedScn(
+        new CommittedTableSnapshotRow(orders, 0L, null, "s3://orders/v2.json"),
+        new CommittedTableSnapshotRow(customers, 0L, null, "s3://customers/v2.json"));
 
-    // Snapshot AFTER the batch commit
+    // Snapshot AFTER the batch commit.
     TxnSnapshotRow snap = service.createTransactionSnapshot(3600);
 
     assertThat(service.resolveTableMetadataLocation(orders, snap.txnSnapshotId()))
@@ -246,94 +247,64 @@ class MultiTableAtomicityTest {
   }
 
   // ---------------------------------------------------------------------------
-  // Contrast: per-row inserts have separate txn IDs (showing the old gap)
+  // Contrast: separate single-table commits get distinct commit_scns
   // ---------------------------------------------------------------------------
 
-  /**
-   * Documents the MVCC gap present in the legacy per-row path: two separate {@code
-   * insertCommittedTableSnapshotRow} calls produce distinct {@code committed_txn_id} values. A
-   * snapshot taken between them would see table 1 but not table 2 — partial state.
-   *
-   * <p>This test does <em>not</em> assert a bug; it documents the expected behavior difference
-   * between per-row and batch inserts to motivate the batch approach.
-   */
   @Test
-  void perRowInsertGivesSeparateTxnIdsUnlikeBatch() throws Exception {
+  void separateSingleCommitsGetDistinctScnsUnlikeBatch() throws Exception {
     String table1 = "entity-separate-1";
     String table2 = "entity-separate-2";
 
-    long id1 = persistence.nextTxnId();
-    persistence.insertCommittedTableSnapshotRow(
-        new CommittedTableSnapshotRow(table1, id1, null, "s3://t1/v1.json"));
-    long id2 = persistence.nextTxnId();
-    persistence.insertCommittedTableSnapshotRow(
-        new CommittedTableSnapshotRow(table2, id2, null, "s3://t2/v1.json"));
+    singleCommit(table1, "s3://t1/v1.json");
+    singleCommit(table2, "s3://t2/v1.json");
 
-    assertThat(id1).isNotEqualTo(id2);
-
-    // Snapshot taken between id1 and id2 would see table1 but not table2
-    // (We simulate this by manually checking the committed_txn_ids)
-    List<Long> perRowIds = readAllCommittedTxnIds(table1, table2);
-    assertThat(perRowIds.stream().distinct().count())
-        .as("per-row inserts give distinct committed_txn_ids (no MVCC atomicity)")
+    List<Long> perRowScns = readAllCommitScns(table1, table2);
+    assertThat(perRowScns.stream().distinct().count())
+        .as("separate single-table commits get distinct commit_scns")
         .isEqualTo(2);
 
-    // Contrast: batch inserts share one txn_id
+    // Contrast: a batch commit shares one commit_scn.
     String bTable1 = "entity-batch-1";
     String bTable2 = "entity-batch-2";
-    persistence.insertBatchCommittedTableSnapshots(
-        List.of(
-            new CommittedTableSnapshotRow(bTable1, 0L, null, "s3://b1/v1.json"),
-            new CommittedTableSnapshotRow(bTable2, 0L, null, "s3://b2/v1.json")));
+    batchCommitWithSharedScn(
+        new CommittedTableSnapshotRow(bTable1, 0L, null, "s3://b1/v1.json"),
+        new CommittedTableSnapshotRow(bTable2, 0L, null, "s3://b2/v1.json"));
 
-    List<Long> batchIds = readAllCommittedTxnIds(bTable1, bTable2);
-    assertThat(batchIds.stream().distinct().count())
-        .as("batch insert gives a single committed_txn_id (MVCC atomic)")
+    List<Long> batchScns = readAllCommitScns(bTable1, bTable2);
+    assertThat(batchScns.stream().distinct().count())
+        .as("batch commit shares a single commit_scn (MVCC atomic)")
         .isEqualTo(1);
   }
 
   // ---------------------------------------------------------------------------
-  // Multi-table txn snapshot: snapshot taken mid-batch sees consistent old state
+  // Full atomicity scenario
   // ---------------------------------------------------------------------------
 
-  /**
-   * Simulates the full atomicity scenario: reader holds a snapshot, writer commits two tables via
-   * batch insert, reader verifies it sees a consistent (all-old or all-new) view.
-   *
-   * <p>Since the batch uses a single {@code committed_txn_id > snap.xmax}, the snapshot sees
-   * neither table updated.
-   */
   @Test
   void snapshotTakenBeforeBatchCommitSeesConsistentOldState() throws Exception {
     String orders = "entity-orders-3";
     String customers = "entity-customers-3";
 
-    // Old state for both tables
-    persistence.insertCommittedTableSnapshotRow(
-        new CommittedTableSnapshotRow(orders, persistence.nextTxnId(), null, "s3://orders/v1.json"));
-    persistence.insertCommittedTableSnapshotRow(
-        new CommittedTableSnapshotRow(
-            customers, persistence.nextTxnId(), null, "s3://customers/v1.json"));
+    singleCommit(orders, "s3://orders/v1.json");
+    singleCommit(customers, "s3://customers/v1.json");
 
-    // Reader pins a snapshot here
+    // Reader pins a snapshot here.
     TxnSnapshotRow readerSnap = service.createTransactionSnapshot(3600);
 
-    // Writer batch-commits new versions
-    persistence.insertBatchCommittedTableSnapshots(
-        List.of(
-            new CommittedTableSnapshotRow(orders, 0L, null, "s3://orders/v2.json"),
-            new CommittedTableSnapshotRow(customers, 0L, null, "s3://customers/v2.json")));
+    // Writer batch-commits new versions.
+    batchCommitWithSharedScn(
+        new CommittedTableSnapshotRow(orders, 0L, null, "s3://orders/v2.json"),
+        new CommittedTableSnapshotRow(customers, 0L, null, "s3://customers/v2.json"));
 
-    // Reader's snapshot: both tables still at v1
-    String ordersAtSnap =
-        service.resolveTableMetadataLocation(orders, readerSnap.txnSnapshotId()).orElse(null);
-    String customersAtSnap =
-        service.resolveTableMetadataLocation(customers, readerSnap.txnSnapshotId()).orElse(null);
+    // Reader's snapshot: both tables still at v1.
+    assertThat(service.resolveTableMetadataLocation(orders, readerSnap.txnSnapshotId()))
+        .as("orders should be at v1 under reader's snapshot")
+        .hasValue("s3://orders/v1.json");
+    assertThat(service.resolveTableMetadataLocation(customers, readerSnap.txnSnapshotId()))
+        .as("customers should be at v1 under reader's snapshot")
+        .hasValue("s3://customers/v1.json");
 
-    assertThat(ordersAtSnap).as("orders should be at v1 under reader's snapshot").isEqualTo("s3://orders/v1.json");
-    assertThat(customersAtSnap).as("customers should be at v1 under reader's snapshot").isEqualTo("s3://customers/v1.json");
-
-    // Fresh snapshot after commit: both tables at v2
+    // Fresh snapshot after commit: both tables at v2.
     TxnSnapshotRow freshSnap = service.createTransactionSnapshot(3600);
     assertThat(service.resolveTableMetadataLocation(orders, freshSnap.txnSnapshotId()))
         .hasValue("s3://orders/v2.json");
@@ -345,16 +316,16 @@ class MultiTableAtomicityTest {
   // Helper
   // ---------------------------------------------------------------------------
 
-  /** Queries committed_txn_id for all given table_uuids in this realm/catalog. */
-  private List<Long> readAllCommittedTxnIds(String... tableUuids) throws Exception {
+  /** Queries commit_scn for all given table_uuids in this realm/catalog. */
+  private List<Long> readAllCommitScns(String... tableUuids) throws Exception {
     List<Long> result = new ArrayList<>();
     String placeholders = "?,".repeat(tableUuids.length);
     placeholders = placeholders.substring(0, placeholders.length() - 1);
     String sql =
-        "SELECT committed_txn_id FROM POLARIS_SCHEMA.committed_table_snapshots "
+        "SELECT commit_scn FROM POLARIS_SCHEMA.committed_table_snapshots "
             + "WHERE realm_id = ? AND catalog_id = ? AND table_uuid IN ("
             + placeholders
-            + ") ORDER BY committed_txn_id";
+            + ") ORDER BY commit_scn";
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
       ps.setString(1, realm);
@@ -364,7 +335,7 @@ class MultiTableAtomicityTest {
       }
       try (ResultSet rs = ps.executeQuery()) {
         while (rs.next()) {
-          result.add(rs.getLong("committed_txn_id"));
+          result.add(rs.getLong("commit_scn"));
         }
       }
     }

@@ -150,7 +150,8 @@ public class TransactionManagerTest {
   @Test
   public void testSetIsolationLevelThrowsIfActive() {
     // Simulate ACTIVE state: both pending and txn_id are set
-    confStore.put(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG), "REPEATABLE_READ");
+    confStore.put(
+        String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG), "REPEATABLE_READ");
     confStore.put(String.format(TransactionManager.CONF_TXN_ID, CATALOG), "42");
 
     assertThatThrownBy(() -> txnManager.setIsolationLevel(mockSpark, "READ_COMMITTED"))
@@ -185,12 +186,16 @@ public class TransactionManagerTest {
     TableIdentifier ident = TableIdentifier.of(Namespace.of("ns"), "orders");
     Optional<String> result = txnManager.resolveMetadataLocation(mockSpark, ident);
 
-    verify(mockRestCatalog).beginTransaction("REPEATABLE_READ", TransactionManager.DEFAULT_LEASE_SECONDS);
+    verify(mockRestCatalog)
+        .beginTransaction("REPEATABLE_READ", TransactionManager.DEFAULT_LEASE_SECONDS);
     assertThat(result).hasValue("file:///tmp/metadata/v5.metadata.json");
     // txn_id and token should be stored in conf
-    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_ID, CATALOG))).isEqualTo("123");
-    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG))).isEqualTo("tok");
-    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_SNAPSHOT_ID, CATALOG))).isEqualTo("47");
+    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_ID, CATALOG)))
+        .isEqualTo("123");
+    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG)))
+        .isEqualTo("tok");
+    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_SNAPSHOT_ID, CATALOG)))
+        .isEqualTo("47");
   }
 
   @Test
@@ -233,7 +238,8 @@ public class TransactionManagerTest {
 
   @Test
   public void testCommitCallsRestWhenActive() {
-    confStore.put(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG), "REPEATABLE_READ");
+    confStore.put(
+        String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG), "REPEATABLE_READ");
     confStore.put(String.format(TransactionManager.CONF_TXN_ID, CATALOG), "42");
     confStore.put(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG), "secret");
     confStore.put(String.format(TransactionManager.CONF_TXN_SNAPSHOT_ID, CATALOG), "7");
@@ -242,7 +248,8 @@ public class TransactionManagerTest {
 
     verify(mockRestCatalog).commitTransaction(eq(42L), eq("secret"), anyList());
     // conf should be cleared
-    assertThat(confStore.get(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG))).isNull();
+    assertThat(confStore.get(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG)))
+        .isNull();
     assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_ID, CATALOG))).isNull();
   }
 
@@ -253,7 +260,8 @@ public class TransactionManagerTest {
     txnManager.commit(mockSpark);
 
     verify(mockRestCatalog, never()).commitTransaction(anyLong(), anyString(), anyList());
-    assertThat(confStore.get(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG))).isNull();
+    assertThat(confStore.get(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG)))
+        .isNull();
   }
 
   @Test
@@ -269,14 +277,16 @@ public class TransactionManagerTest {
 
   @Test
   public void testRollbackCallsAbortWhenActive() {
-    confStore.put(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG), "REPEATABLE_READ");
+    confStore.put(
+        String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG), "REPEATABLE_READ");
     confStore.put(String.format(TransactionManager.CONF_TXN_ID, CATALOG), "55");
     confStore.put(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG), "tok55");
 
     txnManager.rollback(mockSpark);
 
     verify(mockRestCatalog).abortTransaction(55L, "tok55");
-    assertThat(confStore.get(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG))).isNull();
+    assertThat(confStore.get(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG)))
+        .isNull();
   }
 
   // -------------------------------------------------------------------------
@@ -291,7 +301,8 @@ public class TransactionManagerTest {
     when(txnResp.txnSnapshotId()).thenReturn(50L);
     when(mockRestCatalog.beginTransaction(anyString(), anyInt())).thenReturn(txnResp);
     SubtransactionRESTResponse subtxnResp = mock(SubtransactionRESTResponse.class);
-    when(mockRestCatalog.createSubtransaction(anyLong(), anyString(), anyString(), anyString(), anyInt()))
+    when(mockRestCatalog.createSubtransaction(
+            anyLong(), anyString(), anyString(), anyString(), anyInt()))
         .thenReturn(subtxnResp);
 
     txnManager.begin(mockSpark, "REPEATABLE_READ"); // PENDING — no REST call yet
@@ -299,37 +310,55 @@ public class TransactionManagerTest {
     txnManager.createSubtransactionForOrchestrator(mockSpark, orders, "ROW_EXCLUSIVE");
 
     // beginTransaction must have fired on the first CREATE SUBTRANSACTION FOR
-    verify(mockRestCatalog).beginTransaction("REPEATABLE_READ", TransactionManager.DEFAULT_LEASE_SECONDS);
-    verify(mockRestCatalog).createSubtransaction(
-        10L, "tok10", "demo_ns.orders", "ROW_EXCLUSIVE", TransactionManager.DEFAULT_LEASE_SECONDS);
-    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_ID, CATALOG))).isEqualTo("10");
-    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG))).isEqualTo("tok10");
-    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_SNAPSHOT_ID, CATALOG))).isEqualTo("50");
+    verify(mockRestCatalog)
+        .beginTransaction("REPEATABLE_READ", TransactionManager.DEFAULT_LEASE_SECONDS);
+    verify(mockRestCatalog)
+        .createSubtransaction(
+            10L,
+            "tok10",
+            "demo_ns.orders",
+            "ROW_EXCLUSIVE",
+            TransactionManager.DEFAULT_LEASE_SECONDS);
+    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_ID, CATALOG)))
+        .isEqualTo("10");
+    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG)))
+        .isEqualTo("tok10");
+    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_SNAPSHOT_ID, CATALOG)))
+        .isEqualTo("50");
   }
 
   @Test
   public void testCreateSubtransactionDoesNotRebegindWhenAlreadyActive() {
     // Pre-set ACTIVE state (txn_id already present)
-    confStore.put(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG), "REPEATABLE_READ");
+    confStore.put(
+        String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG), "REPEATABLE_READ");
     confStore.put(String.format(TransactionManager.CONF_TXN_ID, CATALOG), "99");
     confStore.put(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG), "tok99");
     SubtransactionRESTResponse subtxnResp = mock(SubtransactionRESTResponse.class);
-    when(mockRestCatalog.createSubtransaction(anyLong(), anyString(), anyString(), anyString(), anyInt()))
+    when(mockRestCatalog.createSubtransaction(
+            anyLong(), anyString(), anyString(), anyString(), anyInt()))
         .thenReturn(subtxnResp);
 
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
     txnManager.createSubtransactionForOrchestrator(mockSpark, orders, "ROW_EXCLUSIVE");
 
     verify(mockRestCatalog, never()).beginTransaction(anyString(), anyInt());
-    verify(mockRestCatalog).createSubtransaction(
-        99L, "tok99", "demo_ns.orders", "ROW_EXCLUSIVE", TransactionManager.DEFAULT_LEASE_SECONDS);
+    verify(mockRestCatalog)
+        .createSubtransaction(
+            99L,
+            "tok99",
+            "demo_ns.orders",
+            "ROW_EXCLUSIVE",
+            TransactionManager.DEFAULT_LEASE_SECONDS);
   }
 
   @Test
   public void testCreateSubtransactionThrowsWhenNoTransaction() {
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
 
-    assertThatThrownBy(() -> txnManager.createSubtransactionForOrchestrator(mockSpark, orders, "ROW_EXCLUSIVE"))
+    assertThatThrownBy(
+            () ->
+                txnManager.createSubtransactionForOrchestrator(mockSpark, orders, "ROW_EXCLUSIVE"))
         .isInstanceOf(IllegalStateException.class)
         .hasMessageContaining("No active transaction");
   }
@@ -369,7 +398,9 @@ public class TransactionManagerTest {
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
 
     assertThatThrownBy(
-            () -> txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "ROW_EXCLUSIVE"))
+            () ->
+                txnManager.beginWorkerSubtransaction(
+                    mockSpark, 42L, "subtok", orders, "ROW_EXCLUSIVE"))
         .isInstanceOf(IllegalStateException.class)
         .hasMessageContaining("Transaction already in progress");
   }
@@ -420,7 +451,8 @@ public class TransactionManagerTest {
 
     txnManager.rollbackWorkerSubtransaction(mockSpark);
 
-    verify(mockRestCatalog, never()).commitSubtransaction(anyLong(), anyLong(), anyString(), anyString());
+    verify(mockRestCatalog, never())
+        .commitSubtransaction(anyLong(), anyLong(), anyString(), anyString());
     assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_SUBTXN_ID, CATALOG)))
         .isNull();
   }

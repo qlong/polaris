@@ -95,7 +95,8 @@ class TransactionConflictTest {
         DatasourceOperations.class.getClassLoader().getResourceAsStream("h2/schema-v5.sql");
     ops.executeScript(schema);
 
-    persistence = new JdbcTransactionPersistence(dataSource, DatabaseType.H2, "realm-test", CATALOG_ID);
+    persistence =
+        new JdbcTransactionPersistence(dataSource, DatabaseType.H2, "realm-test", CATALOG_ID);
     service = new TransactionService(persistence, new LockManager(persistence));
   }
 
@@ -110,9 +111,9 @@ class TransactionConflictTest {
   }
 
   /**
-   * Creates an operation for {@code TABLE_UUID} and marks it COMMITTED with the staged path.
-   * The {@code server_base_metadata_location} is set by {@code createOperation} at creation time —
-   * so call this BEFORE simulating concurrent commits.
+   * Creates an operation for {@code TABLE_UUID} and marks it COMMITTED with the staged path. The
+   * {@code server_base_metadata_location} is set by {@code createOperation} at creation time — so
+   * call this BEFORE simulating concurrent commits.
    */
   private long beginOpAndStage(long txnId, String txnToken, String lockMode) throws Exception {
     var op =
@@ -164,10 +165,28 @@ class TransactionConflictTest {
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
 
     // Create and stage operations for both tables before any new commit
-    var subA = service.createOperation(txn.txnId(), txn.txnToken(), tableA, "ROW_EXCLUSIVE", null, null, 3600, "s3://bucket/a/metadata");
+    var subA =
+        service.createOperation(
+            txn.txnId(),
+            txn.txnToken(),
+            tableA,
+            "ROW_EXCLUSIVE",
+            null,
+            null,
+            3600,
+            "s3://bucket/a/metadata");
     service.commitOperation(txn.txnId(), subA.opId(), subA.opToken(), subA.assignedStagingPath());
 
-    var subB = service.createOperation(txn.txnId(), txn.txnToken(), tableB, "ROW_EXCLUSIVE", null, null, 3600, "s3://bucket/b/metadata");
+    var subB =
+        service.createOperation(
+            txn.txnId(),
+            txn.txnToken(),
+            tableB,
+            "ROW_EXCLUSIVE",
+            null,
+            null,
+            3600,
+            "s3://bucket/b/metadata");
     service.commitOperation(txn.txnId(), subB.opId(), subB.opToken(), subB.assignedStagingPath());
 
     var result = service.prepareCommit(txn.txnId(), txn.txnToken());
@@ -210,7 +229,8 @@ class TransactionConflictTest {
 
     // ROW_EXCLUSIVE conflict does NOT abort the transaction — it goes to merge-retry
     assertThat(result.mergeRetry()).hasSize(1);
-    JdbcTransactionPersistence.TransactionRow txnRow = persistence.findTransaction(txn.txnId()).orElseThrow();
+    JdbcTransactionPersistence.TransactionRow txnRow =
+        persistence.findTransaction(txn.txnId()).orElseThrow();
     assertThat(txnRow.status()).isEqualTo(JdbcTransactionPersistence.TXN_STATUS_IN_PROGRESS);
   }
 
@@ -223,11 +243,31 @@ class TransactionConflictTest {
 
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
 
-    var subClean = service.createOperation(txn.txnId(), txn.txnToken(), cleanTable, "ROW_EXCLUSIVE", null, null, 3600, "s3://bucket/clean/metadata");
-    service.commitOperation(txn.txnId(), subClean.opId(), subClean.opToken(), subClean.assignedStagingPath());
+    var subClean =
+        service.createOperation(
+            txn.txnId(),
+            txn.txnToken(),
+            cleanTable,
+            "ROW_EXCLUSIVE",
+            null,
+            null,
+            3600,
+            "s3://bucket/clean/metadata");
+    service.commitOperation(
+        txn.txnId(), subClean.opId(), subClean.opToken(), subClean.assignedStagingPath());
 
-    var subDirty = service.createOperation(txn.txnId(), txn.txnToken(), dirtyTable, "ROW_EXCLUSIVE", null, null, 3600, "s3://bucket/dirty/metadata");
-    service.commitOperation(txn.txnId(), subDirty.opId(), subDirty.opToken(), subDirty.assignedStagingPath());
+    var subDirty =
+        service.createOperation(
+            txn.txnId(),
+            txn.txnToken(),
+            dirtyTable,
+            "ROW_EXCLUSIVE",
+            null,
+            null,
+            3600,
+            "s3://bucket/dirty/metadata");
+    service.commitOperation(
+        txn.txnId(), subDirty.opId(), subDirty.opToken(), subDirty.assignedStagingPath());
 
     // Concurrent writer advances only dirtyTable
     commitTableVersion(dirtyTable, "s3://bucket/dirty/v2.json");
@@ -272,7 +312,8 @@ class TransactionConflictTest {
     } catch (TransactionService.SerializationFailureException ignored) {
     }
 
-    JdbcTransactionPersistence.TransactionRow txnRow = persistence.findTransaction(txn.txnId()).orElseThrow();
+    JdbcTransactionPersistence.TransactionRow txnRow =
+        persistence.findTransaction(txn.txnId()).orElseThrow();
     assertThat(txnRow.status())
         .as("transaction must be ABORTED after serialization failure")
         .isEqualTo(JdbcTransactionPersistence.TXN_STATUS_ABORTED);
@@ -295,7 +336,8 @@ class TransactionConflictTest {
     // After a serialization failure the transaction is ABORTED; prepareCommit again must reject.
     commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v1.json");
 
-    JdbcTransactionPersistence.TransactionRow txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
+    JdbcTransactionPersistence.TransactionRow txn =
+        service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
     long txnId = txn.txnId();
     String txnToken = txn.txnToken();
     beginOpAndStage(txnId, txnToken, "EXCLUSIVE");

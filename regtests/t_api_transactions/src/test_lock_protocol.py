@@ -34,6 +34,9 @@ Conflict semantics:
   - ROW_EXCLUSIVE blocked by EXCLUSIVE/AX  → 409 type≠"LockConflictError" (fail-fast)
 """
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 
@@ -405,3 +408,65 @@ class TestLockScope:
         assert r1.status_code == 200, f"EXCLUSIVE on orders failed: {r1.text}"
         assert r2.status_code == 200, f"EXCLUSIVE on customers failed: {r2.text}"
         assert r1.json()["subtxn_id"] != r2.json()["subtxn_id"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: concurrent acquisition (the grant decision is serialized)
+# ---------------------------------------------------------------------------
+
+class TestConcurrentAcquire:
+    """Fire N EXCLUSIVE acquisitions on the SAME table at the same instant and assert
+    exactly one wins.
+
+    Each acquisition comes from an independent transaction; a barrier releases all N
+    ``createSubtransaction(EXCLUSIVE)`` calls simultaneously to maximize the race. The
+    server must grant exactly one and reject the rest with a retryable 409 — never two
+    EXCLUSIVE grants on one table.
+
+    The grant decision is serialized in the catalog's database (a per-resource
+    ``SELECT ... FOR UPDATE`` anchor), not by an in-process lock — so this holds even
+    when the racing requests are served by different Polaris nodes sharing one database.
+    (Proving the strict *two-nodes* case needs two coordinator instances and lives in the
+    JUnit L3 test ``TxnConcurrencyTest.concurrentExclusiveAcquireAcrossNodesGrantsExactlyOne``;
+    this e2e test exercises the same DB-level path through the live REST server.)
+    """
+
+    def test_concurrent_exclusive_acquire_grants_exactly_one(
+        self, client, namespace, table_orders
+    ):
+        n = 6
+        # Begin all transactions first, so the race is purely on the acquire call.
+        txns = [_begin(client) for _ in range(n)]
+        barrier = threading.Barrier(n)
+        results: list = [None] * n
+
+        def worker(i: int):
+            try:
+                barrier.wait(timeout=15)  # all workers fire acquire together
+                resp = _create_subtxn(client, txns[i], namespace, table_orders, "EXCLUSIVE")
+                retryable = _is_retryable_conflict(resp) if resp.status_code == 409 else None
+                results[i] = (resp.status_code, retryable, resp.text)
+            except Exception as e:  # noqa: BLE001 - record, don't let the pool swallow it
+                results[i] = ("error", None, repr(e))
+
+        try:
+            with ThreadPoolExecutor(max_workers=n) as pool:
+                list(pool.map(worker, range(n)))
+
+            granted = [r for r in results if r and r[0] == 200]
+            conflicts = [r for r in results if r and r[0] == 409]
+            errors = [r for r in results if r and r[0] == "error"]
+
+            assert not errors, f"unexpected errors during concurrent acquire: {errors}"
+            assert len(granted) == 1, (
+                f"exactly ONE EXCLUSIVE must be granted on the same table; got {results}"
+            )
+            assert len(conflicts) == n - 1, (
+                f"every other acquirer must get 409; got {results}"
+            )
+            assert all(c[1] for c in conflicts), (
+                f"EXCLUSIVE conflicts must be retryable (LockConflictError); got {results}"
+            )
+        finally:
+            for t in txns:
+                _abort(client, t)

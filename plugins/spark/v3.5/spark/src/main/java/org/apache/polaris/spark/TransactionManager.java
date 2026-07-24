@@ -196,7 +196,9 @@ public class TransactionManager {
    *       staged path directly; no REST call
    *   <li>PENDING → calls beginTransaction REST, transitions to ACTIVE, then proceeds
    *   <li>ACTIVE + REPEATABLE_READ → calls resolveTableMetadataLocation, returns pinned path
-   *   <li>ACTIVE + READ_COMMITTED → returns empty (use normal loadTable)
+   *   <li>ACTIVE + READ_COMMITTED → returns empty; reads use the latest version. Worker sessions
+   *       still stage writes: SparkCatalog.loadTable wraps the live table in
+   *       PinnedTableOperations with the live metadata as the base (see loadTable).
    * </ul>
    */
   public Optional<String> resolveMetadataLocation(SparkSession spark, TableIdentifier ident) {
@@ -215,7 +217,11 @@ public class TransactionManager {
 
     String snapIdStr = getConf(spark, CONF_TXN_SNAPSHOT_ID);
     if (snapIdStr == null) {
-      // ACTIVE but READ_COMMITTED — load the latest version normally
+      // ACTIVE but READ_COMMITTED (no pinned snapshot) — reads use the latest committed version.
+      // For a worker session, SparkCatalog.loadTable still wraps the live table in
+      // PinnedTableOperations (using the live metadata as the base) so writes stage to the
+      // server-allocated path; here we simply signal "no pinned location" and let loadTable
+      // detect worker mode.
       return Optional.empty();
     }
 

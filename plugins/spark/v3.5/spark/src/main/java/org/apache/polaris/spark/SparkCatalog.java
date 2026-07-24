@@ -158,51 +158,22 @@ public class SparkCatalog
   @Override
   public Table loadTable(Identifier ident) throws NoSuchTableException {
     org.apache.spark.sql.SparkSession spark = org.apache.spark.sql.SparkSession.active();
+    TableIdentifier icebergIdent = toIcebergIdentifier(ident);
     java.util.Optional<String> metadataLocation =
-        txnManager.resolveMetadataLocation(spark, toIcebergIdentifier(ident));
+        txnManager.resolveMetadataLocation(spark, icebergIdent);
 
     if (metadataLocation.isPresent()) {
+      // REPEATABLE_READ (or read-your-own-writes): base is a pinned snapshot metadata file.
       Configuration conf = SparkUtil.hadoopConfCatalogOverrides(spark, catalogName);
       HadoopFileIO fileIO = new HadoopFileIO(conf);
       TableMetadata pinnedMetadata = TableMetadataParser.read(fileIO, metadataLocation.get());
+      Table wrapped = tryWrapPinned(spark, ident, icebergIdent, pinnedMetadata, fileIO);
+      if (wrapped != null) {
+        return wrapped;
+      }
+      // Read-only fallback when the live table cannot be loaded.
       LocationProvider locationProvider =
           LocationProviders.locationsFor(pinnedMetadata.location(), pinnedMetadata.properties());
-
-      // txnId is always set here because resolveMetadataLocation transitions PENDING → ACTIVE
-      // before returning a present value.
-      String txnIdStr = txnManager.getConf(spark, TransactionManager.CONF_TXN_ID);
-      long txnId = txnIdStr != null ? Long.parseLong(txnIdStr) : 0L;
-      TableIdentifier icebergIdent = toIcebergIdentifier(ident);
-
-      // Use PinnedTableOperations: reads see the pinned snapshot (REPEATABLE_READ), writes
-      // are staged locally and sent to the server inline at COMMIT time.
-      // Fall back to read-only StaticTableOperations only if the live table cannot be loaded.
-      try {
-        Table liveSparkTable = this.icebergsSparkCatalog.loadTable(ident);
-        if (liveSparkTable instanceof SparkTable sparkTable) {
-          org.apache.iceberg.Table liveIceberg = sparkTable.table();
-          if (liveIceberg instanceof BaseTable baseTable) {
-            TableOperations liveOps = baseTable.operations();
-            TableOperations ops =
-                new PinnedTableOperations(
-                    pinnedMetadata,
-                    fileIO,
-                    locationProvider,
-                    liveOps,
-                    txnManager,
-                    spark,
-                    icebergIdent,
-                    txnId);
-            org.apache.iceberg.Table icebergTable =
-                new BaseTable(
-                    ops, ident.namespace()[ident.namespace().length - 1] + "." + ident.name());
-            return newSparkTable(icebergTable);
-          }
-        }
-      } catch (Exception ignored) {
-        // fall through to static fallback
-      }
-
       StaticTableOperations ops =
           new StaticTableOperations(pinnedMetadata, fileIO, locationProvider);
       org.apache.iceberg.Table icebergTable =
@@ -210,11 +181,73 @@ public class SparkCatalog
       return newSparkTable(icebergTable);
     }
 
+    // Worker mode with no pinned snapshot (READ_COMMITTED parent): the worker must still stage
+    // its write to the server-allocated path, but its read base is the table's LATEST committed
+    // metadata (READ_COMMITTED = no pinning). Wrap the live table in PinnedTableOperations using
+    // the live metadata as the base so writes route to the staged path just like REPEATABLE_READ.
+    if (txnManager.isWorkerMode(spark)
+        && TransactionManager.identToKey(icebergIdent).equals(txnManager.getWorkerTable(spark))) {
+      Configuration conf = SparkUtil.hadoopConfCatalogOverrides(spark, catalogName);
+      HadoopFileIO fileIO = new HadoopFileIO(conf);
+      Table wrapped = tryWrapPinned(spark, ident, icebergIdent, null, fileIO);
+      if (wrapped != null) {
+        return wrapped;
+      }
+      // If the live table cannot be loaded, fall through to the normal load path below.
+    }
+
     try {
       return this.icebergsSparkCatalog.loadTable(ident);
     } catch (NoSuchTableException e) {
       return this.polarisSparkCatalog.loadTable(ident);
     }
+  }
+
+  /**
+   * Wraps the live Iceberg table in {@link PinnedTableOperations} so reads use {@code baseMetadata}
+   * and writes are staged. When {@code baseMetadata} is null the live table's current metadata is
+   * used as the base (READ_COMMITTED worker path — read latest, stage writes). Returns null if the
+   * live table is not a {@link BaseTable} (caller falls back).
+   */
+  private Table tryWrapPinned(
+      org.apache.spark.sql.SparkSession spark,
+      Identifier ident,
+      TableIdentifier icebergIdent,
+      TableMetadata baseMetadata,
+      HadoopFileIO fileIO) {
+    String txnIdStr = txnManager.getConf(spark, TransactionManager.CONF_TXN_ID);
+    long txnId = txnIdStr != null ? Long.parseLong(txnIdStr) : 0L;
+    try {
+      Table liveSparkTable = this.icebergsSparkCatalog.loadTable(ident);
+      if (liveSparkTable instanceof SparkTable sparkTable) {
+        org.apache.iceberg.Table liveIceberg = sparkTable.table();
+        if (liveIceberg instanceof BaseTable baseTable) {
+          TableOperations liveOps = baseTable.operations();
+          TableMetadata effectiveBase =
+              baseMetadata != null ? baseMetadata : liveOps.current();
+          LocationProvider locationProvider =
+              LocationProviders.locationsFor(
+                  effectiveBase.location(), effectiveBase.properties());
+          TableOperations ops =
+              new PinnedTableOperations(
+                  effectiveBase,
+                  fileIO,
+                  locationProvider,
+                  liveOps,
+                  txnManager,
+                  spark,
+                  icebergIdent,
+                  txnId);
+          org.apache.iceberg.Table icebergTable =
+              new BaseTable(
+                  ops, ident.namespace()[ident.namespace().length - 1] + "." + ident.name());
+          return newSparkTable(icebergTable);
+        }
+      }
+    } catch (Exception ignored) {
+      // caller handles the null (static fallback or normal load)
+    }
+    return null;
   }
 
   /**

@@ -20,6 +20,8 @@ package org.apache.polaris.spark;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -433,8 +435,7 @@ public class TransactionManagerTest {
 
     txnManager.commitWorkerSubtransaction(mockSpark);
 
-    verify(mockRestCatalog)
-        .commitSubtransaction(7L, 42L, "subtok", "file:///tmp/txn-42.metadata.json");
+    verify(mockRestCatalog).commitSubtransaction(7L, 42L, "subtok");
     // All conf cleared after commit
     assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_SUBTXN_ID, CATALOG)))
         .isNull();
@@ -445,14 +446,30 @@ public class TransactionManagerTest {
   }
 
   @Test
-  public void testRollbackWorkerSubtransactionClearsConfWithoutRestCall() {
+  public void testRollbackWorkerSubtransactionReopensForRetryAndClearsConf() {
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
     txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "ROW_EXCLUSIVE");
 
     txnManager.rollbackWorkerSubtransaction(mockSpark);
 
+    // rollback reopens the unit (reopen_for_retry=true) and does NOT commit it
+    verify(mockRestCatalog).rollbackSubtransaction(7L, 42L, "subtok", null, true);
+    verify(mockRestCatalog, never()).commitSubtransaction(anyLong(), anyLong(), anyString());
+    assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_SUBTXN_ID, CATALOG)))
+        .isNull();
+  }
+
+  @Test
+  public void testAbortWorkerSubtransactionAbandonsAndClearsConf() {
+    TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
+    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "ROW_EXCLUSIVE");
+
+    txnManager.abortWorkerSubtransaction(mockSpark);
+
+    // abort abandons permanently (no reopen) via the /abort endpoint
+    verify(mockRestCatalog).abortSubtransaction(7L, 42L, "subtok");
     verify(mockRestCatalog, never())
-        .commitSubtransaction(anyLong(), anyLong(), anyString(), anyString());
+        .rollbackSubtransaction(anyLong(), anyLong(), anyString(), any(), anyBoolean());
     assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_SUBTXN_ID, CATALOG)))
         .isNull();
   }

@@ -62,9 +62,11 @@ val transactionModels =
     // CommitTransactionRequest is hand-written — name collision with Iceberg spec.
     // See the Javadoc in CommitTransactionRequest.java for details.
     "StagedTableCommit",
+    "SubtransactionTable",
     "CreateSubtransactionRequest",
+    "SubtransactionOperation",
     "Subtransaction",
-    "CommitSubtransactionRequest",
+    "RollbackSubtransactionRequest",
     "RenewLeaseRequest",
     "GetSubtransactionResponse",
   )

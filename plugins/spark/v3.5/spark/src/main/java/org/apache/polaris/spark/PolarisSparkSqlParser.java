@@ -124,11 +124,21 @@ public class PolarisSparkSqlParser implements ParserInterface {
       return delegate.parsePlan(statusSql("Subtransaction committed"));
     }
 
-    // ROLLBACK SUBTRANSACTION
+    // ROLLBACK SUBTRANSACTION — rolls the subtransaction back and reopens it (attempt++) so it can
+    // be
+    // retried, possibly by a different worker.
     if (normalized.equals("ROLLBACK SUBTRANSACTION")) {
       SparkSession spark = SparkSession.active();
       txnManager(spark).rollbackWorkerSubtransaction(spark);
       return delegate.parsePlan(statusSql("Subtransaction rolled back"));
+    }
+
+    // ABORT SUBTRANSACTION — abandons the subtransaction permanently (not reopened); the parent
+    // transaction skips it at commit.
+    if (normalized.equals("ABORT SUBTRANSACTION")) {
+      SparkSession spark = SparkSession.active();
+      txnManager(spark).abortWorkerSubtransaction(spark);
+      return delegate.parsePlan(statusSql("Subtransaction aborted"));
     }
 
     // CREATE SUBTRANSACTION FOR <table> [WITH (ROW_EXCLUSIVE|EXCLUSIVE|ACCESS_EXCLUSIVE)]

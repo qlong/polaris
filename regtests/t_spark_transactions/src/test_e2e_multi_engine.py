@@ -123,13 +123,16 @@ def run_worker(spark_session, ns_table: str, info: SubtxnInfo, insert_sql: str) 
 
 
 def run_worker_rollback(spark_session, ns_table: str, info: SubtxnInfo, insert_sql: str) -> None:
-    """Worker that rolls back its subtransaction after writing."""
+    """Worker that permanently abandons its subtransaction (ABORT) after writing.
+
+    Use this when the worker gives up and the parent should commit without its data.
+    """
     spark_session.sql(
         f"BEGIN SUBTRANSACTION {ns_table} "
         f"SUBTXN_ID={info.subtxn_id}, SUBTXN_TOKEN='{info.subtxn_token}'"
     )
     spark_session.sql(insert_sql)
-    spark_session.sql("ROLLBACK SUBTRANSACTION")
+    spark_session.sql("ABORT SUBTRANSACTION")
 
 
 def parallel_workers(txn_spark, tasks):

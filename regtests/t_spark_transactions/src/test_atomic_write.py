@@ -82,13 +82,17 @@ def run_worker(spark_session, ns_table: str, info: SubtxnInfo, insert_sql: str) 
 
 
 def run_worker_rollback(spark_session, ns_table: str, info: SubtxnInfo, insert_sql: str) -> None:
-    """Worker that rolls back its subtransaction after writing."""
+    """Worker that permanently abandons its subtransaction (ABORT) after writing.
+
+    Use this when the worker gives up and the parent should commit without its data.
+    For the reopen-and-retry-same-subtransaction pattern, use ROLLBACK SUBTRANSACTION directly.
+    """
     spark_session.sql(
         f"BEGIN SUBTRANSACTION {ns_table} "
         f"SUBTXN_ID={info.subtxn_id}, SUBTXN_TOKEN='{info.subtxn_token}'"
     )
     spark_session.sql(insert_sql)
-    spark_session.sql("ROLLBACK SUBTRANSACTION")
+    spark_session.sql("ABORT SUBTRANSACTION")
 
 
 def parallel_workers(txn_spark, tasks):
@@ -502,14 +506,15 @@ class TestRetrySubtransaction:
         )
 
         # RECOVERY step 1: abort the stale subtransaction so it no longer blocks the
-        # parent. A new session re-binds to it and ROLLBACK SUBTRANSACTION.
+        # parent. A new session re-binds to it and issues ABORT SUBTRANSACTION to
+        # permanently abandon it (not reopen-for-retry).
         cleanup = txn_spark.new_session()
         cleanup.sql(
             f"BEGIN SUBTRANSACTION {ns}.customers "
             f"SUBTXN_ID={subtxn_customers_1.subtxn_id}, "
             f"SUBTXN_TOKEN='{subtxn_customers_1.subtxn_token}'"
         )
-        cleanup.sql("ROLLBACK SUBTRANSACTION")
+        cleanup.sql("ABORT SUBTRANSACTION")
 
         # RECOVERY step 2: a brand-new subtransaction for the SAME table succeeds.
         subtxn_customers_2 = create_subtxn(txn_spark, f"{ns}.customers")

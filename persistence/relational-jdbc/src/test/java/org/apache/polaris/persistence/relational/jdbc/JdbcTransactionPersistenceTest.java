@@ -206,6 +206,7 @@ class JdbcTransactionPersistenceTest {
         new JdbcTransactionPersistence.OperationRow(
             opId,
             txnId,
+            null, // subtxnId — bare inline op, no subtransaction
             REALM,
             CATALOG_ID,
             "table-uuid-1",
@@ -587,6 +588,7 @@ class JdbcTransactionPersistenceTest {
         new JdbcTransactionPersistence.OperationRow(
             opId,
             txnId,
+            null, // subtxnId — bare inline op, no subtransaction
             REALM,
             CATALOG_ID,
             "table-uuid-sub",

@@ -223,11 +223,9 @@ public class SparkCatalog
         org.apache.iceberg.Table liveIceberg = sparkTable.table();
         if (liveIceberg instanceof BaseTable baseTable) {
           TableOperations liveOps = baseTable.operations();
-          TableMetadata effectiveBase =
-              baseMetadata != null ? baseMetadata : liveOps.current();
+          TableMetadata effectiveBase = baseMetadata != null ? baseMetadata : liveOps.current();
           LocationProvider locationProvider =
-              LocationProviders.locationsFor(
-                  effectiveBase.location(), effectiveBase.properties());
+              LocationProviders.locationsFor(effectiveBase.location(), effectiveBase.properties());
           TableOperations ops =
               new PinnedTableOperations(
                   effectiveBase,
@@ -355,16 +353,21 @@ public class SparkCatalog
       // Write the staged metadata file
       TableMetadataParser.write(metadata, fileIO.newOutputFile(stagingPath));
 
-      // Determine lock mode from the new snapshot's operation
-      String operation = "APPEND";
+      // Map the Iceberg snapshot operation to a server LockMode. The server keys its
+      // conflict-resolution policy off the lock mode (not the raw Iceberg op): an additive
+      // append is ROW_EXCLUSIVE (merge-and-retry on a concurrent commit), while a delta /
+      // overwrite / replace is EXCLUSIVE (first-committer-wins). The inline commit request
+      // deserializes this field into the LockMode enum, so it MUST be one of
+      // ROW_EXCLUSIVE / EXCLUSIVE / ACCESS_EXCLUSIVE.
+      String lockMode = "ROW_EXCLUSIVE";
       if (metadata.currentSnapshot() != null) {
         String snapOp = metadata.currentSnapshot().operation();
         if (!"append".equalsIgnoreCase(snapOp)) {
-          operation = "ROW_DELTA";
+          lockMode = "EXCLUSIVE";
         }
       }
 
-      txnManager.stageWrite(spark, tableIdent, stagingPath, operation);
+      txnManager.stageWrite(spark, tableIdent, stagingPath, lockMode);
     }
 
     @Override

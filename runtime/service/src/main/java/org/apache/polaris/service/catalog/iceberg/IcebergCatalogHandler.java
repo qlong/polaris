@@ -720,6 +720,18 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
   }
 
   /**
+   * Returns the numeric entity ID (as a string) for the given table. The result matches the {@code
+   * table_uuid} column in {@code committed_table_snapshots}. Requires that the table has already
+   * been loaded (i.e. the resolution manifest is populated) — call {@link
+   * #loadTable(TableIdentifier, String)} first.
+   */
+  public String resolveTableEntityId(TableIdentifier tableIdentifier) {
+    PolarisResolvedPathWrapper target =
+        resolutionManifest.getResolvedPath(ResolvedPathKey.ofTableLike(tableIdentifier));
+    return String.valueOf(target.getRawLeafEntity().getId());
+  }
+
+  /**
    * Attempt to perform a loadTable operation only when the specified set of eTags do not match the
    * current state of the table metadata.
    *
@@ -1591,10 +1603,9 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
         tableHandler.setWorkspaceMetaStoreManager(workspace);
         TableOperations ops = ((BaseTable) table).operations();
         FileIO io = ops.io();
-        TableMetadata base =
-            info.serverBaseMetadataLocation() != null
-                ? TableMetadataParser.read(io, info.serverBaseMetadataLocation())
-                : ops.current();
+        // base must be ops.current() (reference equality required by IcebergCatalog.commit).
+        // OCC was already validated in prepareInlineCommit; no second check needed here.
+        TableMetadata base = ops.current();
         TableMetadata staged = TableMetadataParser.read(io, info.stagedMetadataLocation());
         ops.commit(base, staged);
       }

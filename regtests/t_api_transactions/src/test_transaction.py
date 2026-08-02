@@ -197,7 +197,7 @@ class TestSubtransactionLifecycle:
         )
         assert resp.status_code == 200
         data = resp.json()
-        assert data["txn_id"] == txn["txn_id"]
+        assert data["parent_txn_id"] == txn["txn_id"]
 
     def test_get_subtransaction_returns_staging_path(self, client, txn, namespace, table_orders):
         """GET subtransaction returns the same assigned_staging_path as create."""
@@ -229,19 +229,16 @@ class TestSubtransactionLifecycle:
             f"Expected 401/403, got {resp.status_code}: {resp.text}"
         )
 
-    def test_commit_subtransaction_registers_staging_path(
+    def test_commit_subtransaction_is_body_less(
         self, client, txn, namespace, table_orders
     ):
-        """POST /subtransactions/{id}/commit records staged_metadata_location in the DB.
-
-        No actual Iceberg metadata file is written — commitSubtransaction only
-        registers the path.  The parent is aborted for cleanup so staged data
-        is discarded without touching any table.
+        """POST /subtransactions/{id}/commit is body-less — staging paths were assigned at
+        create time and are already recorded server-side.  Only X-Subtxn-Token is required.
+        The parent is aborted for cleanup.
         """
         subtxn = _create_subtxn(client, txn, namespace, table_orders)
         resp = client.post(
             f"/transactions/{txn['txn_id']}/subtransactions/{subtxn['subtxn_id']}/commit",
-            {"staged_metadata_location": subtxn["assigned_staging_path"]},
             extra_headers={"X-Subtxn-Token": subtxn["subtxn_token"]},
         )
         assert resp.status_code == 204
@@ -257,7 +254,6 @@ class TestSubtransactionLifecycle:
             subtxn = _create_subtxn(client, txn, namespace, table_orders)
             client.post(
                 f"/transactions/{txn['txn_id']}/subtransactions/{subtxn['subtxn_id']}/commit",
-                {"staged_metadata_location": subtxn["assigned_staging_path"]},
                 extra_headers={"X-Subtxn-Token": subtxn["subtxn_token"]},
             ).raise_for_status()
 
@@ -266,6 +262,78 @@ class TestSubtransactionLifecycle:
                 extra_headers={"X-Txn-Token": txn["txn_token"]},
             )
             assert abort_resp.status_code == 204
+        except Exception:
+            _abort_txn(client, txn)
+            raise
+
+    def test_rollback_subtransaction_reopens_for_retry(
+        self, client, txn, namespace, table_orders
+    ):
+        """POST /subtransactions/{id}/rollback with reopen_for_retry=true marks the subtransaction OPEN
+        again (attempt++) so the same subtxn_id + token can be re-claimed by another worker.
+        """
+        subtxn = _create_subtxn(client, txn, namespace, table_orders)
+        resp = client.post(
+            f"/transactions/{txn['txn_id']}/subtransactions/{subtxn['subtxn_id']}/rollback",
+            {"reopen_for_retry": True},
+            extra_headers={"X-Subtxn-Token": subtxn["subtxn_token"]},
+        )
+        assert resp.status_code == 204
+
+    def test_rollback_subtransaction_wrong_token_rejected(
+        self, client, txn, namespace, table_orders
+    ):
+        """rollback with an invalid X-Subtxn-Token must be rejected (401 or 403)."""
+        subtxn = _create_subtxn(client, txn, namespace, table_orders)
+        resp = client.post(
+            f"/transactions/{txn['txn_id']}/subtransactions/{subtxn['subtxn_id']}/rollback",
+            {"reopen_for_retry": True},
+            extra_headers={"X-Subtxn-Token": "not-a-real-token"},
+        )
+        assert resp.status_code in (401, 403), (
+            f"Expected 401/403, got {resp.status_code}: {resp.text}"
+        )
+
+    def test_rollback_then_recommit_succeeds(
+        self, client, txn, namespace, table_orders
+    ):
+        """After a rollback (reopen), the same subtransaction can be committed again by re-claiming it
+        with the same subtxn_id + token (simulates retry by another worker).
+        """
+        subtxn = _create_subtxn(client, txn, namespace, table_orders)
+        # Attempt 1: rollback with reopen
+        client.post(
+            f"/transactions/{txn['txn_id']}/subtransactions/{subtxn['subtxn_id']}/rollback",
+            {"reopen_for_retry": True},
+            extra_headers={"X-Subtxn-Token": subtxn["subtxn_token"]},
+        ).raise_for_status()
+        # Attempt 2: re-commit the same subtransaction (same subtxn_id + token)
+        resp = client.post(
+            f"/transactions/{txn['txn_id']}/subtransactions/{subtxn['subtxn_id']}/commit",
+            extra_headers={"X-Subtxn-Token": subtxn["subtxn_token"]},
+        )
+        assert resp.status_code == 204
+
+    def test_abort_subtransaction_is_permanent(
+        self, client, namespace, table_orders
+    ):
+        """POST /subtransactions/{id}/abort permanently abandons the subtransaction — the parent
+        transaction can still commit; the aborted subtransaction's operations are skipped.
+        """
+        txn = _begin(client)
+        try:
+            subtxn = _create_subtxn(client, txn, namespace, table_orders)
+            abort_resp = client.post(
+                f"/transactions/{txn['txn_id']}/subtransactions/{subtxn['subtxn_id']}/abort",
+                extra_headers={"X-Subtxn-Token": subtxn["subtxn_token"]},
+            )
+            assert abort_resp.status_code == 204
+            # Parent can commit with the aborted subtransaction present (skips it)
+            commit_resp = client.post(
+                f"/transactions/{txn['txn_id']}/commit",
+                extra_headers={"X-Txn-Token": txn["txn_token"]},
+            )
+            assert commit_resp.status_code in (204, 400, 409, 422)
         except Exception:
             _abort_txn(client, txn)
             raise

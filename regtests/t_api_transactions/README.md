@@ -121,7 +121,10 @@ src/
 - Staging path is inside the table's own `metadata/` directory
 - `GET /subtransactions/{id}` returns parent `txn_id` and matching staging path
 - `POST /subtransactions/{id}/abort` returns 204; wrong token returns 401/403
-- `POST /subtransactions/{id}/commit` records the staging path (HTTP 204)
+- `POST /subtransactions/{id}/commit` is body-less (staging paths assigned server-side)
+- `POST /subtransactions/{id}/rollback` reopens unit for retry (reopen_for_retry=true); wrong token rejected
+- Rollback then re-commit of the same unit succeeds (retry semantics)
+- Aborting a subtransaction permanently is distinguishable from rollback
 - Aborting the parent after `commitSubtransaction` returns 204 (staged data discarded)
 - Two subtransactions for different tables get distinct ids and distinct staging paths
 
@@ -152,7 +155,11 @@ test_transaction.py::TestSubtransactionLifecycle::test_get_subtransaction_return
 test_transaction.py::TestSubtransactionLifecycle::test_get_subtransaction_returns_staging_path PASSED
 test_transaction.py::TestSubtransactionLifecycle::test_abort_subtransaction_returns_204 PASSED
 test_transaction.py::TestSubtransactionLifecycle::test_abort_subtxn_wrong_token_rejected PASSED
-test_transaction.py::TestSubtransactionLifecycle::test_commit_subtransaction_registers_staging_path PASSED
+test_transaction.py::TestSubtransactionLifecycle::test_commit_subtransaction_is_body_less PASSED
 test_transaction.py::TestSubtransactionLifecycle::test_abort_parent_after_subtxn_committed PASSED
+test_transaction.py::TestSubtransactionLifecycle::test_rollback_subtransaction_reopens_for_retry PASSED
+test_transaction.py::TestSubtransactionLifecycle::test_rollback_subtransaction_wrong_token_rejected PASSED
+test_transaction.py::TestSubtransactionLifecycle::test_rollback_then_recommit_succeeds PASSED
+test_transaction.py::TestSubtransactionLifecycle::test_abort_subtransaction_is_permanent PASSED
 test_transaction.py::TestSubtransactionLifecycle::test_two_subtransactions_different_tables PASSED
 ```

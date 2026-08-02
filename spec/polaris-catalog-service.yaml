@@ -199,6 +199,9 @@ paths:
   /polaris/v1/{prefix}/transactions/{txn-id}/subtransactions/{subtxn-id}/abort:
     $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transactions~1{txn-id}~1subtransactions~1{subtxn-id}~1abort'
 
+  /polaris/v1/{prefix}/transactions/{txn-id}/subtransactions/{subtxn-id}/rollback:
+    $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transactions~1{txn-id}~1subtransactions~1{subtxn-id}~1rollback'
+
   /polaris/v1/{prefix}/transactions/{txn-id}/subtransactions/{subtxn-id}/renew:
     $ref: './polaris-catalog-apis/transaction-apis.yaml#/paths/~1polaris~1v1~1{prefix}~1transactions~1{txn-id}~1subtransactions~1{subtxn-id}~1renew'
 

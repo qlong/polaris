@@ -26,7 +26,7 @@ import org.apache.iceberg.shaded.com.fasterxml.jackson.annotation.JsonProperty;
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class GetSubtransactionRESTResponse implements RESTResponse {
 
-  @JsonProperty("txn_id")
+  @JsonProperty("parent_txn_id")
   private long txnId;
 
   @JsonProperty("txn_snapshot_id")

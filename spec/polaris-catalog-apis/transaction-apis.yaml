@@ -422,7 +422,7 @@ paths:
         - Transaction API
       summary: Create a subtransaction for a single table
       description: >
-        Allocates a per-table unit of work inside the parent transaction.
+        Allocates a per-table operation inside the parent transaction.
         Acquires a pessimistic lock if the operation requires one
         (ROW_DELTA, OVERWRITE, EXCLUSIVE, ACCESS_EXCLUSIVE).
         Returns a server-assigned staging path for the worker app to write to.
@@ -484,11 +484,14 @@ paths:
     post:
       tags:
         - Transaction API
-      summary: Stage a subtransaction's metadata for commit
+      summary: Stage a whole subtransaction for commit
       description: >
-        Validates that the staged metadata file exists at the server-assigned staging path
-        and marks this subtransaction SUB_COMMITTED. The data is not yet visible; visibility
-        occurs only when the parent transaction is committed.
+        Stages every table in this subtransaction atomically. The server already assigned each
+        operation's staging path at create time, so no body is needed: the server verifies
+        each staged metadata file exists at its assigned path, marks every operation
+        SUB_COMMITTED, and marks the subtransaction STAGED. The data is not yet visible; visibility
+        occurs only when the parent transaction is committed. A subtransaction is executed by a single
+        worker, so staging is all-or-nothing.
       operationId: commitSubtransaction
       parameters:
         - name: X-Subtxn-Token
@@ -496,12 +499,6 @@ paths:
           required: true
           schema:
             type: string
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/CommitSubtransactionRequest'
       responses:
         204:
           description: Subtransaction staged successfully
@@ -552,6 +549,62 @@ paths:
       responses:
         204:
           description: Subtransaction aborted
+        401:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/UnauthorizedResponse'
+        403:
+          $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ForbiddenResponse'
+        404:
+          description: Not Found - The requested resource does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '../iceberg-rest-catalog-open-api.yaml#/components/schemas/IcebergErrorResponse'
+
+  /polaris/v1/{prefix}/transactions/{txn-id}/subtransactions/{subtxn-id}/rollback:
+    parameters:
+      - $ref: '../iceberg-rest-catalog-open-api.yaml#/components/parameters/prefix'
+      - name: txn-id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: subtxn-id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+
+    post:
+      tags:
+        - Transaction API
+      summary: Roll back a subtransaction (abort its operations; optionally reopen for retry)
+      description: >
+        Aborts every operation in the subtransaction and releases their locks. When `reopen_for_retry` is
+        true (the default) the subtransaction is reopened with an incremented attempt so it can be re-staged,
+        possibly by a different worker; when false the subtransaction stays aborted and the parent COMMIT
+        skips it. Other subtransactions' staged work is untouched. Accepts either the subtransaction token
+        (X-Subtxn-Token) or the parent txn token (X-Txn-Token).
+      operationId: rollbackSubtransaction
+      parameters:
+        - name: X-Subtxn-Token
+          in: header
+          schema:
+            type: string
+        - name: X-Txn-Token
+          in: header
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RollbackSubtransactionRequest'
+      responses:
+        204:
+          description: Subtransaction rolled back
         401:
           $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/UnauthorizedResponse'
         403:
@@ -719,8 +772,9 @@ components:
           type: string
           format: date-time
 
-    CreateSubtransactionRequest:
+    SubtransactionTable:
       type: object
+      description: One table's contribution to a subtransaction.
       required:
         - table_identifier
         - operation
@@ -730,6 +784,36 @@ components:
           description: "Fully-qualified table name, e.g. 'ns.orders'"
         operation:
           $ref: '#/components/schemas/LockMode'
+        base_snapshot_id:
+          type: integer
+          format: int64
+          description: Iceberg snapshot ID the worker read this table from
+
+    CreateSubtransactionRequest:
+      type: object
+      description: >
+        Creates a subtransaction (savepoint) grouping one or more per-table operations
+        that succeed-or-fail together. Provide either the multi-table `tables` list (preferred) or
+        the single-table `table_identifier` + `operation` shorthand. A subtransaction is the retry boundary:
+        rolling it back aborts exactly its operations and reopens the subtransaction for another attempt,
+        possibly by a different worker.
+      properties:
+        tables:
+          type: array
+          description: Tables grouped into this subtransaction. Preferred over the single-table shorthand.
+          items:
+            $ref: '#/components/schemas/SubtransactionTable'
+        table_identifier:
+          type: string
+          description: "Single-table shorthand. Fully-qualified table name, e.g. 'ns.orders'."
+        operation:
+          $ref: '#/components/schemas/LockMode'
+        name:
+          type: string
+          description: >
+            Optional stable name for the subtransaction (savepoint name / worker task key). Reusing a
+            non-aborted name within the same transaction is rejected; a name freed by rollback
+            can be reused.
         lease_seconds:
           type: integer
           default: 3600
@@ -740,28 +824,22 @@ components:
             If this subtransaction retries a previously aborted one,
             set this to the old subtxn_id so the server can chain the lineage.
 
-    Subtransaction:
+    SubtransactionOperation:
       type: object
+      description: One table's per-op state within a subtransaction.
       required:
-        - subtxn_id
-        - parent_txn_id
+        - op_id
         - table_uuid
         - operation
         - assigned_staging_path
         - status
-        - expires_at
       properties:
-        subtxn_id:
+        op_id:
           type: integer
           format: int64
-        subtxn_token:
+        op_token:
           type: string
-          description: >
-            Opaque token for this subtransaction. Given to the worker app.
-            Only returned on createSubtransaction.
-        parent_txn_id:
-          type: integer
-          format: int64
+          description: Opaque token for staging this single table's metadata. Only on create.
         table_uuid:
           type: string
         operation:
@@ -769,27 +847,70 @@ components:
         base_snapshot_id:
           type: integer
           format: int64
-          description: Iceberg snapshot ID at the time this subtransaction was created
         assigned_staging_path:
           type: string
-          description: "Server-assigned S3 path for staged metadata, e.g. s3://warehouse/staging/5001/1/"
+          description: "Server-assigned path for staged metadata"
         staged_metadata_location:
           type: string
-          description: Filled in after commitSubtransaction
+          description: Filled in after this table is staged
+        status:
+          $ref: '#/components/schemas/SubtransactionStatus'
+
+    Subtransaction:
+      type: object
+      description: >
+        A subtransaction grouping one or more per-table operations. The `operations` list carries each
+        table's op id/token/staging path. The top-level single-table fields mirror the first
+        operation for the single-table shorthand path.
+      required:
+        - subtxn_id
+        - parent_txn_id
+        - status
+        - expires_at
+      properties:
+        subtxn_id:
+          type: integer
+          format: int64
+          description: The subtransaction id.
+        subtxn_token:
+          type: string
+          description: >
+            Opaque token for this subtransaction. Given to the worker app; drives stage/rollback of the
+            whole subtransaction. Only returned on createSubtransaction.
+        parent_txn_id:
+          type: integer
+          format: int64
+        name:
+          type: string
+          description: Optional stable subtransaction name (savepoint name / worker task key).
+        attempt:
+          type: integer
+          description: 1-based attempt counter; incremented each time the subtransaction is rolled back and retried.
+        operations:
+          type: array
+          description: Per-table operations grouped into this subtransaction.
+          items:
+            $ref: '#/components/schemas/SubtransactionOperation'
+        table_uuid:
+          type: string
+          description: First operation's table (single-table shorthand mirror).
+        operation:
+          $ref: '#/components/schemas/LockMode'
+        base_snapshot_id:
+          type: integer
+          format: int64
+          description: First operation's base snapshot (single-table shorthand mirror).
+        assigned_staging_path:
+          type: string
+          description: First operation's staging path (single-table shorthand mirror).
+        staged_metadata_location:
+          type: string
+          description: First operation's staged location (single-table shorthand mirror).
         status:
           $ref: '#/components/schemas/SubtransactionStatus'
         expires_at:
           type: string
           format: date-time
-
-    CommitSubtransactionRequest:
-      type: object
-      required:
-        - staged_metadata_location
-      properties:
-        staged_metadata_location:
-          type: string
-          description: Full path to the staged Iceberg metadata JSON file
 
     CommitTransactionRequest:
       type: object
@@ -818,6 +939,16 @@ components:
           description: Full path to the client-staged Iceberg metadata JSON file
         operation:
           $ref: '#/components/schemas/LockMode'
+
+    RollbackSubtransactionRequest:
+      type: object
+      properties:
+        reopen_for_retry:
+          type: boolean
+          default: true
+          description: >
+            When true (default) the subtransaction is reopened (attempt++) after its operations are aborted,
+            so it can be re-staged. When false the subtransaction stays aborted and is skipped at commit.
 
     RenewLeaseRequest:
       type: object

@@ -18,6 +18,7 @@
  */
 package org.apache.polaris.service.transaction;
 
+import jakarta.annotation.Nullable;
 import jakarta.ws.rs.BadRequestException;
 import jakarta.ws.rs.ForbiddenException;
 import jakarta.ws.rs.NotFoundException;
@@ -50,7 +51,7 @@ import org.slf4j.LoggerFactory;
  *   <li>{@link #createTransactionSnapshot} — acquire a read-only consistency handle
  *   <li>{@link #beginTransaction} — start a write transaction (also acquires a TxnSnapshot for
  *       REPEATABLE_READ)
- *   <li>{@link #createSubtransaction} — allocate a per-table work unit; acquire lock if needed
+ *   <li>{@link #createSubtransaction} — allocate a per-table subtransaction; acquire lock if needed
  *   <li>{@link #commitSubtransaction} — stage metadata for one table
  *   <li>{@link #commitTransaction} — finalize: atomically publish all tables + record snapshots
  *   <li>{@link #abortTransaction} — mark ABORTED + release locks
@@ -241,6 +242,35 @@ public class TransactionService {
       int leaseSeconds,
       String tableMetadataDir)
       throws SQLException, LockConflictException {
+    return createOperation(
+        txnId,
+        txnToken,
+        null,
+        tableUuid,
+        lockMode,
+        baseSnapshotId,
+        retryOfOpId,
+        leaseSeconds,
+        tableMetadataDir);
+  }
+
+  /**
+   * Overload that binds the new operation to a subtransaction ({@code subtxnId}). When {@code
+   * subtxnId} is null the operation is a bare inline op (the Problem-1 single-session path); when
+   * non-null the op is a child of a {@code subtransactions} row and shares that subtransaction's
+   * succeed-or-fail / retry-by-different-worker fate.
+   */
+  public OperationRow createOperation(
+      long txnId,
+      String txnToken,
+      Long subtxnId,
+      String tableUuid,
+      String lockMode,
+      Long baseSnapshotId,
+      Long retryOfOpId,
+      int leaseSeconds,
+      String tableMetadataDir)
+      throws SQLException, LockConflictException {
 
     TransactionRow txn = validateTxnToken(txnId, txnToken);
     requireInProgress(txn);
@@ -275,6 +305,7 @@ public class TransactionService {
         new OperationRow(
             opId,
             txnId,
+            subtxnId,
             persistence.getRealmId(),
             persistence.getCatalogId(),
             tableUuid,
@@ -375,6 +406,275 @@ public class TransactionService {
   }
 
   // ---------------------------------------------------------------------------
+  // Subtransactions (savepoints — Use Case 2: worker grouping)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * One requested table within a subtransaction: the table's stable identifier, its metadata
+   * directory (where the assigned staging path is placed), the lock mode, and an optional base
+   * snapshot id.
+   *
+   * @param tableUuid stable identifier of the target table (identifier string, e.g. "ns.orders")
+   * @param tableMetadataDir the table's canonical metadata directory
+   * @param lockMode {@code ROW_EXCLUSIVE} / {@code EXCLUSIVE} / {@code ACCESS_EXCLUSIVE} (defaults
+   *     to {@code ROW_EXCLUSIVE} when null)
+   * @param baseSnapshotId optional Iceberg base snapshot the worker read from
+   */
+  public record SubtxnTableSpec(
+      String tableUuid, String tableMetadataDir, String lockMode, Long baseSnapshotId) {}
+
+  /**
+   * A subtransaction plus its per-table child operations. Returned by {@link
+   * #createSubtransaction}; the client (or a retrying worker) uses {@code subtxnToken} to drive the
+   * whole group and each {@link OperationRow}'s {@code opToken} + {@code assignedStagingPath} to
+   * stage a single table.
+   */
+  public record SubtxnInfo(
+      JdbcTransactionPersistence.SubtxnRow subtxn, List<OperationRow> operations) {}
+
+  /**
+   * Creates a subtransaction that groups {@code tables.size()} per-table operations under a single
+   * succeed-or-fail boundary. Locks for every table are acquired up front; if any acquisition fails
+   * the whole subtransaction is rolled back (locks released) before the error propagates, so a
+   * partial subtransaction never lingers holding locks.
+   *
+   * @param name optional stable name for the subtransaction (savepoint name / worker task key).
+   *     Reusing a non-aborted name within the same transaction is rejected by the unique index; a
+   *     name freed by rollback (ABORTED) can be reused.
+   */
+  public SubtxnInfo createSubtransaction(
+      long txnId, String txnToken, String name, int leaseSeconds, List<SubtxnTableSpec> tables)
+      throws SQLException, LockConflictException {
+    TransactionRow txn = validateTxnToken(txnId, txnToken);
+    requireInProgress(txn);
+    if (tables == null || tables.isEmpty()) {
+      throw new BadRequestException("A subtransaction must reference at least one table");
+    }
+
+    long subtxnId = persistence.nextTxnId();
+    String subtxnToken = generateToken();
+    int effective = leaseSeconds > 0 ? leaseSeconds : DEFAULT_TXN_LEASE_SECONDS;
+    Instant now = Instant.now();
+    Instant expiresAt = now.plus(effective, ChronoUnit.SECONDS);
+
+    persistence.insertSubtxn(
+        new JdbcTransactionPersistence.SubtxnRow(
+            subtxnId,
+            txnId,
+            persistence.getRealmId(),
+            persistence.getCatalogId(),
+            name,
+            subtxnToken,
+            JdbcTransactionPersistence.SUBTXN_STATUS_OPEN,
+            1,
+            now,
+            expiresAt,
+            null));
+
+    List<OperationRow> ops = new ArrayList<>(tables.size());
+    try {
+      for (SubtxnTableSpec t : tables) {
+        ops.add(
+            createOperation(
+                txnId,
+                txnToken,
+                subtxnId,
+                t.tableUuid(),
+                t.lockMode(),
+                t.baseSnapshotId(),
+                null,
+                leaseSeconds,
+                t.tableMetadataDir()));
+      }
+    } catch (RuntimeException | SQLException | LockConflictException e) {
+      // Roll the partially-built subtransaction back so no lock is orphaned. Mark ABORTED (not
+      // reopened) —
+      // creation failed outright; the caller decides whether to retry with a fresh subtxn.
+      try {
+        List<OperationRow> aborted = persistence.abortSubtxn(subtxnId);
+        releaseSubtxnLocks(txnId, aborted);
+      } catch (SQLException cleanup) {
+        LOGGER.warn(
+            "Failed to clean up partial subtransaction {}: {}", subtxnId, cleanup.getMessage());
+      }
+      throw e;
+    }
+
+    LOGGER.info(
+        "Subtransaction created: subtxn_id={} txn_id={} tables={}", subtxnId, txnId, tables.size());
+    return new SubtxnInfo(persistence.findSubtxn(subtxnId).orElseThrow(), ops);
+  }
+
+  /**
+   * Stages an entire subtransaction atomically. A subtransaction is executed by a single worker, so
+   * staging is all-or-nothing: the server already assigned each operation's staging path at create
+   * time, so there is no per-table body — the worker has written each table's metadata to its
+   * {@code assigned_staging_path}, and this call marks every operation COMMITTED at that path, then
+   * marks the subtransaction STAGED. The data is not yet visible; visibility happens only when the
+   * parent transaction commits.
+   *
+   * <p>ROW_EXCLUSIVE locks are released as each op is staged (so waiting EXCLUSIVE requests can
+   * proceed); EXCLUSIVE/ACCESS_EXCLUSIVE locks are held until the parent transaction ends.
+   */
+  public void commitSubtransaction(long subtxnId, String subtxnToken) throws SQLException {
+    JdbcTransactionPersistence.SubtxnRow subtxn = validateSubtxnToken(subtxnId, subtxnToken);
+    if (subtxn.status() != JdbcTransactionPersistence.SUBTXN_STATUS_OPEN) {
+      throw new BadRequestException(
+          "Subtransaction " + subtxnId + " is not OPEN (status=" + subtxn.status() + ")");
+    }
+    List<OperationRow> ops = persistence.findOperationsForSubtxn(subtxnId);
+    for (OperationRow op : ops) {
+      if (op.status() != JdbcTransactionPersistence.OP_STATUS_IN_PROGRESS) {
+        continue;
+      }
+      persistence.markOperationCommitted(op.opId(), op.assignedStagingPath());
+      if (LockManager.MODE_ROW_EXCLUSIVE.equals(op.lockMode())) {
+        lockManager.releaseForResource(subtxn.txnId(), op.tableUuid());
+      }
+    }
+    persistence.updateSubtxnStatus(subtxnId, JdbcTransactionPersistence.SUBTXN_STATUS_STAGED);
+    LOGGER.info("Subtransaction staged: subtxn_id={} ops={}", subtxnId, ops.size());
+  }
+
+  /**
+   * Rolls a subtransaction back: aborts every one of its operations, releases their locks, and —
+   * when {@code reopenForRetry} is true — re-opens the subtransaction (attempt++) so the same
+   * subtransaction can be re-staged, possibly by a different worker. When false the subtransaction
+   * stays ABORTED (the transaction skips it at commit). Other subtransactions' staged work is
+   * untouched.
+   *
+   * <p>Accepts either the subtransaction token or the parent txn token (orchestrator-driven
+   * rollback).
+   */
+  public void rollbackSubtransaction(
+      long txnId, long subtxnId, String subtxnToken, String txnToken, boolean reopenForRetry)
+      throws SQLException {
+    JdbcTransactionPersistence.SubtxnRow subtxn;
+    if (subtxnToken != null && !subtxnToken.isBlank()) {
+      subtxn = validateSubtxnToken(subtxnId, subtxnToken);
+    } else {
+      validateTxnToken(txnId, txnToken);
+      subtxn =
+          persistence
+              .findSubtxn(subtxnId)
+              .orElseThrow(() -> new NotFoundException("Subtransaction not found: " + subtxnId));
+    }
+    if (subtxn.txnId() != txnId) {
+      throw new BadRequestException(
+          "Subtransaction " + subtxnId + " does not belong to transaction " + txnId);
+    }
+
+    List<OperationRow> aborted = persistence.abortSubtxn(subtxnId);
+    releaseSubtxnLocks(txnId, aborted);
+
+    if (reopenForRetry) {
+      Instant expiresAt = Instant.now().plus(DEFAULT_TXN_LEASE_SECONDS, ChronoUnit.SECONDS);
+      persistence.reopenSubtxn(subtxnId, expiresAt);
+      // Re-create fresh operation rows (new staging paths) for each aborted op so the retry
+      // worker gets a new assignedStagingPath from getSubtransaction — the old file may still
+      // exist on storage, so reusing it would cause FileAlreadyExistsException on write.
+      for (OperationRow old : aborted) {
+        String tableMetadataDir =
+            old.assignedStagingPath().substring(0, old.assignedStagingPath().lastIndexOf('/'));
+        long newOpId = persistence.nextTxnId();
+        String newOpToken = generateToken();
+        String newStagingPath =
+            tableMetadataDir
+                + "/"
+                + txnId
+                + "-"
+                + newOpId
+                + "-"
+                + UUID.randomUUID()
+                + ".metadata.json";
+        String serverBase =
+            persistence.findLatestCommittedMetadataLocation(old.tableUuid()).orElse(null);
+        OperationRow retry =
+            new OperationRow(
+                newOpId,
+                txnId,
+                subtxnId,
+                old.realmId(),
+                old.catalogId(),
+                old.tableUuid(),
+                old.lockMode(),
+                old.baseSnapshotId(),
+                serverBase,
+                newStagingPath,
+                null,
+                newOpToken,
+                JdbcTransactionPersistence.OP_STATUS_IN_PROGRESS,
+                old.opId(),
+                Instant.now(),
+                expiresAt,
+                null);
+        persistence.insertOperation(retry);
+        try {
+          lockManager.acquire(txnId, old.tableUuid(), old.lockMode());
+        } catch (LockManager.LockConflictException e) {
+          throw new jakarta.ws.rs.BadRequestException(
+              "Lock conflict re-acquiring lock for retry: " + e.getMessage());
+        }
+      }
+      LOGGER.info("Subtransaction rolled back and reopened for retry: subtxn_id={}", subtxnId);
+    } else {
+      LOGGER.info("Subtransaction rolled back (aborted): subtxn_id={}", subtxnId);
+    }
+  }
+
+  /** Releases every lock held by the given (now-aborted) operations. */
+  private void releaseSubtxnLocks(long txnId, List<OperationRow> ops) throws SQLException {
+    for (OperationRow op : ops) {
+      // Only ROW_EXCLUSIVE locks are released eagerly elsewhere; here we release whatever this op
+      // still holds so a reopened/retried subtransaction re-acquires cleanly and EXCLUSIVE waiters
+      // proceed.
+      lockManager.releaseForResource(txnId, op.tableUuid());
+    }
+  }
+
+  private JdbcTransactionPersistence.SubtxnRow validateSubtxnToken(
+      long subtxnId, String subtxnToken) throws SQLException {
+    JdbcTransactionPersistence.SubtxnRow subtxn =
+        persistence
+            .findSubtxn(subtxnId)
+            .orElseThrow(() -> new NotFoundException("Subtransaction not found: " + subtxnId));
+    if (!subtxn.subtxnToken().equals(subtxnToken)) {
+      throw new ForbiddenException("Invalid subtxn_token for subtransaction " + subtxnId);
+    }
+    return subtxn;
+  }
+
+  /**
+   * Looks up a subtransaction by id + token, returning the subtransaction row and its per-table
+   * operations. Used by {@code getSubtransaction} so a resuming worker can see every operation's
+   * assigned staging path.
+   */
+  public SubtxnInfo getSubtransactionInfo(long subtxnId, String subtxnToken) throws SQLException {
+    JdbcTransactionPersistence.SubtxnRow subtxn = validateSubtxnToken(subtxnId, subtxnToken);
+    return new SubtxnInfo(subtxn, persistence.findOperationsForSubtxn(subtxnId));
+  }
+
+  /**
+   * Extends a subtransaction's lease. The lease is tracked on the subtransaction row; renewing
+   * bumps its {@code expires_at} (and the parent transaction's, so the whole group stays live).
+   */
+  public SubtxnInfo renewSubtransaction(
+      long txnId, long subtxnId, String subtxnToken, int leaseSeconds) throws SQLException {
+    JdbcTransactionPersistence.SubtxnRow subtxn = validateSubtxnToken(subtxnId, subtxnToken);
+    if (subtxn.txnId() != txnId) {
+      throw new BadRequestException(
+          "Subtransaction " + subtxnId + " does not belong to transaction " + txnId);
+    }
+    int effective = leaseSeconds > 0 ? leaseSeconds : DEFAULT_TXN_LEASE_SECONDS;
+    Instant expiresAt = Instant.now().plus(effective, ChronoUnit.SECONDS);
+    persistence.renewSubtxn(subtxnId, expiresAt);
+    persistence.renewTransaction(txnId, expiresAt);
+    return new SubtxnInfo(
+        persistence.findSubtxn(subtxnId).orElseThrow(),
+        persistence.findOperationsForSubtxn(subtxnId));
+  }
+
+  // ---------------------------------------------------------------------------
   // Inline commit (Use Case 1 — single-session staged writes)
   // ---------------------------------------------------------------------------
 
@@ -392,9 +692,26 @@ public class TransactionService {
       String tableIdentifier,
       String stagedMetadataLocation,
       String serverBaseMetadataLocation,
-      String lockMode) {}
+      String lockMode,
+      // Numeric entity ID string matching committed_table_snapshots.table_uuid
+      @Nullable String tableEntityId) {
 
-  /** Parallel to {@link PrepareCommitResult} but for the inline path. */
+    /** Backward-compatible constructor without tableEntityId. */
+    public StagedTableInfo(
+        String tableIdentifier,
+        String stagedMetadataLocation,
+        String serverBaseMetadataLocation,
+        String lockMode) {
+      this(tableIdentifier, stagedMetadataLocation, serverBaseMetadataLocation, lockMode, null);
+    }
+  }
+
+  /**
+   * Result of {@link #prepareInlineCommit}. All validated tables go to {@code direct}; conflicts
+   * abort the transaction and throw {@link SerializationFailureException} before this returns.
+   * {@code mergeRetry} is always empty for inline transactions (kept for API symmetry with {@link
+   * PrepareCommitResult}).
+   */
   public record PrepareInlineResult(
       List<StagedTableInfo> direct, List<StagedTableInfo> mergeRetry) {}
 
@@ -406,9 +723,9 @@ public class TransactionService {
    * difference means a concurrent commit occurred:
    *
    * <ul>
-   *   <li>APPEND → merge-and-retry
-   *   <li>ROW_DELTA → first-committer-wins; aborts the transaction and throws {@link
-   *       SerializationFailureException}
+   *   <li>Any concurrent write → first-committer-wins; aborts the transaction and throws {@link
+   *       SerializationFailureException}. Merge-and-retry is not used for inline transactions
+   *       because there is no server-held staged file to re-parent onto the new table state.
    * </ul>
    *
    * For READ_COMMITTED all tables are routed directly (no snapshot baseline).
@@ -422,14 +739,18 @@ public class TransactionService {
     List<StagedTableInfo> mergeRetry = new ArrayList<>();
 
     for (StagedTableInfo info : inputTables) {
+      // Use the resolved numeric entity ID for committed_table_snapshots lookups when available;
+      // fall back to tableIdentifier for tests / callers that don't supply it.
+      String snapshotKey =
+          info.tableEntityId() != null ? info.tableEntityId() : info.tableIdentifier();
+
       String currentMeta =
-          persistence.findLatestCommittedMetadataLocation(info.tableIdentifier()).orElse(null);
+          persistence.findLatestCommittedMetadataLocation(snapshotKey).orElse(null);
 
       // Determine the baseline visible at transaction-begin time (REPEATABLE_READ only).
       String baselineMeta = null;
       if (txn.txnSnapshotId() != null) {
-        baselineMeta =
-            resolveTableMetadataLocation(info.tableIdentifier(), txn.txnSnapshotId()).orElse(null);
+        baselineMeta = resolveTableMetadataLocation(snapshotKey, txn.txnSnapshotId()).orElse(null);
       }
 
       boolean conflict = baselineMeta != null && !baselineMeta.equals(currentMeta);
@@ -439,16 +760,12 @@ public class TransactionService {
                 info.tableIdentifier(),
                 info.stagedMetadataLocation(),
                 currentMeta,
-                info.lockMode()));
-      } else if (LockManager.MODE_ROW_EXCLUSIVE.equals(info.lockMode())) {
-        LOGGER.info(
-            "ROW_EXCLUSIVE conflict detected for table {} in inline txn {}: scheduling merge-and-retry",
-            info.tableIdentifier(),
-            txnId);
-        mergeRetry.add(
-            new StagedTableInfo(
-                info.tableIdentifier(), info.stagedMetadataLocation(), null, info.lockMode()));
+                info.lockMode(),
+                snapshotKey));
       } else {
+        // Inline transactions always use first-committer-wins under REPEATABLE_READ.
+        // Unlike the subtransaction path, there is no server-held staged file to re-parent,
+        // so merge-and-retry is not applicable here regardless of lock mode.
         persistence.updateTransactionStatus(txnId, JdbcTransactionPersistence.TXN_STATUS_ABORTED);
         lockManager.releaseAll(txnId);
         LOGGER.info(
@@ -503,22 +820,41 @@ public class TransactionService {
     requireInProgress(txn);
 
     List<OperationRow> subtxns = persistence.findOperationsForTransaction(txnId);
-    long uncommitted =
+
+    // Subtransaction-granularity guard: ops of an ABORTED subtransaction are skipped entirely
+    // (their staged work is
+    // discarded); ops that belong to a still-OPEN subtransaction — or a bare inline op — must be
+    // finalized
+    // before the parent can commit. A non-null subtxn_id whose subtransaction is ABORTED is
+    // invisible here.
+    java.util.Set<Long> abortedSubtxnIds =
+        persistence.findSubtxnsForTransaction(txnId).stream()
+            .filter(u -> u.status() == JdbcTransactionPersistence.SUBTXN_STATUS_ABORTED)
+            .map(JdbcTransactionPersistence.SubtxnRow::subtxnId)
+            .collect(java.util.stream.Collectors.toSet());
+
+    List<OperationRow> live =
         subtxns.stream()
+            .filter(s -> s.subtxnId() == null || !abortedSubtxnIds.contains(s.subtxnId()))
+            .toList();
+
+    long uncommitted =
+        live.stream()
             .filter(s -> s.status() == JdbcTransactionPersistence.OP_STATUS_IN_PROGRESS)
             .count();
     if (uncommitted > 0) {
       throw new BadRequestException(
           uncommitted
-              + " subtransaction(s) are still IN_PROGRESS for txn "
+              + " operation(s) are still IN_PROGRESS for txn "
               + txnId
-              + ". Commit or abort them before committing the transaction.");
+              + " (open subtransaction or un-staged inline write)."
+              + " Stage/commit or roll them back before committing the transaction.");
     }
 
     List<OperationRow> direct = new ArrayList<>();
     List<OperationRow> mergeRetry = new ArrayList<>();
     for (OperationRow s :
-        subtxns.stream()
+        live.stream()
             .filter(s -> s.status() == JdbcTransactionPersistence.OP_STATUS_COMMITTED)
             .toList()) {
       String currentMeta =
@@ -550,8 +886,10 @@ public class TransactionService {
       } else {
         // EXCLUSIVE / ACCESS_EXCLUSIVE (pessimistic, potentially destructive): a concurrent writer
         // advanced the table since this op was created. First-committer-wins — abort the whole
-        // transaction and surface a serialization failure (mirrors prepareInlineCommit and the
-        // PostgreSQL 40001 semantics documented in multi-table-transaction-design.md).
+        // transaction and surface a serialization failure (PostgreSQL 40001 semantics, documented
+        // in multi-table-transaction-design.md). Unlike the inline path — which cannot re-parent
+        // and so aborts on ANY conflict — the subtransaction path merges ROW_EXCLUSIVE above and
+        // only reaches this abort branch for the pessimistic lock modes.
         persistence.updateTransactionStatus(txnId, JdbcTransactionPersistence.TXN_STATUS_ABORTED);
         lockManager.releaseAll(txnId);
         LOGGER.info(

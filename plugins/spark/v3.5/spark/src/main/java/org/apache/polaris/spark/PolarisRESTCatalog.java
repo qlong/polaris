@@ -49,7 +49,6 @@ import org.apache.iceberg.util.PropertyUtil;
 import org.apache.polaris.core.rest.PolarisEndpoints;
 import org.apache.polaris.core.rest.PolarisResourcePaths;
 import org.apache.polaris.spark.rest.BeginTransactionRESTRequest;
-import org.apache.polaris.spark.rest.CommitSubtransactionRESTRequest;
 import org.apache.polaris.spark.rest.CommitTransactionRESTRequest;
 import org.apache.polaris.spark.rest.CreateGenericTableRESTRequest;
 import org.apache.polaris.spark.rest.CreateGenericTableRequest;
@@ -58,6 +57,7 @@ import org.apache.polaris.spark.rest.GenericTable;
 import org.apache.polaris.spark.rest.GetSubtransactionRESTResponse;
 import org.apache.polaris.spark.rest.ListGenericTablesRESTResponse;
 import org.apache.polaris.spark.rest.LoadGenericTableRESTResponse;
+import org.apache.polaris.spark.rest.RollbackSubtransactionRESTRequest;
 import org.apache.polaris.spark.rest.StagedTableCommitRESTRequest;
 import org.apache.polaris.spark.rest.SubtransactionRESTResponse;
 import org.apache.polaris.spark.rest.TransactionRESTResponse;
@@ -358,24 +358,26 @@ public class PolarisRESTCatalog implements PolarisCatalog, Closeable {
   }
 
   /**
-   * POST /polaris/v1/{prefix}/transactions/{txnId}/subtransactions/{subtxnId}/commit — registers
-   * the staged metadata location for a worker subtransaction. Requires X-Subtxn-Token header.
+   * POST /polaris/v1/{prefix}/transactions/{txnId}/subtransactions/{subtxnId}/commit — atomically
+   * stages the whole subtransaction for commit. Body-less: the server assigned each operation's
+   * staging path at create time, so the worker only proves ownership via the X-Subtxn-Token header.
+   * Marks every operation COMMITTED at its assigned path and the subtransaction STAGED.
    */
-  public void commitSubtransaction(
-      long txnId, long subtxnId, String subtxnToken, String stagedMetadataLocation) {
+  public void commitSubtransaction(long txnId, long subtxnId, String subtxnToken) {
     restClient
         .withAuthSession(this.catalogAuth)
         .post(
             pathGenerator.subtransactionCommit(txnId, subtxnId),
-            new CommitSubtransactionRESTRequest(stagedMetadataLocation),
+            null,
             TransactionRESTResponse.class,
             Map.of("X-Subtxn-Token", subtxnToken),
             ErrorHandlers.defaultErrorHandler());
   }
 
   /**
-   * POST /polaris/v1/{prefix}/transactions/{txnId}/subtransactions/{subtxnId}/abort — marks the
-   * subtransaction as aborted so the orchestrator can commit without it. Requires X-Subtxn-Token.
+   * POST /polaris/v1/{prefix}/transactions/{txnId}/subtransactions/{subtxnId}/abort — rolls the
+   * subtransaction back permanently (not reopened): its operations are aborted and the parent
+   * transaction skips it at commit. Requires X-Subtxn-Token.
    */
   public void abortSubtransaction(long txnId, long subtxnId, String subtxnToken) {
     restClient
@@ -385,6 +387,31 @@ public class PolarisRESTCatalog implements PolarisCatalog, Closeable {
             null,
             TransactionRESTResponse.class,
             Map.of("X-Subtxn-Token", subtxnToken),
+            ErrorHandlers.defaultErrorHandler());
+  }
+
+  /**
+   * POST /polaris/v1/{prefix}/transactions/{txnId}/subtransactions/{subtxnId}/rollback — rolls the
+   * subtransaction back and, when {@code reopenForRetry} is true (default), reopens it (attempt++)
+   * so the same subtransaction can be re-staged, possibly by a different worker. Accepts the
+   * X-Subtxn-Token (worker) or X-Txn-Token (orchestrator) — pass whichever is non-null.
+   */
+  public void rollbackSubtransaction(
+      long txnId, long subtxnId, String subtxnToken, String txnToken, boolean reopenForRetry) {
+    Map<String, String> headers = new java.util.HashMap<>();
+    if (subtxnToken != null && !subtxnToken.isBlank()) {
+      headers.put("X-Subtxn-Token", subtxnToken);
+    }
+    if (txnToken != null && !txnToken.isBlank()) {
+      headers.put("X-Txn-Token", txnToken);
+    }
+    restClient
+        .withAuthSession(this.catalogAuth)
+        .post(
+            pathGenerator.subtransactionRollback(txnId, subtxnId),
+            new RollbackSubtransactionRESTRequest(reopenForRetry),
+            TransactionRESTResponse.class,
+            headers,
             ErrorHandlers.defaultErrorHandler());
   }
 

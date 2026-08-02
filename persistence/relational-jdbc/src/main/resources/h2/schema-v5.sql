@@ -19,8 +19,9 @@
 
 -- Changes from v4:
 --  * Added multi-table transaction support tables:
---    - txn_id_seq, transactions (with parent_txn_id for nesting), transaction_operations,
---      txn_snapshots, committed_table_snapshots, locks, txn_watermark
+--    - txn_id_seq, transactions (with parent_txn_id for nesting), subtransactions
+--      (retry/rollback/savepoint grouping), transaction_operations, txn_snapshots,
+--      committed_table_snapshots, locks, txn_watermark
 --  * H2: TEXT for JSON-like columns, MERGE for version, sequences instead of BIGSERIAL,
 --    no partial indexes on txn_snapshots (H2 index DDL)
 
@@ -329,9 +330,33 @@ CREATE INDEX IF NOT EXISTS idx_txns_realm_status
 CREATE UNIQUE INDEX IF NOT EXISTS idx_txns_token
     ON transactions (txn_token);
 
+-- subtransactions (retry / rollback / savepoint boundary): group 1..N per-table
+-- operations that succeed-or-fail together; the retry boundary for cross-process
+-- ingestion and single-session savepoints alike. See postgres/schema-v5.sql for full notes.
+-- status: 0=OPEN, 1=STAGED, 2=ABORTED.
+CREATE TABLE IF NOT EXISTS subtransactions (
+    subtxn_id    BIGINT PRIMARY KEY,
+    txn_id       BIGINT NOT NULL,
+    realm_id     TEXT NOT NULL,
+    catalog_id   BIGINT NOT NULL,
+    name         TEXT,
+    subtxn_token TEXT NOT NULL,
+    status       SMALLINT NOT NULL DEFAULT 0,
+    attempt      INT NOT NULL DEFAULT 1,
+    created_at   TIMESTAMP NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMP NOT NULL,
+    ended_at     TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_subtxns_txn
+    ON subtransactions (txn_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subtxns_token
+    ON subtransactions (subtxn_token);
+
 CREATE TABLE IF NOT EXISTS transaction_operations (
     op_id                         BIGINT PRIMARY KEY,
     txn_id                        BIGINT NOT NULL,
+    subtxn_id                     BIGINT,
     realm_id                      TEXT NOT NULL,
     catalog_id                    BIGINT NOT NULL,
     table_uuid                    TEXT NOT NULL,
@@ -350,6 +375,8 @@ CREATE TABLE IF NOT EXISTS transaction_operations (
 
 CREATE INDEX IF NOT EXISTS idx_ops_txn
     ON transaction_operations (txn_id, status);
+CREATE INDEX IF NOT EXISTS idx_ops_subtxn
+    ON transaction_operations (subtxn_id, status);
 CREATE INDEX IF NOT EXISTS idx_ops_table
     ON transaction_operations (realm_id, catalog_id, table_uuid, status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ops_token

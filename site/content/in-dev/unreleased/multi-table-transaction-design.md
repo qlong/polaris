@@ -23,8 +23,6 @@
     - [The Server Process Stays Stateless Even Though Transactions Are Stateful](#the-server-process-stays-stateless-even-though-transactions-are-stateful)
     - [Why Transaction Coordination Cannot Be Pushed to the Engine or Client Side](#why-transaction-coordination-cannot-be-pushed-to-the-engine-or-client-side)
 
-> **Implementation status (2026-06-09):** Phase 1 and Phase 2 are implemented. All known open items resolved: (1) `assigned_staging_path` now points to a specific file inside the table's own metadata directory (`{table.location}/metadata/{txn_id}-{subtxn_id}-{uuid}.metadata.json`), fixing the credential-vending location check failure on `loadTable?txn_id=T` (RYOW). (2) `IcebergCatalogHandler` RYOW lookup now uses `tableIdentifier.toString()` to correctly match `subtransactions.table_uuid`.
-
 > **Key insight — two kinds of "snapshot"**: The word "snapshot" has two distinct meanings in this system. A **`TxnSnapshot`** carries a single **`read_point`** — a monotonic commit-order value (a *commit timestamp*) captured when the snapshot is taken. It determines which committed table states a reader can see: a committed table snapshot is visible iff its `commit_scn <= read_point`. An **Iceberg table snapshot** (`table_snapshot_id`) is the native Iceberg point-in-time state of a table's data files. The catalog server maintains a `committed_table_snapshots` mapping table that translates a `read_point` into the specific Iceberg table snapshot to serve for each table. Pure readers acquire a `txn_snapshot_id` — lightweight, lock-free, no CLOG entry — and pass it on every table read; the server resolves the correct Iceberg table snapshot automatically. A query that reads multiple tables **must** use a shared `TxnSnapshot`; without one, successive reads can observe different committed states and produce a torn cross-table view.
 >
 > This is deliberately *simpler* than PostgreSQL's `pg_snapshot` `(xmin, xmax, xip_list)` triple. See [Why a single `read_point`](#why-a-single-read_point-and-not-xmin-xmax-xip) for why the triple is unnecessary in this model.
@@ -99,17 +97,32 @@ Status values:
 
 The CLOG is the authoritative record of transaction *lifecycle* — it governs commit/abort and write-conflict decisions. It is **not** consulted on the read path. Because a `committed_table_snapshots` row is written **only at commit** (an aborted or in-flight transaction leaves no row — see [Abort: No Undo Log Needed](#abort-no-undo-log-needed)), the mere existence of a mapping row already means "committed." A reader therefore never needs to ask the CLOG whether a writer committed: it compares `commit_scn <= read_point` against the mapping table and is done. This is the structural difference from PostgreSQL that lets us drop `(xmin, xmax, xip)` — see [Why a single `read_point`](#why-a-single-read_point-and-not-xmin-xmax-xip).
 
-### Subtransaction
+### Subtransaction + Operations
 
-Each table involved in a multi-table transaction is managed by a **subtransaction** — a child unit of work scoped to exactly one table. The subtransaction lifecycle is:
+Each table involved in a multi-table transaction is staged by an **operation** — a child unit of work scoped to exactly one table. An operation's lifecycle is:
 
 ```
 IN_PROGRESS   → the client is writing data files to object storage
-SUB_COMMITTED → client has staged metadata; waiting for parent to commit
-ABORTED       → subtransaction failed or parent was aborted
+COMMITTED     → client has staged metadata; waiting for parent to commit  (a.k.a. SUB_COMMITTED)
+ABORTED       → operation failed, its subtransaction was rolled back, or the parent was aborted
 ```
 
-Subtransactions inherit their parent's txn_id for ordering purposes, but have their own subtxn_id for fine-grained tracking. A top-level `COMMIT` is only executed when ALL subtransactions have reached `SUB_COMMITTED`. If any subtransaction fails, the parent is aborted and all subtransactions are rolled back.
+Operations inherit their parent's `txn_id` for ordering, but each has its own `op_id` (and per-operation `op_token`) for fine-grained tracking. A top-level `COMMIT` is only executed when every *live* operation has reached `COMMITTED`.
+
+**Why the extra subtransaction level.** A single per-table row cannot express "these three tables succeed or fail *together*, and can be retried as a group by a different worker." The **subtransaction** is that succeed-or-fail / retry boundary:
+
+```
+OPEN     → accepting operations; the subtransaction's tables are being written
+STAGED   → all operations COMMITTED and locks released; ready for parent COMMIT
+ABORTED  → the subtransaction was rolled back; its operations are discarded and skipped at COMMIT
+```
+
+Rolling a subtransaction back aborts **exactly its operations** (and releases their locks), leaving other subtransactions' staged work untouched — so only the failed tables are re-run, not the whole transaction. A rollback can optionally **re-open** the subtransaction (`attempt++`) with *fresh operation rows and fresh staging paths*, so the same logical subtransaction can be re-staged (possibly by a different worker) without colliding with the orphaned files from the failed attempt. This one object serves both:
+
+- **Cross-process parallel ingestion** (Use Case 2): different workers write the subtransaction's operations; any of them can retry the subtransaction.
+- **Single-session PostgreSQL-style savepoints**: one session creates a named subtransaction (`SAVEPOINT <name>`), stages it, and can `ROLLBACK TO` it before `COMMIT`.
+
+A **bare inline operation** (Use Case 1, single-session commit) has `subtxn_id = NULL` — it belongs to no subtransaction and is finalized directly at the top-level `COMMIT`.
 
 ### Terminology: Two Kinds of "Snapshot"
 
@@ -172,13 +185,13 @@ TxnSnapshot RS (read_point=5050)
          │   visible to RS for table orders?"
          ▼
 committed_table_snapshots
-  table=orders, commit_scn=5040, table_snapshot_id=42   ← visible (5040 <= 5050)
-  table=orders, commit_scn=5048, table_snapshot_id=43   ← most recent visible (5048 <= 5050)
-  table=orders, commit_scn=5055, table_snapshot_id=44   ← NOT visible (5055 > 5050)
+  table=orders, commit_scn=5040, iceberg_snapshot_id=42   ← visible (5040 <= 5050)
+  table=orders, commit_scn=5048, iceberg_snapshot_id=43   ← most recent visible (5048 <= 5050)
+  table=orders, commit_scn=5055, iceberg_snapshot_id=44   ← NOT visible (5055 > 5050)
          │
-         │  answer: table_snapshot_id=43
+         │  answer: iceberg_snapshot_id=43
          ▼
-Iceberg metadata JSON for orders at table_snapshot_id=43
+Iceberg metadata JSON for orders at iceberg_snapshot_id=43
 → scan data files
 ```
 
@@ -186,7 +199,7 @@ The mapping query:
 
 ```sql
 -- Given `TxnSnapshot` RS, find the Iceberg table snapshot to serve for a given table
-SELECT table_snapshot_id, metadata_location
+SELECT iceberg_snapshot_id, metadata_location
 FROM committed_table_snapshots
 WHERE table_uuid = :table_uuid
   AND commit_scn <= :read_point    -- committed at or before RS was taken
@@ -270,12 +283,7 @@ Locks are acquired pessimistically (before writing) for multi-table transactions
 
 All transaction state lives in the REST catalog server's backend database. No shared memory is required. The catalog DB's own ACID transactions provide atomicity for state changes.
 
-> **Implementation divergences vs. the shipped schema.** The DDL in this section is the *conceptual* model; the authoritative schema is `persistence/relational-jdbc/src/main/resources/{postgres,h2}/schema-v5.sql`, and the implementation status is tracked in [multi-table_transactions.plan.md](multi-table_transactions.plan.md). Notable deltas:
-> - **`subtransactions` → `transaction_operations`** at the persistence layer (`SubtransactionRow`→`OperationRow`, `createSubtransaction`→`createOperation`). The REST/SQL surface still says "subtransaction" (`CREATE SUBTRANSACTION FOR`, `/subtransactions/{id}`).
-> - **Lock modes are the 3 PostgreSQL-style modes** `ROW_EXCLUSIVE` / `EXCLUSIVE` / `ACCESS_EXCLUSIVE` (see the [Lock Hierarchy](#lock-hierarchy) note), not the 5 data-semantic modes some examples below still narrate.
-> - **Read-write transactions link a `txn_snapshots` row via `txn_snapshot_id`** rather than storing an inline `read_point` column on `transactions` (so the embedded-`read_point` DDL below is conceptual).
-> - **`committed_txn_id` → `commit_scn`**, a *transactional per-catalog counter* (`commit_scn_counter`), not a sequence value — see [Why a single `read_point`](#why-a-single-read_point-and-not-xmin-xmax-xip).
-> - **`lock_resource`** — an added per-`(realm, catalog, resource)` anchor table used purely as a `SELECT … FOR UPDATE` gate so `LockManager.acquire`'s check-then-insert is atomic across Polaris nodes (a plain lock on `locks` can't stop two phantom inserts).
+> The authoritative schema is `persistence/relational-jdbc/src/main/resources/{postgres,h2}/schema-v5.sql`; implementation status is tracked in [multi-table_transactions.plan.md](multi-table_transactions.plan.md).
 
 ### `transactions` — The CLOG
 
@@ -285,62 +293,115 @@ Only write transactions (single-table pessimistic or multi-table) get a row here
 CREATE TABLE transactions (
     txn_id           BIGINT PRIMARY KEY,
                      -- server-assigned from monotone sequence; writers only
-    txn_token        BYTEA NOT NULL,
-                     -- opaque top-level bearer secret (gen_random_bytes(32));
+    parent_txn_id    BIGINT REFERENCES transactions(txn_id),
+                     -- NULL for top-level; non-NULL for nested transactions
+    realm_id         TEXT NOT NULL,
+    catalog_id       BIGINT NOT NULL,
+    txn_token        TEXT NOT NULL,
+                     -- opaque top-level bearer secret (random 32-byte hex);
                      -- held only by the transaction owner / orchestrator;
                      -- required to commit or abort the top-level transaction
     owner_principal  TEXT NOT NULL,
                      -- authenticated identity that called BEGIN; enforced on every operation
     status           SMALLINT NOT NULL DEFAULT 0,
                      -- 0=IN_PROGRESS, 1=COMMITTED, 2=ABORTED
-    isolation        SMALLINT NOT NULL DEFAULT 1,
-                     -- 0=READ_COMMITTED, 1=REPEATABLE_READ, 2=SERIALIZABLE
-    -- Embedded read_point for snapshot isolation (REPEATABLE_READ) transactions
-    read_point       BIGINT,      -- commit high-water-mark pinned at BEGIN;
-                     -- NULL for READ_COMMITTED (fresh read point per statement)
-    started_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    ended_at         TIMESTAMPTZ,
-    expires_at       TIMESTAMPTZ NOT NULL
+    isolation        TEXT NOT NULL DEFAULT 'REPEATABLE_READ',
+                     -- 'READ_COMMITTED' or 'REPEATABLE_READ'
+    txn_snapshot_id  BIGINT,
+                     -- FK to txn_snapshots; NULL for READ_COMMITTED.
+                     -- The read_point (visibility cutoff) lives in the referenced txn_snapshots row.
+    started_at       TIMESTAMP NOT NULL DEFAULT now(),
+    ended_at         TIMESTAMP,
+    expires_at       TIMESTAMP NOT NULL
                      -- hard deadline; reaper aborts expired transactions
 );
 
-CREATE INDEX txn_status_idx ON transactions (status, txn_id);
+CREATE INDEX idx_txns_realm_status ON transactions (realm_id, catalog_id, status, expires_at);
+CREATE UNIQUE INDEX idx_txns_token ON transactions (txn_token);
 ```
 
-### `subtransactions` — Per-Table Work Units
+### `subtransactions` — The Retry/Rollback Boundary
+
+A **subtransaction** groups 1..N per-table operations under a single boundary that can be committed, rolled back, or re-opened for retry as a group. It is what makes both cross-process parallel ingestion and single-session `SAVEPOINT` work.
 
 ```sql
 CREATE TABLE subtransactions (
-    subtxn_id                BIGINT PRIMARY KEY,
-    parent_txn_id            BIGINT NOT NULL REFERENCES transactions (txn_id),
-    table_uuid               UUID NOT NULL,
-    base_snapshot_id         BIGINT,
-                             -- Iceberg snapshot_id at subtxn start; used for conflict check
-    staged_metadata_location TEXT,
-                             -- written by client to object storage; applied on parent commit
-    assigned_staging_path    TEXT,
-                             -- server-assigned path WITHIN the table's canonical metadata
-                             -- directory (e.g. s3://warehouse/ns/table/metadata/<uuid>.metadata.json).
-                             -- Placing the file inside the table's own tree is intentional:
-                             -- the catalog pointer controls visibility (not the file's location),
-                             -- so the file is invisible until commitTransaction swaps the pointer,
-                             -- and credential vending / location validation work without special-casing.
-    subtxn_token             BYTEA NOT NULL,
-                             -- opaque per-subtxn bearer secret (gen_random_bytes(32));
-                             -- authorizes only this subtxn's operations; does NOT allow
-                             -- top-level commit/abort (those require transactions.txn_token)
-    status                   SMALLINT NOT NULL DEFAULT 0
-                             -- 0=IN_PROGRESS, 1=SUB_COMMITTED, 2=ABORTED
+    subtxn_id    BIGINT PRIMARY KEY,
+    txn_id       BIGINT NOT NULL REFERENCES transactions (txn_id),
+    realm_id     TEXT   NOT NULL,
+    catalog_id   BIGINT NOT NULL,
+    name         TEXT,                    -- optional user label; the SAVEPOINT name.
+                                          -- unique per txn while the subtransaction is not aborted.
+    subtxn_token TEXT   NOT NULL,         -- random 32-byte hex; held by the subtransaction driver
+                                          -- (the worker/session that owns this subtransaction's operations)
+    status       SMALLINT NOT NULL DEFAULT 0,
+                                          -- 0=OPEN     (accepting operations)
+                                          -- 1=STAGED   (all operations COMMITTED, locks released,
+                                          --             ready for the parent COMMIT)
+                                          -- 2=ABORTED  (rolled back; operations discarded/skipped at COMMIT)
+    attempt      INT NOT NULL DEFAULT 1,  -- incremented each time a rollback re-opens the subtransaction for retry
+    created_at   TIMESTAMP NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMP NOT NULL,
+    ended_at     TIMESTAMP
 );
 
-CREATE INDEX subtxn_parent_idx ON subtransactions (parent_txn_id);
-CREATE INDEX subtxn_table_idx  ON subtransactions (table_uuid, parent_txn_id);
+-- a SAVEPOINT name is unique within a txn, but only among live (non-aborted) subtransactions,
+-- so ROLLBACK TO + a fresh SAVEPOINT of the same name is allowed
+CREATE UNIQUE INDEX subtxn_name_idx ON subtransactions (realm_id, txn_id, name)
+    WHERE name IS NOT NULL AND status <> 2;
+```
+
+### `transaction_operations` — Per-Table Staging
+
+One operation stages exactly one table. `subtxn_id = NULL` means a **bare inline operation** (the single-session commit path, Use Case 1, finalized directly at the top-level `COMMIT`); a non-null `subtxn_id` makes it a child of a subtransaction (Use Case 2).
+
+```sql
+CREATE TABLE transaction_operations (
+    op_id                         BIGINT PRIMARY KEY,
+    txn_id                        BIGINT NOT NULL REFERENCES transactions (txn_id),
+    subtxn_id                     BIGINT REFERENCES subtransactions (subtxn_id),
+                                  -- NULL = bare inline op; non-null = child of a subtransaction
+    realm_id                      TEXT   NOT NULL,
+    catalog_id                    BIGINT NOT NULL,
+    table_uuid                    TEXT   NOT NULL,
+    lock_mode                     TEXT   NOT NULL DEFAULT 'ROW_EXCLUSIVE',
+    base_snapshot_id              BIGINT,
+                                  -- Iceberg snapshot_id at operation start; used for conflict check
+    server_base_metadata_location TEXT,
+                                  -- committed metadata-location captured at operation-create time;
+                                  -- commit-time conflict = current committed location has diverged from this
+    assigned_staging_path         TEXT NOT NULL,
+                                  -- server-assigned path WITHIN the table's canonical metadata directory
+                                  -- (e.g. s3://warehouse/ns/table/metadata/<txnId>-<opId>-<uuid>.metadata.json).
+                                  -- Placing the file inside the table's own tree is intentional:
+                                  -- the catalog pointer controls visibility (not the file's location),
+                                  -- so the file is invisible until commit swaps the pointer, and
+                                  -- credential vending / location validation work without special-casing.
+    staged_metadata_location      TEXT,
+                                  -- written by client to object storage; applied on parent commit
+    op_token                      TEXT NOT NULL,
+                                  -- opaque per-operation bearer secret (32-byte hex);
+                                  -- authorizes only this operation; does NOT allow top-level
+                                  -- commit/abort (those require transactions.txn_token)
+    status                        SMALLINT NOT NULL DEFAULT 0,
+                                  -- 0=IN_PROGRESS, 1=COMMITTED (a.k.a. SUB_COMMITTED), 2=ABORTED
+    retry_of_op_id                BIGINT,
+                                  -- when a rollback re-opened the subtransaction, the fresh op row points at
+                                  -- the failed predecessor it replaces (lineage; new staging path
+                                  -- avoids FileAlreadyExists on the orphaned attempt's files)
+    created_at                    TIMESTAMP NOT NULL DEFAULT now(),
+    expires_at                    TIMESTAMP NOT NULL,
+    ended_at                      TIMESTAMP
+);
+
+CREATE INDEX txn_op_txn_idx   ON transaction_operations (txn_id);
+CREATE INDEX txn_op_subtxn_idx ON transaction_operations (subtxn_id);
+CREATE INDEX txn_op_table_idx ON transaction_operations (table_uuid, txn_id);
 ```
 
 ### `txn_snapshots` — Reader Visibility Snapshots
 
-Only pure readers (no writes) get a row here. Read-write transactions store their `read_point`
-inline in the `transactions` table (`read_point` column).
+Pure readers (no writes) get a row here and pass its `txn_snapshot_id` on every table read. Read-write transactions (`REPEATABLE_READ`) also get a row here; the `transactions` row references it via `txn_snapshot_id`. `READ_COMMITTED` transactions do not pin a snapshot — they take a fresh `read_point` per statement.
 
 ```sql
 CREATE TABLE txn_snapshots (
@@ -349,7 +410,8 @@ CREATE TABLE txn_snapshots (
     read_point        BIGINT NOT NULL,
                       -- commit high-water-mark at snapshot time: the largest
                       -- commit_scn durably committed when this snapshot was taken.
-                      -- Sole visibility bound (replaces the old xmin/xmax/xip triple) and
+                      -- Sole visibility bound (see § Why a single read_point for why the
+                      -- PostgreSQL xmin/xmax/xip triple is unnecessary here) and
                       -- the value that pins the purge watermark while the snapshot is live.
     registered_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at        TIMESTAMPTZ NOT NULL,
@@ -370,21 +432,24 @@ This is the bridge between the transaction system and Iceberg's native table sna
 
 ```sql
 CREATE TABLE committed_table_snapshots (
-    table_uuid          UUID    NOT NULL,
-    table_snapshot_id   BIGINT  NOT NULL,
-                        -- Iceberg's native snapshot ID from the table metadata JSON
+    id                  BIGSERIAL PRIMARY KEY,
+    realm_id            TEXT    NOT NULL,
+    catalog_id          BIGINT  NOT NULL,
+    table_uuid          TEXT    NOT NULL,
     commit_scn          BIGINT  NOT NULL,
                         -- commit-order stamp from commit_scn_counter, allocated atomically
                         -- with the pointer swap that published this snapshot (NOT a txn_id)
+    iceberg_snapshot_id BIGINT,
+                        -- Iceberg's native snapshot ID from the table metadata JSON;
+                        -- NULL for DROP or schema-only changes
     metadata_location   TEXT    NOT NULL,
                         -- path to the Iceberg metadata JSON file for this snapshot
-    committed_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (table_uuid, table_snapshot_id)
+    committed_at        TIMESTAMP NOT NULL DEFAULT now()
 );
 
 -- Critical index: resolves "most recent visible table snapshot" in O(log n)
-CREATE INDEX cts_visibility_idx
-    ON committed_table_snapshots (table_uuid, commit_scn DESC);
+CREATE INDEX idx_cts_table_txn
+    ON committed_table_snapshots (realm_id, catalog_id, table_uuid, commit_scn DESC);
 ```
 
 **`commit_scn_counter` — the per-catalog commit clock.** A single row per `(realm, catalog)` whose `scn` is the source of every `commit_scn`. It is bumped transactionally (see the invariant above), which both orders commits and closes the assign-before-visible window:
@@ -406,7 +471,7 @@ CREATE TABLE commit_scn_counter (
 The visibility resolution query — given a `TxnSnapshot` `RS`, find the Iceberg table snapshot to return for a table:
 
 ```sql
-SELECT table_snapshot_id, metadata_location
+SELECT iceberg_snapshot_id, metadata_location
 FROM committed_table_snapshots
 WHERE table_uuid        = :table_uuid
   AND commit_scn       <= :rs_read_point     -- committed at or before RS was taken
@@ -419,7 +484,7 @@ This query returns the most recently committed Iceberg table snapshot that is vi
 For an unregistered read (no `txn_snapshot_id`), the equivalent is simply the latest committed row (no cutoff):
 
 ```sql
-SELECT table_snapshot_id, metadata_location
+SELECT iceberg_snapshot_id, metadata_location
 FROM committed_table_snapshots
 WHERE table_uuid = :table_uuid
 ORDER BY commit_scn DESC
@@ -430,24 +495,37 @@ LIMIT 1;
 
 ```sql
 CREATE TABLE locks (
-    lock_id       BIGINT PRIMARY KEY,
-    txn_id        BIGINT NOT NULL REFERENCES transactions (txn_id),
-    resource      TEXT NOT NULL,
-                  -- e.g. 'table:<uuid>', 'partition:<uuid>/<spec_id>/<partition_value>'
-    resource_type SMALLINT NOT NULL,
-                  -- 0=TABLE, 1=PARTITION
-    lock_mode     TEXT NOT NULL,
-                  -- as implemented, 3 PostgreSQL-style modes (see § Lock Hierarchy note):
-                  -- 'ROW_EXCLUSIVE' (default, OCC, self-compatible),
-                  -- 'EXCLUSIVE' (table pessimistic write), 'ACCESS_EXCLUSIVE' (blocks all)
-    status        SMALLINT NOT NULL DEFAULT 0,
-                  -- 0=WAITING, 1=GRANTED
-    requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    granted_at    TIMESTAMPTZ
+    lock_id      BIGSERIAL PRIMARY KEY,
+    txn_id       BIGINT NOT NULL REFERENCES transactions (txn_id),
+    realm_id     TEXT NOT NULL,
+    catalog_id   BIGINT NOT NULL,
+    resource     TEXT NOT NULL,
+                 -- "{table_uuid}" or "{table_uuid}:{partition_spec_id}:{partition_value}"
+    lock_mode    TEXT NOT NULL,
+                 -- 'ROW_EXCLUSIVE' (default, OCC, self-compatible),
+                 -- 'EXCLUSIVE' (table pessimistic write), 'ACCESS_EXCLUSIVE' (blocks all)
+    status       SMALLINT NOT NULL DEFAULT 0,
+                 -- 0=WAITING, 1=GRANTED
+    requested_at TIMESTAMP NOT NULL DEFAULT now(),
+    granted_at   TIMESTAMP
 );
 
-CREATE INDEX locks_resource_idx ON locks (resource, status);
-CREATE INDEX locks_txn_idx      ON locks (txn_id, status);
+CREATE INDEX idx_locks_resource ON locks (realm_id, catalog_id, resource, status);
+CREATE INDEX idx_locks_txn      ON locks (txn_id, status);
+```
+
+### `lock_resource` — Per-Resource Serialization Anchor
+
+One always-present row per lockable `(realm, catalog, resource)`, used exclusively as a `SELECT … FOR UPDATE` gate around the check-then-insert critical section in `LockManager.acquire`. Without it, two Polaris nodes could each observe zero conflicts and both insert conflicting lock rows (a phantom insert that locking the `locks` table itself cannot prevent). Locking this anchor row serializes the grant decision fleet-wide; the anchor lock is held only for the duration of the critical section (released when that short DB transaction commits). The long-lived lock remains the `locks` row. Per-resource granularity means acquisitions on different tables never serialize against each other.
+
+```sql
+CREATE TABLE lock_resource (
+    realm_id   TEXT   NOT NULL,
+    catalog_id BIGINT NOT NULL,
+    resource   TEXT   NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT now(),
+    PRIMARY KEY (realm_id, catalog_id, resource)
+);
 ```
 
 ### `txn_watermark` — Purge Horizon
@@ -520,58 +598,64 @@ Phantom reads are prevented at snapshot isolation because the read view is fixed
 
 ## Lock Hierarchy
 
-> **Implemented protocol (3 modes).** The design below presents 5 *data-semantic* modes (`APPEND` / `ROW_DELTA` / `OVERWRITE` / `EXCLUSIVE` / `ACCESS_EXCLUSIVE`) to motivate the compatibility reasoning. The shipped `LockManager` collapses these to **3 PostgreSQL-style modes**: **`ROW_EXCLUSIVE`** (default, OCC-style, self-compatible — the old "APPEND = no blocking lock" role, now a recorded-but-non-blocking row), **`EXCLUSIVE`** (table-level pessimistic write), and **`ACCESS_EXCLUSIVE`** (blocks everything). Conflict routing is keyed on metadata-location divergence at commit (merge-and-retry for `ROW_EXCLUSIVE`; first-committer-wins abort for `EXCLUSIVE`/`ACCESS_EXCLUSIVE`), not on the data-semantic mode. `LockManager.acquire` serializes its check-then-insert across nodes via the `lock_resource` anchor (`SELECT … FOR UPDATE`). Read the modes below as the conceptual rationale; the 3-mode matrix in `LockManager.java` is authoritative.
-
 ### Lock Modes
 
-Locks are ordered from weakest (most compatible) to strongest (least compatible):
+Three PostgreSQL-style modes, ordered from least to most restrictive:
 
-| Mode | Code | Description | Typical Operation |
-|---|---|---|---|
-| `APPEND` | 0 | Add new files; never conflicts with anything | `newAppend()`, `newFastAppend()` |
-| `ROW_DELTA` | 1 | Positional deletes + new data files within partitions | `newRowDelta()` (UPDATE/DELETE) |
-| `OVERWRITE` | 2 | Replace entire partition(s) | `newReplacePartitions()`, `newOverwrite()` |
-| `EXCLUSIVE` | 3 | Full table write serialization | `newRewrite()`, compaction |
-| `ACCESS_EXCLUSIVE` | 4 | Block all access including reads | Schema evolution DDL |
+| Mode | Description | Typical Operation |
+|---|---|---|
+| `ROW_EXCLUSIVE` | Default OCC mode. A lock row is recorded so that a concurrent `EXCLUSIVE` acquirer can detect it. Self-compatible: multiple `ROW_EXCLUSIVE` holders on the same resource coexist. Conflicts detected at commit via metadata-location divergence (merge-and-retry for the subtransaction path; first-committer-wins abort for the inline path). Plays the role a non-blocking append lock would: ingest-level concurrency is preserved, but the record exists for EXCLUSIVE to inspect. | Default for all write operations |
+| `EXCLUSIVE` | Full-table pessimistic write serialization. Blocks all other writers (any mode). Used when the cost of an OCC retry is unacceptable (e.g. compaction, long-running rewrites). | `newRewrite()`, compaction |
+| `ACCESS_EXCLUSIVE` | Blocks all access, including other `ROW_EXCLUSIVE` holders. Reserved for operations that must prevent all concurrent writes (e.g. destructive DDL). | Schema evolution DDL (destructive) |
+
+`LockManager.acquire` serializes its check-then-insert across all Polaris nodes via the `lock_resource` anchor table (`SELECT … FOR UPDATE`), preventing phantom-insert races on the `locks` table.
 
 ### Lock Compatibility Matrix
 
 ```
-                 APPEND   ROW_DELTA   OVERWRITE   EXCLUSIVE   ACCESS_EXCLUSIVE
-APPEND             ✅         ✅          ✅           ✅              ❌
-ROW_DELTA          ✅         ❌*         ❌           ❌              ❌
-OVERWRITE          ✅         ❌          ❌           ❌              ❌
-EXCLUSIVE          ✅         ❌          ❌           ❌              ❌
-ACCESS_EXCLUSIVE   ❌         ❌          ❌           ❌              ❌
+                   ROW_EXCLUSIVE   EXCLUSIVE   ACCESS_EXCLUSIVE
+ROW_EXCLUSIVE           ✅             ❌              ❌
+EXCLUSIVE               ❌             ❌              ❌
+ACCESS_EXCLUSIVE        ❌             ❌              ❌
 ```
 
-\* Two `ROW_DELTA` operations on **different partitions** of the same table are compatible even though `ROW_DELTA` conflicts with itself at the same partition. Lock resource granularity handles this: `partition:<uuid>/date=2024-01-15` and `partition:<uuid>/date=2024-01-16` are different resources.
+(Source: `LockManager.COMPAT` in `LockManager.java` — rows = held mode, columns = requested mode.)
 
 Key properties:
-- **APPEND never conflicts with any write mode** — concurrent appenders always proceed, preserving Iceberg's high-throughput ingest model.
+- **`ROW_EXCLUSIVE` is self-compatible** — multiple concurrent holders can coexist; conflict is resolved at commit time rather than at lock-acquire time.
+- **`EXCLUSIVE` and `ACCESS_EXCLUSIVE` block everything** — once granted, no other lock on the same resource can be acquired until the holding transaction ends.
 - **Reads (snapshot acquisition) never block** — no read lock is taken; the snapshot mechanism provides read isolation without locking.
-- **ACCESS_EXCLUSIVE conflicts with APPEND** — DDL (schema evolution) is the only operation that blocks readers.
+
+### Conflict Routing
+
+Conflict detection at `COMMIT` compares a per-table **baseline** metadata-pointer against the table's current committed pointer. A difference means another writer advanced the table during this transaction's window.
+
+| Lock mode | On metadata conflict at commit |
+|---|---|
+| `ROW_EXCLUSIVE` (subtransaction path) | **Merge-and-retry** — server re-derives the added data files and re-applies them onto the current table state (`extractAddedDataFiles` → fresh `newAppend()`). Commit succeeds without the client having to retry. |
+| `ROW_EXCLUSIVE` (inline path) | **First-committer-wins abort** (HTTP 409) — the inline path has no per-table subtransaction to re-parent, so abort is the only correct response. |
+| `EXCLUSIVE` / `ACCESS_EXCLUSIVE` | **First-committer-wins abort** in all cases. |
 
 ### Lock Granularity
 
 ```
 Catalog
   └── Namespace
-        └── Table  ← TABLE-level locks (EXCLUSIVE, ACCESS_EXCLUSIVE, OVERWRITE of whole table)
-              └── Partition  ← PARTITION-level locks (ROW_DELTA, OVERWRITE of specific partitions)
+        └── Table  ← TABLE-level locks (EXCLUSIVE, ACCESS_EXCLUSIVE)
+              └── Partition  ← PARTITION-level locks (ROW_EXCLUSIVE on specific partitions)
 ```
 
-Multi-table transactions acquire locks at the granularity appropriate to each subtransaction's operation:
+Multi-table transactions acquire locks at the granularity appropriate to each operation:
 
 ```
 Multi-table transaction T1:
-  SubTxn S1: RowDelta on orders/date=2024-01-15
-             → acquire ROW_DELTA lock on partition:orders-uuid/date=2024-01-15
-  SubTxn S2: Append to customers
-             → no lock needed (APPEND is always optimistic)
+  Op S1: update rows in orders/date=2024-01-15
+         → acquire ROW_EXCLUSIVE lock on partition:orders-uuid/date=2024-01-15
+  Op S2: append to customers
+         → acquire ROW_EXCLUSIVE lock on customers (recorded for EXCLUSIVE detection)
 ```
 
-The multi-table wrapper does **not** escalate lock granularity. Each subtransaction acquires only what its specific operation requires.
+The multi-table wrapper does **not** escalate lock granularity. Each operation acquires only what its specific work requires.
 
 ---
 
@@ -579,21 +663,46 @@ The multi-table wrapper does **not** escalate lock granularity. Each subtransact
 
 ### When Locks Are Not Needed
 
-**Append operations are always lock-free and optimistic**, regardless of whether they are inside a multi-table transaction or not. Appends add new files to the manifest without modifying or deleting existing files. There is no data-level conflict between concurrent appenders. The existing optimistic CAS (compare-and-swap on the metadata pointer) is sufficient.
+**Append operations run lock-free and optimistic by default**, regardless of whether they are inside a multi-table transaction or not. Appends add new data files to the manifest without modifying or deleting existing files. There is no data-level conflict between concurrent appenders; the existing optimistic CAS (compare-and-swap on the metadata pointer) is sufficient. A `ROW_EXCLUSIVE` lock row is still recorded for append operations inside a multi-table transaction so that a concurrent `EXCLUSIVE` acquirer can detect the active writer, but this does not block other appenders.
 
 This is the most important property to preserve: Iceberg's high-throughput ingest workload — thousands of concurrent Spark tasks appending to partitions — must remain completely unaffected by the addition of the transaction system.
 
 ### When Locks Are Needed
 
 Locks are acquired for operations that can conflict at the data level:
-- `ROW_DELTA`: may delete rows from a partition that another writer is also modifying
-- `OVERWRITE`: replaces entire partition(s); conflicts with any other write on those partitions
-- `EXCLUSIVE`: whole-table rewrite (compaction); conflicts with all other writes
-- `ACCESS_EXCLUSIVE`: DDL; conflicts with all access
+- **Positional-delete / row-delta writes**: may delete rows from a partition that another writer is also modifying — requires `ROW_EXCLUSIVE` lock on the partition; use `EXCLUSIVE` if the client cannot tolerate an OCC retry.
+- **Partition overwrite**: replaces entire partition(s); use `EXCLUSIVE` to block all other writers on those partitions.
+- **Full-table rewrite / compaction**: whole-table operation; requires `EXCLUSIVE` lock on the table.
+- **Destructive DDL**: requires `ACCESS_EXCLUSIVE` lock on the table.
 
-For **single-table operations**, locks are optional. The existing optimistic retry model remains the default. Pessimistic locking is opt-in for clients that cannot afford the cost of a retry (e.g., a long-running expensive computation).
+For **single-table operations**, `ROW_EXCLUSIVE` (the default) uses OCC and the optimistic retry model. `EXCLUSIVE` / `ACCESS_EXCLUSIVE` are opt-in for clients that cannot afford the cost of a retry.
 
-For **multi-table operations**, pessimistic locking is mandatory for write subtransactions that involve `ROW_DELTA` or `OVERWRITE`. Without upfront locking, a subtransaction could write hours of S3 data only to discover a conflict at commit time — and it cannot retry just that one table because the other tables have already reached `SUB_COMMITTED`.
+For **multi-table operations**, upfront locking is mandatory for write operations that modify or replace existing data. Without it, an operation could write hours of data to object storage only to discover a conflict at commit time — and it cannot retry just that one table because the other operations have already reached `COMMITTED`.
+
+### Conflict Resolution at Commit: Two Paths
+
+Conflict detection at `COMMIT` compares a per-table **baseline** metadata-pointer against the table's *current* committed pointer. A difference means some other writer advanced the table during this transaction's window. The two paths capture the baseline at different moments:
+
+- **Inline path** — the baseline is the pointer visible under the transaction's `read_point` (its `BEGIN`-time snapshot), resolved via `resolveTableMetadataLocation`.
+- **Subtransaction path** — the baseline is `server_base_metadata_location`, captured when the *operation* was created (i.e. at lock-acquire / `createOperation` time, which for a long-running worker can be well after `BEGIN`). A `null` baseline with a non-`null` current pointer is *also* treated as a conflict, so a concurrent commit that lands in the lock-acquire→`COMMIT` window cannot be silently overwritten.
+
+What happens on a conflict then depends on **which commit path** produced the staged metadata — and the two paths deliberately behave differently:
+
+| | **Inline path** (Use Case 1) | **Subtransaction path** (Use Case 2) |
+|---|---|---|
+| Who staged the metadata | A single client session, built locally on top of its pinned `BEGIN` snapshot | A worker per table, whose added data files the **server** re-derives from the staged file |
+| Conflict → `ROW_EXCLUSIVE` (default) | **First-committer-wins abort** (serialization failure, HTTP 409) | **Merge-and-retry** — server re-parents the added data files onto current state, commit succeeds |
+| Conflict → `EXCLUSIVE` / `ACCESS_EXCLUSIVE` | First-committer-wins abort | First-committer-wins abort |
+| Code | `TransactionService.prepareInlineCommit` | `TransactionService.prepareCommit` |
+
+**Why inline can't merge-and-retry.** The subtransaction path can merge because the server holds each table's staged metadata as a distinct operation and can extract just that operation's added data files (`extractAddedDataFiles`) and re-apply them onto the live table via a fresh `newAppend()` — a genuine server-side re-derivation. The inline path has no such per-table subtransaction: one client session staged the entire multi-table write against one pinned view, and the server only receives file *locations*. There is nothing to re-parent, so the only correct response to a conflict is to abort. (There is a second, structural reason: at finalize time the server must call `ops.commit(base, staged)` with `base == ops.current()` because `IcebergCatalog.commit` requires reference equality on `base`. It therefore cannot hand Iceberg's own OCC the client's pinned base, so Iceberg's native CAS cannot detect the concurrent write on our behalf — the divergence check in `prepareInlineCommit` *is* the OCC for this path.)
+
+**First-committer-wins is one-directional — it defends your snapshot, it does not block others.** The divergence check aborts a transaction only if the pointer moved *between its own `BEGIN` and its own `COMMIT`*. It is not mutual exclusion. This produces an intentional asymmetry with a concurrent *non-transactional* writer W on the same table:
+
+- **Someone else commits first.** If W commits inside the inline transaction's window, the inline transaction sees `current != baseline` at `COMMIT` and **aborts**. W already won.
+- **The inline transaction commits first.** At its `COMMIT`, nothing has moved yet, so it **succeeds**. W then commits afterward — but W never went through `prepareInlineCommit`; it is an ordinary `IcebergCatalog.commit`, governed solely by Iceberg's native OCC. If W is an **append**, Iceberg refreshes and re-parents onto the inline transaction's new snapshot and W **also succeeds** (both writes land). If W is a stale **overwrite/delete**, Iceberg's native OCC rejects it with `CommitFailedException`.
+
+So `ROW_EXCLUSIVE` (the default) gives snapshot-isolation self-defense, not exclusion: a transaction aborts itself if the world changed under it, but it never prevents an independent writer from proceeding. A client that needs to actually *block* other writers — not merely detect that it lost the race — must request an `EXCLUSIVE` / `ACCESS_EXCLUSIVE` lock, which is enforced by the `LockManager` up front (at `createOperation` / `createSubtransaction`), independently of this commit-time OCC check.
 
 ---
 
@@ -647,7 +756,7 @@ No server-side transaction state needed. No locks. Unchanged from current Iceber
 
 ```
 1. Client: POST /v1/transactions           → txn_id=T1, snapshot=S1
-2. Client: POST /v1/locks                  → acquire ROW_DELTA lock on table/partition
+2. Client: POST /v1/locks                  → acquire ROW_EXCLUSIVE lock on table/partition
 3. Client reads table metadata (guaranteed stable — lock held)
 4. Client writes data files to S3
 5. Client stages new metadata to S3 (unique path)
@@ -824,7 +933,7 @@ BEGIN;
 
   -- 3. Record the commit mapping (TxnSnapshot visibility bridge)
   INSERT INTO committed_table_snapshots
-    (table_uuid, table_snapshot_id, commit_scn, metadata_location)
+    (table_uuid, iceberg_snapshot_id, commit_scn, metadata_location)
   VALUES (...), (...), ...;
 
   -- 4. Mark the transaction committed
@@ -862,15 +971,15 @@ SELECT current_metadata_location FROM table_pointers WHERE table_uuid = :uuid;
 -- must equal subtxn.base_metadata_location captured at subtxn start
 ```
 
-If they differ, another writer committed to that table after this subtransaction began. The appropriate response depends on the operation type:
+If they differ, another writer committed to that table after this subtransaction began. The response depends on the lock mode and commit path:
 
-| Operation | On Conflict |
-|---|---|
-| `APPEND` | Re-check: do new files overlap with ours? No overlap → safe to retry or proceed. Overlap → abort. |
-| `ROW_DELTA` | Abort: a concurrent positional delete or data overwrite may have invalidated our deletes. |
-| `OVERWRITE` | Abort: the data we intended to replace has changed. |
+| Lock mode | Commit path | On conflict |
+|---|---|---|
+| `ROW_EXCLUSIVE` | Subtransaction path | **Merge-and-retry** — server re-derives added data files and re-applies them onto the current table state (`extractAddedDataFiles` + fresh `newAppend()`). Commit succeeds. |
+| `ROW_EXCLUSIVE` | Inline path | **First-committer-wins abort** (HTTP 409) — no per-table subtransaction to re-parent. |
+| `EXCLUSIVE` / `ACCESS_EXCLUSIVE` | Either | **First-committer-wins abort** in all cases. |
 
-For multi-table transactions, a conflict on **any** subtransaction aborts the **entire** top-level transaction. Partial commits are not allowed.
+For multi-table transactions, a conflict on **any** operation that cannot be auto-merged aborts the **entire** top-level transaction. Partial commits are not allowed.
 
 ### Abort: No Undo Log Needed
 
@@ -893,18 +1002,26 @@ In Iceberg the analog is: the staged S3 files remain in object storage but are u
 
 ### Savepoint / Partial Rollback
 
-A `SAVEPOINT` marks a point within the transaction to which a partial rollback can retreat. In this design, a savepoint corresponds to rolling back one or more subtransactions while keeping the rest:
+A `SAVEPOINT` marks a point within the transaction to which a partial rollback can retreat. The **subtransaction** *is* the savepoint: a named subtransaction (`CREATE SUBTRANSACTION FOR … name=<sp>`) groups the operations done under it, and rolling that subtransaction back retreats exactly those operations while leaving every other subtransaction's staged work intact — the parent transaction stays `IN_PROGRESS`.
 
 ```
-SAVEPOINT sp1  →  record current set of SUB_COMMITTED subtxn_ids
-ROLLBACK TO sp1 →  ABORT subtxns committed after sp1; release their locks;
-                   those tables revert to their base_snapshot_id
-                   parent txn remains IN_PROGRESS
+CREATE subtxn "sp1" for {A, B} →  a subtransactions row (OPEN), one operation per table
+stage sp1                     →  operations COMMITTED, subtransaction STAGED
+ROLLBACK TO sp1               →  abort sp1's operations; release their locks;
+                                 A and B revert to their pre-subtransaction committed state;
+                                 the parent txn remains IN_PROGRESS
 ```
+
+Rollback has two flavours, distinguished by whether the subtransaction is reopened for another attempt:
+
+| Wire | SQL (Spark) | Effect |
+|---|---|---|
+| `POST …/rollback { reopen_for_retry: true }` (default) | `ROLLBACK SUBTRANSACTION` | Abort the subtransaction's operations + release locks, then **reopen** the subtransaction (`attempt++`) with fresh operation rows and staging paths so it can be re-staged (possibly by a different worker). `retry_of_op_id` links each new op to its aborted predecessor; a fresh staging path avoids `FileAlreadyExists` on the orphaned attempt's files. |
+| `POST …/rollback { reopen_for_retry: false }` or `POST …/abort` | `ABORT SUBTRANSACTION` | Leave the subtransaction `ABORTED`. Its operations are discarded and **skipped** at the parent `COMMIT` — the guard in `prepareCommit` excludes operations of any `ABORTED` subtransaction. |
+
+Because a subtransaction's `name` is unique only among **non-aborted** subtransactions of the same transaction, `ROLLBACK TO <name>` followed by a fresh `SAVEPOINT <name>` (a new subtransaction reusing the freed name) is allowed. Reopening keeps the same `subtxn_id` and bumps `attempt`; re-creating under the same name after an `ABORT` produces a new `subtxn_id`.
 
 The remaining subtransactions are unaffected. The client may then re-issue the rolled-back work or commit the transaction without it.
-
-This is a forward-looking capability and is not required for the initial implementation, but the data model supports it without schema changes.
 
 ### Summary: Single-Table vs. Multi-Table Commit Comparison
 
@@ -1037,17 +1154,17 @@ T1 (RowDelta, orders/date=2024-01-15):
 
 Cost: 30 minutes of wasted work.
 
-**With pessimistic locking (opt-in)**:
+**With pessimistic locking (EXCLUSIVE mode, opt-in)**:
 
 ```
-T1 (RowDelta, orders/date=2024-01-15, pessimistic):
-  POST /v1/locks → acquire ROW_DELTA lock on orders/date=2024-01-15 → GRANTED
+T1 (RowDelta, orders/date=2024-01-15, EXCLUSIVE lock):
+  POST /v1/locks → acquire EXCLUSIVE lock on orders/date=2024-01-15 → GRANTED
   reads base_snapshot_id=42 (guaranteed stable — lock held)
   writes delete file + new data file to S3 (30 minutes)
   commits → SUCCESS, txn_id=5001, lock released
 
-T2 (RowDelta, orders/date=2024-01-15, pessimistic):
-  POST /v1/locks → acquire ROW_DELTA lock on orders/date=2024-01-15 → WAITING
+T2 (RowDelta, orders/date=2024-01-15, EXCLUSIVE lock):
+  POST /v1/locks → acquire EXCLUSIVE lock on orders/date=2024-01-15 → WAITING
   ... waits 30 minutes for T1 to release ...
   lock GRANTED
   reads base_snapshot_id=43 (T1's committed state)
@@ -1064,32 +1181,32 @@ Cost: T2 waits 30 minutes but does zero wasted work. Total wall time: 60 minutes
 **Scenario**: Two ETL jobs both atomically update `orders` and `customers`.
 
 ```
-T1 (multi-table: RowDelta on orders/p1 + Append to customers):
-  acquire ROW_DELTA lock on orders/date=2024-01-15 → GRANTED
-  no lock needed for Append to customers
-  SubTxn S1 writes orders data to S3
-  SubTxn S2 writes customers data to S3
-  S1 → SUB_COMMITTED
-  S2 → SUB_COMMITTED
+T1 (multi-table: row-delta on orders/p1 + append to customers):
+  acquire ROW_EXCLUSIVE lock on orders/date=2024-01-15 → GRANTED
+  acquire ROW_EXCLUSIVE lock on customers → GRANTED
+  Op S1 writes orders data to S3
+  Op S2 writes customers data to S3
+  S1 → COMMITTED
+  S2 → COMMITTED
   T1 commits atomically → orders+customers visible simultaneously
 
-T2 (multi-table: RowDelta on orders/p2 + RowDelta on customers/p1):
-  acquire ROW_DELTA lock on orders/date=2024-01-16 → GRANTED  [different partition from T1]
-  acquire ROW_DELTA lock on customers/date=2024-01-15 → GRANTED
-  SubTxn S3 writes orders data to S3
-  SubTxn S4 writes customers data to S3
-  S3 → SUB_COMMITTED
-  S4 → SUB_COMMITTED
+T2 (multi-table: row-delta on orders/p2 + row-delta on customers/p1):
+  acquire ROW_EXCLUSIVE lock on orders/date=2024-01-16 → GRANTED  [different partition from T1]
+  acquire ROW_EXCLUSIVE lock on customers/date=2024-01-15 → GRANTED
+  Op S3 writes orders data to S3
+  Op S4 writes customers data to S3
+  S3 → COMMITTED
+  S4 → COMMITTED
   T2 commits atomically
 ```
 
-T1 and T2 operate on different partitions. **Both proceed fully concurrently** despite both being multi-table transactions touching the same tables.
+T1 and T2 operate on different partitions. **Both proceed fully concurrently** despite both being multi-table transactions touching the same tables. At commit time each uses the subtransaction (merge-and-retry) path, so if either encounters a metadata-location divergence the server re-applies just the added files onto the current state.
 
-**Conflict case** — T1 and T2 both want `orders/date=2024-01-15`:
+**Conflict case** — T1 and T2 both want `orders/date=2024-01-15` with `EXCLUSIVE` (pessimistic) locks:
 
 ```
-T1: acquire ROW_DELTA lock on orders/date=2024-01-15 → GRANTED
-T2: acquire ROW_DELTA lock on orders/date=2024-01-15 → WAITING
+T1: acquire EXCLUSIVE lock on orders/date=2024-01-15 → GRANTED
+T2: acquire EXCLUSIVE lock on orders/date=2024-01-15 → WAITING
 
 T2 waits until T1 commits and releases the lock.
 T2 then acquires the lock and proceeds.
@@ -1103,29 +1220,28 @@ No data corruption. Correct serialization.
 **Scenario**: A multi-table ETL (T1) holds a lock on `orders/date=2024-01-15` while a routine streaming ingest job (T2) appends to `orders`.
 
 ```
-T1 (multi-table, holds ROW_DELTA lock on orders/date=2024-01-15):
+T1 (multi-table, holds ROW_EXCLUSIVE lock on orders/date=2024-01-15):
   ... writing to S3 for 2 hours ...
 
-T2 (single-table APPEND to orders/date=2024-01-16):
-  No lock needed (APPEND mode)
+T2 (single-table append to orders/date=2024-01-16):
   Writes new files to S3
   Commits via optimistic CAS → SUCCESS immediately
-  [T2 is completely unaware of T1]
+  [T2 is completely unaware of T1; ROW_EXCLUSIVE is self-compatible]
 
-T3 (single-table APPEND to orders/date=2024-01-15):
-  No lock needed (APPEND mode, compatible with ROW_DELTA)
+T3 (single-table append to orders/date=2024-01-15):
   Writes new files to S3
   Commits via optimistic CAS → SUCCESS immediately
-  [Appends never conflict with ROW_DELTA]
+  [ROW_EXCLUSIVE is self-compatible; appends never block each other]
 
-T4 (single-table RowDelta on orders/date=2024-01-15):
-  Pessimistic: tries to acquire ROW_DELTA lock → WAITING for T1
-  Optimistic:  writes S3, commits → CAS check: is snapshot still current?
-               If T1 hasn't committed yet: base still valid → SUCCESS
-               If T1 committed first: CONFLICT → retry
+T4 (single-table row-delta on orders/date=2024-01-15):
+  Pessimistic (EXCLUSIVE): tries to acquire EXCLUSIVE lock → CONFLICT (T1 holds ROW_EXCLUSIVE,
+               which is not compatible with EXCLUSIVE) → WAITING for T1
+  Optimistic (ROW_EXCLUSIVE): writes S3, commits → CAS/divergence check at commit:
+               If T1 hasn't committed yet: base still valid → SUCCESS (merge path)
+               If T1 committed first: metadata diverged → merge-and-retry or abort (inline path)
 ```
 
-**Result**: Appends on any partition of any table proceed freely. Only writers doing `ROW_DELTA`/`OVERWRITE` on the same partition as T1's lock are affected. The blast radius of a multi-table transaction is exactly the same as an equivalent single-table pessimistic transaction.
+**Result**: Appends on any partition of any table proceed freely. Only writers requesting `EXCLUSIVE` or `ACCESS_EXCLUSIVE` on the same partition as T1's lock are blocked. The blast radius of a multi-table transaction is exactly the same as an equivalent single-table pessimistic transaction.
 
 ---
 
@@ -1180,19 +1296,19 @@ Orchestrator:
   ← { subtxn_id: S1, subtxn_token: <tok1>,
       staging_path: "s3://catalog/staging/T1/S1/metadata.json",
       base_snapshot_id: 42 }
-  (server acquires APPEND lock on orders)
+  (server acquires ROW_EXCLUSIVE lock on orders)
 
   POST /v1/transactions/T1/subtxn  { table: "customers" }
   ← { subtxn_id: S2, subtxn_token: <tok2>,
       staging_path: "s3://catalog/staging/T1/S2/metadata.json",
       base_snapshot_id: 17 }
-  (server acquires APPEND lock on customers)
+  (server acquires ROW_EXCLUSIVE lock on customers)
 
   POST /v1/transactions/T1/subtxn  { table: "products" }
   ← { subtxn_id: S3, subtxn_token: <tok3>,
       staging_path: "s3://catalog/staging/T1/S3/metadata.json",
       base_snapshot_id: 31 }
-  (server acquires APPEND lock on products)
+  (server acquires ROW_EXCLUSIVE lock on products)
 
 -- Orchestrator distributes credentials (txn_token NOT shared):
   → SparkApp1 receives: { txn_id:T1, subtxn_id:S1, subtxn_token:tok1, staging_path:S1_path }
@@ -1242,7 +1358,7 @@ and will be cleaned up by the orphan file reaper. ✓
 ```
 
 **Why locks must be acquired by the orchestrator, not by each app:**
-If App1 acquired its own `APPEND` lock on orders and App2 acquired its own lock on customers, a concurrent multi-table transaction acquiring the same two tables in opposite order could deadlock. The orchestrator acquires all locks in a canonical order (e.g., sorted by `table_uuid`) before any app starts, preventing deadlocks entirely.
+If App1 acquired its own lock on orders and App2 acquired its own lock on customers, a concurrent multi-table transaction acquiring the same two tables in opposite order could deadlock. The orchestrator acquires all locks in a canonical order (sorted by `table_uuid` lexicographically — see `LockManager.canonicalOrder`) before any app starts, preventing deadlocks entirely.
 
 ---
 
@@ -1341,7 +1457,7 @@ WHERE txn_id < :txnid_horizon;
 DELETE FROM locks
 WHERE txn_id < :txnid_horizon;
 
--- Released/expired reader snapshots are no longer needed once below the CTS horizon.
+-- Released/expired reader snapshots are safe to purge once below the CTS horizon.
 DELETE FROM txn_snapshots
 WHERE read_point < :cts_watermark
   AND (released_at IS NOT NULL OR expires_at < now());
@@ -1371,7 +1487,7 @@ GET /v1/{prefix}/namespaces/{ns}/tables/{table}?txn_snapshot_id={txn_snapshot_id
 
 The server resolves the Iceberg table snapshot using:
 ```sql
-SELECT table_snapshot_id, metadata_location
+SELECT iceberg_snapshot_id, metadata_location
 FROM committed_table_snapshots
 WHERE table_uuid = <table>
   AND commit_scn <= read_point
@@ -1400,26 +1516,54 @@ POST   /v1/transactions/{txn_id}/renew               Extend lease
 
 ### Subtransaction Management
 
+`createSubtransaction` creates a **subtransaction** (`subtransactions`) that groups one or more per-table **operations** (`transaction_operations`) — see [Subtransaction + Operations](#subtransaction--operations). The `subtxn_id`/`subtxn_token` in the API are the **subtransaction's** id/token; the returned `operations[]` array carries each table's `op_id`, `op_token`, and `assigned_staging_path`. A single-table request is the degenerate one-operation subtransaction; the top-level `table_uuid`/`base_snapshot_id`/`assigned_staging_path` response fields mirror the first operation for that shorthand.
+
 The orchestrator creates subtransactions (requires `txn_token`). Each subtransaction returns its own `subtxn_token` — distributed to the assigned application; the orchestrator does not need to retain it.
 
 ```
-POST   /v1/transactions/{txn_id}/subtxns             Create a subtransaction for a table
+POST   /v1/transactions/{txn_id}/subtxns             Create a subtransaction (savepoint)
   → requires txn_token
-  → { table_uuid, operation: "APPEND" | "ROW_DELTA" | "OVERWRITE" }
-  ← { subtxn_id, subtxn_token,
-      base_snapshot_id,            -- Iceberg snapshot at subtxn start
-      staging_path }               -- server-assigned S3 path for staged metadata
-    -- subtxn_token: per-subtxn bearer secret; distribute to assigned app only
+  → {                              -- preferred multi-table form:
+      tables: [ { table_identifier, operation: "ROW_EXCLUSIVE"|"EXCLUSIVE"|"ACCESS_EXCLUSIVE",
+                  base_snapshot_id? }, ... ],
+      name?,                       -- optional savepoint name / worker task key (unique per txn
+                                   --   among non-aborted subtransactions; a name freed by rollback is reusable)
+      lease_seconds?
+    }
+    -- single-table shorthand: { table_identifier, operation } instead of tables[]
+  ← { subtxn_id,
+      subtxn_token,                -- per-subtransaction bearer secret, to the assigned app only
+      name, attempt,               -- attempt is 1-based; incremented on each rollback-and-retry
+      operations: [ { op_id, op_token, table_uuid, operation,
+                      base_snapshot_id, assigned_staging_path, status }, ... ] }
 
--- The following require subtxn_token (not txn_token):
-POST   /v1/transactions/{txn_id}/subtxns/{id}/commit Stage subtransaction (SUB_COMMITTED)
+-- Subtransaction-scoped operations. commit/rollback accept the subtxn_token; rollback and abort
+-- also accept the parent txn_token (orchestrator-driven).
+POST   /v1/transactions/{txn_id}/subtxns/{id}/commit   Stage the WHOLE subtransaction (body-less)
   → requires subtxn_token
-  → { staged_metadata_location }   -- must equal the server-assigned staging_path
-POST   /v1/transactions/{txn_id}/subtxns/{id}/renew  Extend subtxn lease
-  → requires subtxn_token
-POST   /v1/transactions/{txn_id}/subtxns/{id}/abort  Abort one subtransaction
+  → (no body)                      -- staging paths were assigned at create time; the worker has
+                                   --   already written each table's metadata there. The server
+                                   --   verifies each file exists, marks every operation COMMITTED,
+                                   --   and marks the subtransaction STAGED. All-or-nothing (one worker per subtransaction).
+POST   /v1/transactions/{txn_id}/subtxns/{id}/rollback Roll the subtransaction back (retryable)
   → requires subtxn_token OR txn_token
+  → { reopen_for_retry: true }     -- default true: abort the subtransaction's operations + release locks, then
+                                   --   reopen the subtransaction (attempt++) with FRESH operation rows and
+                                   --   staging paths so it can be re-staged (possibly by a different
+                                   --   worker) without colliding with the orphaned attempt's files.
+                                   --   false ⇒ leave it ABORTED; the parent COMMIT skips it.
+POST   /v1/transactions/{txn_id}/subtxns/{id}/abort    Abandon the subtransaction permanently
+  → requires subtxn_token OR txn_token
+                                   -- equivalent to rollback with reopen_for_retry=false.
+POST   /v1/transactions/{txn_id}/subtxns/{id}/renew    Extend the subtransaction's (and parent's) lease
+  → requires subtxn_token
+GET    /v1/transactions/subtxns/{id}                   Look up a subtransaction by id + subtxn_token
+  → requires subtxn_token          -- id-only addressing; returns the full subtransaction + operations[]
+                                   --   (each with its assigned_staging_path) so a resuming worker
+                                   --   can continue. Response's parent_txn_id names the owning txn.
 ```
+
+`commitSubtransaction` carries no request body: the server assigned every operation's staging path at create time, so ownership of the `subtxn_token` is sufficient and the whole subtransaction stages atomically.
 
 ### Lock Management
 
@@ -1437,7 +1581,7 @@ GET /v1/{prefix}/namespaces/{namespace}/tables/{table}
     &txn_id={txn_id}             optional: read-your-own-writes within a transaction
 ```
 
-When `txn_id` is provided, the server returns the staged metadata for that transaction's subtransaction (if `SUB_COMMITTED`), enabling read-your-own-writes within a multi-table transaction.
+When `txn_id` is provided, the server returns the staged metadata for that transaction's own operation on the table (if the operation has reached `COMMITTED`/`SUB_COMMITTED`), enabling read-your-own-writes within a multi-table transaction.
 
 ---
 
@@ -1491,7 +1635,7 @@ Atomically swapping metadata pointers for two tables requires a single transacti
 To detect that another writer committed to table B between our subtransaction start and our commit, the server must compare the current metadata pointer against the `base_snapshot_id` captured at `BEGIN` time. The engine knows its own `base_snapshot_id` but cannot atomically check-and-swap against the live catalog pointer without a round-trip that the server must serialize. Two engines racing to commit to the same table cannot resolve the conflict among themselves — only the catalog, as the single writer of table pointers, can adjudicate.
 
 **3. Lock coordination requires a neutral third party.**
-If engine A holds a `ROW_DELTA` lock on table T and engine B wants `OVERWRITE` on the same table, they cannot negotiate directly — engines have no knowledge of each other. A central lock table in the catalog is the only place where this can be tracked consistently. Peer-to-peer locking between engines would require either a distributed lock service (ZooKeeper, etcd) or a gossip protocol — both of which are far heavier than a lock table in an existing relational DB.
+If engine A holds an `EXCLUSIVE` lock on table T and engine B wants an `EXCLUSIVE` lock on the same table, they cannot negotiate directly — engines have no knowledge of each other. A central lock table in the catalog is the only place where this can be tracked consistently. Peer-to-peer locking between engines would require either a distributed lock service (ZooKeeper, etcd) or a gossip protocol — both of which are far heavier than a lock table in an existing relational DB.
 
 **In short:** multi-table atomicity, conflict serialization, and lock coordination all require a single serialization point with global visibility over table state. The catalog server — already the canonical authority on table metadata — is the only viable place for that serialization point. Pushing it to the engine side would require rebuilding the same mechanism in a distributed, multi-engine context, which is strictly harder.
 

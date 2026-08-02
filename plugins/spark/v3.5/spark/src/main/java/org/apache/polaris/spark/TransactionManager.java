@@ -197,8 +197,8 @@ public class TransactionManager {
    *   <li>PENDING → calls beginTransaction REST, transitions to ACTIVE, then proceeds
    *   <li>ACTIVE + REPEATABLE_READ → calls resolveTableMetadataLocation, returns pinned path
    *   <li>ACTIVE + READ_COMMITTED → returns empty; reads use the latest version. Worker sessions
-   *       still stage writes: SparkCatalog.loadTable wraps the live table in
-   *       PinnedTableOperations with the live metadata as the base (see loadTable).
+   *       still stage writes: SparkCatalog.loadTable wraps the live table in PinnedTableOperations
+   *       with the live metadata as the base (see loadTable).
    * </ul>
    */
   public Optional<String> resolveMetadataLocation(SparkSession spark, TableIdentifier ident) {
@@ -363,15 +363,41 @@ public class TransactionManager {
           "No staged data for worker table: " + workerTable + ". Write at least one row first.");
     }
     try {
+      // Body-less commit: the worker already wrote its staged metadata to the server-assigned
+      // path (via PinnedTableOperations), so the server needs only the X-Subtxn-Token to prove
+      // ownership. stagedPath above is used purely as a local "did we write anything?" guard.
       restCatalog.commitSubtransaction(
-          Long.parseLong(txnId), Long.parseLong(subtxnIdStr), subtxnToken, stagedPath);
+          Long.parseLong(txnId), Long.parseLong(subtxnIdStr), subtxnToken);
     } finally {
       clearConf(spark);
     }
   }
 
-  /** Abandons the worker subtransaction. Staged file remains on storage for GC. */
+  /**
+   * Rolls the worker subtransaction back and reopens it (attempt++) so the same subtransaction can
+   * be retried, possibly by a different worker. Staged file remains on storage for GC. Use {@link
+   * #abortWorkerSubtransaction} to abandon it permanently.
+   */
   public void rollbackWorkerSubtransaction(SparkSession spark) {
+    String subtxnIdStr = getConf(spark, CONF_WORKER_SUBTXN_ID);
+    if (subtxnIdStr == null) {
+      throw new IllegalStateException("Not in worker mode.");
+    }
+    String subtxnToken = getConf(spark, CONF_WORKER_SUBTXN_TOKEN);
+    String txnId = getConf(spark, CONF_TXN_ID);
+    try {
+      restCatalog.rollbackSubtransaction(
+          Long.parseLong(txnId), Long.parseLong(subtxnIdStr), subtxnToken, null, true);
+    } finally {
+      clearConf(spark);
+    }
+  }
+
+  /**
+   * Abandons the worker subtransaction permanently (not reopened): the parent transaction skips it
+   * at commit. Staged file remains on storage for GC.
+   */
+  public void abortWorkerSubtransaction(SparkSession spark) {
     String subtxnIdStr = getConf(spark, CONF_WORKER_SUBTXN_ID);
     if (subtxnIdStr == null) {
       throw new IllegalStateException("Not in worker mode.");

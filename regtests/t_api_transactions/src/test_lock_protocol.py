@@ -339,10 +339,10 @@ class TestLockRelease:
             conflict = _create_subtxn(client, t2, namespace, table_orders, "EXCLUSIVE")
             assert conflict.status_code == 409
 
-            # Commit t1's subtransaction — this releases the ROW_EXCLUSIVE lock
+            # Commit t1's subtransaction — this releases the ROW_EXCLUSIVE lock.
+            # Body-less: staging path was assigned server-side at create time.
             client.post(
                 f"/transactions/{t1['txn_id']}/subtransactions/{sub['subtxn_id']}/commit",
-                {"staged_metadata_location": sub["assigned_staging_path"]},
                 extra_headers={"X-Subtxn-Token": sub["subtxn_token"]},
             ).raise_for_status()
 

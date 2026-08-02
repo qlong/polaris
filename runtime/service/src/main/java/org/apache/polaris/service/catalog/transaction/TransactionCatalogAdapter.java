@@ -45,14 +45,14 @@ import org.apache.polaris.service.catalog.iceberg.IcebergCatalogHandlerFactory;
 import org.apache.polaris.service.transaction.LockManager.LockConflictException;
 import org.apache.polaris.service.transaction.TransactionService;
 import org.apache.polaris.service.types.BeginTransactionRequest;
-import org.apache.polaris.service.types.CommitSubtransactionRequest;
 import org.apache.polaris.service.types.CommitTransactionRequest;
 import org.apache.polaris.service.types.CreateSubtransactionRequest;
 import org.apache.polaris.service.types.CreateTransactionSnapshotRequest;
-import org.apache.polaris.service.types.GetSubtransactionResponse;
 import org.apache.polaris.service.types.LockMode;
 import org.apache.polaris.service.types.RenewLeaseRequest;
+import org.apache.polaris.service.types.RollbackSubtransactionRequest;
 import org.apache.polaris.service.types.Subtransaction;
+import org.apache.polaris.service.types.SubtransactionOperation;
 import org.apache.polaris.service.types.SubtransactionStatus;
 import org.apache.polaris.service.types.Transaction;
 import org.apache.polaris.service.types.TransactionIsolation;
@@ -125,6 +125,35 @@ public class TransactionCatalogAdapter
       String metadataLocation = tableHandler.loadTable(tableId, null).metadataLocation();
       int lastSlash = metadataLocation.lastIndexOf('/');
       return LocationUtil.stripTrailingSlash(metadataLocation.substring(0, lastSlash));
+    } finally {
+      try {
+        tableHandler.close();
+      } catch (Exception ignored) {
+      }
+    }
+  }
+
+  /**
+   * Returns the numeric entity ID string (matching {@code committed_table_snapshots.table_uuid})
+   * for the given table identifier.
+   */
+  private String resolveTableEntityId(
+      IcebergCatalogHandlerFactory factory,
+      String catalogName,
+      PolarisPrincipal principal,
+      String tableIdentifierStr) {
+    String[] parts = tableIdentifierStr.split("\\.");
+    if (parts.length < 2) {
+      throw new jakarta.ws.rs.BadRequestException(
+          "Invalid table_identifier '" + tableIdentifierStr + "': expected 'namespace.table'");
+    }
+    TableIdentifier tableId =
+        TableIdentifier.of(
+            Namespace.of(Arrays.copyOf(parts, parts.length - 1)), parts[parts.length - 1]);
+    IcebergCatalogHandler tableHandler = factory.createHandler(catalogName, principal);
+    try {
+      tableHandler.loadTable(tableId, null);
+      return tableHandler.resolveTableEntityId(tableId);
     } finally {
       try {
         tableHandler.close();
@@ -270,17 +299,22 @@ public class TransactionCatalogAdapter
       try {
         handler.listNamespaces(org.apache.iceberg.catalog.Namespace.of());
         if (inlinePath) {
-          // Use Case 1: single-session inline staged writes
-          List<TransactionService.StagedTableInfo> inputTables =
-              commitTransactionRequest.getTables().stream()
-                  .map(
-                      t ->
-                          new TransactionService.StagedTableInfo(
-                              t.getTableIdentifier(),
-                              t.getStagedMetadataLocation(),
-                              null,
-                              t.getOperation() != null ? t.getOperation().name() : "ROW_EXCLUSIVE"))
-                  .toList();
+          // Use Case 1: single-session inline staged writes.
+          // Resolve each table's numeric entity ID so prepareInlineCommit can look up the
+          // committed_table_snapshots baseline (which is keyed by entity ID, not "ns.table").
+          List<TransactionService.StagedTableInfo> inputTables = new java.util.ArrayList<>();
+          for (var t : commitTransactionRequest.getTables()) {
+            String tableEntityId =
+                resolveTableEntityId(
+                    handlerFactory, catalogName, principal, t.getTableIdentifier());
+            inputTables.add(
+                new TransactionService.StagedTableInfo(
+                    t.getTableIdentifier(),
+                    t.getStagedMetadataLocation(),
+                    null,
+                    t.getOperation() != null ? t.getOperation().name() : "ROW_EXCLUSIVE",
+                    tableEntityId));
+          }
           TransactionService.PrepareInlineResult result =
               txnService.prepareInlineCommit(txnId, xTxnToken, inputTables);
           LOGGER.info(
@@ -348,18 +382,16 @@ public class TransactionCatalogAdapter
     }
     try {
       TransactionService txnService = openTxnService(securityContext, prefix);
-      TransactionService.OperationInfo info = txnService.getOperation(subtxnId, xSubtxnToken);
-      return Response.ok(
-              new GetSubtransactionResponse(
-                  info.txnId(), info.txnSnapshotId(),
-                  info.assignedStagingPath(), info.tableUuid()))
-          .build();
+      // subtxnId + xSubtxnToken address the subtransaction directly. Return the full
+      // subtransaction so a resuming worker sees every operation's assigned staging path.
+      TransactionService.SubtxnInfo info = txnService.getSubtransactionInfo(subtxnId, xSubtxnToken);
+      return Response.ok(toSubtransaction(info, false)).build();
     } catch (jakarta.ws.rs.ForbiddenException e) {
       return Response.status(403).entity(simpleError(e.getMessage())).build();
     } catch (jakarta.ws.rs.NotFoundException e) {
       return notFound(e.getMessage());
     } catch (java.sql.SQLException e) {
-      return serverError("getOperation failed", e);
+      return serverError("getSubtransaction failed", e);
     }
   }
 
@@ -425,25 +457,44 @@ public class TransactionCatalogAdapter
     try {
       handler.listNamespaces(Namespace.of());
       TransactionService txnService = handler.newTransactionServiceForCatalog();
-      String tableMetadataDir =
-          resolveTableMetadataDir(
-              handlerFactory,
-              catalogName,
-              principal,
-              createSubtransactionRequest.getTableIdentifier());
-      LockMode lockModeEnum = createSubtransactionRequest.getOperation();
-      String lockMode = (lockModeEnum != null ? lockModeEnum : LockMode.ROW_EXCLUSIVE).name();
-      OperationRow op =
-          txnService.createOperation(
+
+      // A subtransaction groups one or more per-table operations. Accept either the multi-table
+      // `tables` list (preferred) or the single-table `table_identifier` + `operation` shorthand.
+      List<TransactionService.SubtxnTableSpec> specs = new java.util.ArrayList<>();
+      if (createSubtransactionRequest.getTables() != null
+          && !createSubtransactionRequest.getTables().isEmpty()) {
+        for (var t : createSubtransactionRequest.getTables()) {
+          String metadataDir =
+              resolveTableMetadataDir(
+                  handlerFactory, catalogName, principal, t.getTableIdentifier());
+          String lockMode =
+              (t.getOperation() != null ? t.getOperation() : LockMode.ROW_EXCLUSIVE).name();
+          specs.add(
+              new TransactionService.SubtxnTableSpec(
+                  t.getTableIdentifier(), metadataDir, lockMode, t.getBaseSnapshotId()));
+        }
+      } else if (createSubtransactionRequest.getTableIdentifier() != null) {
+        String tableId = createSubtransactionRequest.getTableIdentifier();
+        String metadataDir =
+            resolveTableMetadataDir(handlerFactory, catalogName, principal, tableId);
+        LockMode lockModeEnum = createSubtransactionRequest.getOperation();
+        String lockMode = (lockModeEnum != null ? lockModeEnum : LockMode.ROW_EXCLUSIVE).name();
+        specs.add(new TransactionService.SubtxnTableSpec(tableId, metadataDir, lockMode, null));
+      } else {
+        return Response.status(400)
+            .entity(
+                simpleError("createSubtransaction requires either 'tables' or 'table_identifier'"))
+            .build();
+      }
+
+      TransactionService.SubtxnInfo subtxn =
+          txnService.createSubtransaction(
               txnId,
               xTxnToken,
-              createSubtransactionRequest.getTableIdentifier(),
-              lockMode,
-              null,
-              createSubtransactionRequest.getRetryOfSubtxnId(),
+              createSubtransactionRequest.getName(),
               createSubtransactionRequest.getLeaseSeconds(),
-              tableMetadataDir);
-      return Response.ok(toSubtransaction(op, true)).build();
+              specs);
+      return Response.ok(toSubtransaction(subtxn, true)).build();
     } catch (jakarta.ws.rs.BadRequestException | jakarta.ws.rs.ForbiddenException e) {
       return Response.status(e instanceof jakarta.ws.rs.ForbiddenException ? 403 : 400)
           .entity(simpleError(e.getMessage()))
@@ -480,21 +531,17 @@ public class TransactionCatalogAdapter
       Long txnId,
       Long subtxnId,
       String xSubtxnToken,
-      CommitSubtransactionRequest commitSubtransactionRequest,
       RealmContext realmContext,
       SecurityContext securityContext) {
     if (xSubtxnToken == null || xSubtxnToken.isBlank()) {
       return Response.status(401).entity(simpleError("X-Subtxn-Token header is required")).build();
     }
-    String staged = commitSubtransactionRequest.getStagedMetadataLocation();
-    if (staged == null || staged.isBlank()) {
-      return Response.status(400)
-          .entity(simpleError("staged_metadata_location is required"))
-          .build();
-    }
     try {
       TransactionService txnService = openTxnService(securityContext, prefix);
-      txnService.commitOperation(txnId, subtxnId, xSubtxnToken, staged);
+      // Body-less: staging paths were assigned at create time. This atomically stages the whole
+      // subtransaction — every operation is marked committed at its assigned path and the
+      // subtransaction becomes STAGED.
+      txnService.commitSubtransaction(subtxnId, xSubtxnToken);
       return Response.noContent().build();
     } catch (jakarta.ws.rs.BadRequestException e) {
       return Response.status(400).entity(simpleError(e.getMessage())).build();
@@ -518,7 +565,9 @@ public class TransactionCatalogAdapter
       SecurityContext securityContext) {
     try {
       TransactionService txnService = openTxnService(securityContext, prefix);
-      txnService.abortOperation(txnId, subtxnId, xSubtxnToken, xTxnToken);
+      // Abort = roll the subtransaction back permanently (not reopened for retry). The parent
+      // transaction will skip this subtransaction's operations at commit.
+      txnService.rollbackSubtransaction(txnId, subtxnId, xSubtxnToken, xTxnToken, false);
       return Response.noContent().build();
     } catch (jakarta.ws.rs.BadRequestException e) {
       return Response.status(400).entity(simpleError(e.getMessage())).build();
@@ -528,6 +577,38 @@ public class TransactionCatalogAdapter
       return notFound(e.getMessage());
     } catch (SQLException e) {
       return serverError("abortSubtransaction failed", e);
+    }
+  }
+
+  @Override
+  public Response rollbackSubtransaction(
+      String prefix,
+      Long txnId,
+      Long subtxnId,
+      String xSubtxnToken,
+      String xTxnToken,
+      RollbackSubtransactionRequest rollbackSubtransactionRequest,
+      RealmContext realmContext,
+      SecurityContext securityContext) {
+    // reopen_for_retry defaults to true: roll the subtransaction back but keep it so another
+    // attempt (possibly a different worker) can re-stage the same subtransaction id/name.
+    boolean reopenForRetry = true;
+    if (rollbackSubtransactionRequest != null
+        && rollbackSubtransactionRequest.getReopenForRetry() != null) {
+      reopenForRetry = rollbackSubtransactionRequest.getReopenForRetry();
+    }
+    try {
+      TransactionService txnService = openTxnService(securityContext, prefix);
+      txnService.rollbackSubtransaction(txnId, subtxnId, xSubtxnToken, xTxnToken, reopenForRetry);
+      return Response.noContent().build();
+    } catch (jakarta.ws.rs.BadRequestException e) {
+      return Response.status(400).entity(simpleError(e.getMessage())).build();
+    } catch (jakarta.ws.rs.ForbiddenException e) {
+      return Response.status(403).entity(simpleError(e.getMessage())).build();
+    } catch (jakarta.ws.rs.NotFoundException e) {
+      return notFound(e.getMessage());
+    } catch (SQLException e) {
+      return serverError("rollbackSubtransaction failed", e);
     }
   }
 
@@ -542,10 +623,12 @@ public class TransactionCatalogAdapter
       SecurityContext securityContext) {
     try {
       TransactionService txnService = openTxnService(securityContext, prefix);
-      OperationRow row =
-          txnService.renewOperation(
+      TransactionService.SubtxnInfo subtxn =
+          txnService.renewSubtransaction(
               txnId, subtxnId, xSubtxnToken, renewLeaseRequest.getLeaseSeconds());
-      return Response.ok(toSubtransaction(row, false)).build();
+      return Response.ok(toSubtransaction(subtxn, false)).build();
+    } catch (jakarta.ws.rs.BadRequestException e) {
+      return Response.status(400).entity(simpleError(e.getMessage())).build();
     } catch (jakarta.ws.rs.ForbiddenException e) {
       return Response.status(403).entity(simpleError(e.getMessage())).build();
     } catch (jakarta.ws.rs.NotFoundException e) {
@@ -586,18 +669,43 @@ public class TransactionCatalogAdapter
     }
   }
 
-  private static Subtransaction toSubtransaction(OperationRow op, boolean includeToken) {
+  /**
+   * Builds a {@link Subtransaction} response from a {@link TransactionService.SubtxnInfo}. The
+   * {@code subtxn_id}/{@code subtxn_token} address the subtransaction directly; the {@code
+   * operations} list carries each table's op id/token/staging path. The top-level single-table
+   * fields mirror the first operation for the single-table shorthand path.
+   */
+  private static Subtransaction toSubtransaction(
+      TransactionService.SubtxnInfo info, boolean includeToken) {
+    JdbcTransactionPersistence.SubtxnRow subtxn = info.subtxn();
+    List<SubtransactionOperation> ops = new java.util.ArrayList<>(info.operations().size());
+    for (OperationRow op : info.operations()) {
+      ops.add(
+          new SubtransactionOperation(
+              op.opId(),
+              includeToken ? op.opToken() : null,
+              op.tableUuid(),
+              LockMode.valueOf(op.lockMode()),
+              op.baseSnapshotId(),
+              op.assignedStagingPath(),
+              op.stagedMetadataLocation(),
+              toSubtransactionStatus(op.status())));
+    }
+    OperationRow first = info.operations().isEmpty() ? null : info.operations().get(0);
     return new Subtransaction(
-        op.opId(),
-        includeToken ? op.opToken() : null,
-        op.txnId(),
-        op.tableUuid(),
-        LockMode.valueOf(op.lockMode()),
-        op.baseSnapshotId(),
-        op.assignedStagingPath(),
-        op.stagedMetadataLocation(),
-        toSubtransactionStatus(op.status()),
-        Date.from(op.expiresAt()));
+        subtxn.subtxnId(),
+        includeToken ? subtxn.subtxnToken() : null,
+        subtxn.txnId(),
+        subtxn.name(),
+        subtxn.attempt(),
+        ops,
+        first != null ? first.tableUuid() : null,
+        first != null ? LockMode.valueOf(first.lockMode()) : null,
+        first != null ? first.baseSnapshotId() : null,
+        first != null ? first.assignedStagingPath() : null,
+        first != null ? first.stagedMetadataLocation() : null,
+        subtxnStatusToSubtransactionStatus(subtxn.status()),
+        Date.from(subtxn.expiresAt()));
   }
 
   private static TransactionStatus toTransactionStatus(int status) {
@@ -612,6 +720,19 @@ public class TransactionCatalogAdapter
     return switch (status) {
       case JdbcTransactionPersistence.OP_STATUS_COMMITTED -> SubtransactionStatus.COMMITTED;
       case JdbcTransactionPersistence.OP_STATUS_ABORTED -> SubtransactionStatus.ABORTED;
+      default -> SubtransactionStatus.IN_PROGRESS;
+    };
+  }
+
+  /**
+   * Maps a subtransaction status to the wire {@link SubtransactionStatus}. A STAGED subtransaction
+   * (all ops staged, awaiting parent commit) surfaces as COMMITTED to the client; an OPEN one as
+   * IN_PROGRESS.
+   */
+  private static SubtransactionStatus subtxnStatusToSubtransactionStatus(int subtxnStatus) {
+    return switch (subtxnStatus) {
+      case JdbcTransactionPersistence.SUBTXN_STATUS_STAGED -> SubtransactionStatus.COMMITTED;
+      case JdbcTransactionPersistence.SUBTXN_STATUS_ABORTED -> SubtransactionStatus.ABORTED;
       default -> SubtransactionStatus.IN_PROGRESS;
     };
   }

@@ -20,7 +20,8 @@
 --  * Added multi-table transaction support tables:
 --    - txn_id_seq: monotonically increasing sequence for transaction and snapshot IDs
 --    - transactions: top-level write transactions; parent_txn_id enables nested transactions
---    - transaction_operations: per-table staging units within a transaction (replaces subtransactions)
+--    - subtransactions: the retry/rollback/savepoint boundary; groups 1..N per-table operations
+--    - transaction_operations: per-table staging within a transaction (or a subtransaction)
 --    - txn_snapshots: MVCC visibility window; shared by read-only handles and write transactions
 --    - committed_table_snapshots: MVCC-to-Iceberg snapshot bridge
 --    - locks: pessimistic lock state (ROW_EXCLUSIVE, EXCLUSIVE, ACCESS_EXCLUSIVE)
@@ -352,15 +353,55 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_txns_token
     ON transactions (txn_token);
 
 -- ---------------------------------------------------------------------------
--- transaction_operations: per-table staging units within a transaction.
+-- subtransactions: the retry / rollback / savepoint boundary inside a transaction.
+-- A subtransaction groups 1..N per-table operations (transaction_operations rows)
+-- that succeed-or-fail together. Rolling a subtransaction back aborts exactly its
+-- operations and releases their locks, leaving other subtransactions' staged work
+-- untouched, so only the failed tables are re-run. The same object serves both
+-- cross-process parallel ingestion (different workers write the subtransaction's
+-- ops, any of them can retry) and single-session Postgres-style savepoints (one
+-- session creates, stages, and rolls back the subtransaction before COMMIT).
+-- name is the optional user label (SAVEPOINT <name>).
+-- subtxn_token is held by the subtransaction driver; required to roll it back / release it.
+-- status: 0=OPEN (accepting ops), 1=STAGED (released; ready for parent COMMIT),
+--         2=ABORTED (its ops are discarded and skipped at COMMIT).
+-- attempt increments each time the subtransaction is rolled back and re-opened.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS subtransactions (
+    subtxn_id    BIGINT PRIMARY KEY,
+    txn_id       BIGINT NOT NULL REFERENCES transactions(txn_id),
+    realm_id     TEXT NOT NULL,
+    catalog_id   BIGINT NOT NULL,
+    name         TEXT,                    -- optional user label; unique per txn when set
+    subtxn_token TEXT NOT NULL,           -- random 32-byte hex; held by the subtransaction driver
+    status       SMALLINT NOT NULL DEFAULT 0,
+    attempt      INT NOT NULL DEFAULT 1,
+    created_at   TIMESTAMP NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMP NOT NULL,
+    ended_at     TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_subtxns_txn
+    ON subtransactions (txn_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subtxns_token
+    ON subtransactions (subtxn_token);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subtxns_name
+    ON subtransactions (realm_id, txn_id, name)
+    WHERE name IS NOT NULL AND status <> 2;
+
+-- ---------------------------------------------------------------------------
+-- transaction_operations: per-table staging within a transaction.
 -- Created explicitly (CREATE SUBTRANSACTION FOR) or implicitly by StagingTableOperations.
 -- commitTransaction processes all COMMITTED rows atomically.
+-- subtxn_id groups this op into a subtransaction; NULL for a bare
+--   inline op (single-session commit path with no explicit subtransaction).
 -- lock_mode: 'ROW_EXCLUSIVE' (default/OCC), 'EXCLUSIVE', 'ACCESS_EXCLUSIVE'
 -- status: 0=IN_PROGRESS, 1=COMMITTED, 2=ABORTED
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS transaction_operations (
     op_id                         BIGINT PRIMARY KEY,
     txn_id                        BIGINT NOT NULL REFERENCES transactions(txn_id),
+    subtxn_id                     BIGINT REFERENCES subtransactions(subtxn_id),  -- NULL = bare inline op
     realm_id                      TEXT NOT NULL,
     catalog_id                    BIGINT NOT NULL,
     table_uuid                    TEXT NOT NULL,   -- stable UUID of the Iceberg table entity
@@ -379,6 +420,8 @@ CREATE TABLE IF NOT EXISTS transaction_operations (
 
 CREATE INDEX IF NOT EXISTS idx_ops_txn
     ON transaction_operations (txn_id, status);
+CREATE INDEX IF NOT EXISTS idx_ops_subtxn
+    ON transaction_operations (subtxn_id, status);
 CREATE INDEX IF NOT EXISTS idx_ops_table
     ON transaction_operations (realm_id, catalog_id, table_uuid, status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ops_token

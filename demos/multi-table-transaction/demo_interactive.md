@@ -5,10 +5,11 @@ consistent reads with Trino sharing the same Polaris catalog:
 
 1. **Consistent multi-table reads** (no torn reads) — REPEATABLE READ isolation (Spark)
 2. **Atomic multi-table writes** — subtransaction staging + atomic commit (Spark)
-3. **Cross-engine consistent read** — a Trino REPEATABLE READ transaction stays pinned while
-   Spark commits underneath (Spark writes, Trino reads the same catalog)
-4. **Cross-engine READ COMMITTED** — a Trino READ COMMITTED transaction reads the latest
-   committed data each statement
+3. **Cross-engine, multi-table consistent read** — one Trino REPEATABLE READ transaction pins
+   `orders` + `customers` at a single instant while Spark commits a torn multi-table write
+   underneath (Spark writes two tables, Trino reads the same catalog with no torn read)
+4. **The isolation contrast** — in the *same* Trino session, flip REPEATABLE READ → READ COMMITTED
+   and watch the same query move on a concurrent Spark commit (one word changed, no new terminal)
 
 Parts 1–2 need only Spark. Parts 3–4 additionally need a Trino server on the same Polaris
 catalog and the Trino CLI (see Part 3 prerequisites).
@@ -251,12 +252,19 @@ These semantics map directly to MVCC concepts familiar from PostgreSQL:
 
 ---
 
-## Part 3 — Cross-Engine Consistent Read (Trino reads a Spark-written table)
+## Part 3 — Cross-Engine, Multi-Table Consistent Read (Trino pins two tables Spark writes)
 
-**What this shows:** Trino and Spark share the same Polaris REST catalog. A Trino transaction
-opened with `START TRANSACTION ISOLATION LEVEL REPEATABLE READ` pins a Polaris snapshot on its
-first read, so it keeps seeing a consistent point-in-time view even while a Spark session commits
-new rows underneath — the same REPEATABLE READ guarantee as Part 1, but across engines.
+**What this shows:** Trino and Spark share the same Polaris REST catalog. A single Trino
+transaction opened with `START TRANSACTION ISOLATION LEVEL REPEATABLE READ` pins a Polaris
+snapshot on its first read — and that one snapshot covers **every** table the transaction touches.
+While the transaction stays open, a Spark session commits a **torn multi-table write** underneath
+(an `orders` row referencing a `customers` row that doesn't exist yet, then the matching customer).
+The pinned Trino transaction keeps seeing the consistent *pair* — no torn read — until it commits.
+This is the same REPEATABLE READ guarantee as Part 1, but now **across engines and across tables**.
+
+> Verified live: a single Trino REPEATABLE READ transaction resolves both `orders` and `customers`
+> through the same `read_point`. The counts stay `5 / 3` across the concurrent Spark write, and the
+> dangling-FK invariant stays `0` inside the pin while a fresh read sees `1`.
 
 ### Prerequisites (Trino)
 
@@ -285,7 +293,7 @@ Trino uses its internal default (`READ_UNCOMMITTED`) in that case, and no snapsh
 Always type the isolation level in the SQL, and keep the CLI session open at the prompt so the
 transaction stays alive across the concurrent Spark write.
 
-### Terminal A — Trino: open a REPEATABLE READ transaction
+### Terminal A — Trino: pin BOTH tables in one REPEATABLE READ transaction
 
 ```bash
 java -jar <trino-repo>/client/trino-cli/target/trino-cli-*-executable.jar \
@@ -293,59 +301,104 @@ java -jar <trino-repo>/client/trino-cli/target/trino-cli-*-executable.jar \
 ```
 
 ```sql
--- Isolation level in the SQL is REQUIRED (see note above). This pins a Polaris snapshot
--- on the first table read.
+-- Isolation level in the SQL is REQUIRED (see note above). The FIRST read pins a Polaris
+-- snapshot; every table read later in this transaction resolves through that same snapshot.
 trino:demo_ns> START TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 
-trino:demo_ns> SELECT count(*) FROM orders;   -- e.g. 5 — pins the snapshot here
+trino:demo_ns> SELECT count(*) FROM orders;      -- 5  — pins the snapshot HERE
+trino:demo_ns> SELECT count(*) FROM customers;   -- 3  — same pinned instant
+
+-- Baseline cross-table invariant: no order references a missing customer.
+trino:demo_ns> SELECT count(*) AS dangling FROM orders o
+                 LEFT JOIN customers c ON o.customer_id = c.customer_id
+                 WHERE c.customer_id IS NULL;    -- 0
 ```
 
-Leave this prompt open.
+**IMPORTANT — wait until Trino returns `5` and `3` before switching to Terminal B.** The snapshot
+is pinned on the first *read*, not on `START TRANSACTION`. Leave this prompt open.
 
-### Terminal B — Spark: commit a new row
+### Terminal B — Spark: commit a torn multi-table write
+
+Insert the **orphan order first** (opening the torn-read window), then — after glancing back at
+Terminal A — the matching customer. Running these as two separate statements lets you control the
+window live.
 
 ```bash
 source spark-env.sh
 $SPARK_HOME/bin/spark-sql \
   --jars $ICEBERG_JAR,$POLARIS_PLUGIN_JAR \
   --properties-file spark-defaults.conf \
-  --conf 'spark.ui.enabled=false' --master 'local[2]' \
-  -e "INSERT INTO polaris.demo_ns.orders VALUES (9500, 9, 42.00, 'live')"
+  --conf 'spark.ui.enabled=false' --master 'local[2]'
 ```
 
-### Terminal A — Trino: pinned read is unchanged, then fresh read sees the write
+```sql
+-- Step 1: an order for customer 6, who does NOT exist yet → dangling foreign key.
+spark-sql> INSERT INTO polaris.demo_ns.orders VALUES (9500, 6, 42.00, 'live');
+--         orders is now 6 in the live catalog; customers still 3 — window OPEN.
+
+--   ⏸  Run the "still pinned" reads in Terminal A now, then come back.
+
+-- Step 2: close the window by inserting the matching customer.
+spark-sql> INSERT INTO polaris.demo_ns.customers VALUES (6, 'Frank', 'frank@example.com');
+```
+
+### Terminal A — Trino: pinned view is unmoved (no torn read), then commit → fresh
 
 ```sql
--- Still inside the same REPEATABLE READ transaction — pinned to the snapshot.
-trino:demo_ns> SELECT count(*) FROM orders;   -- STILL 5 — does NOT see Spark's commit
+-- Still inside the same REPEATABLE READ transaction — pinned to the original instant.
+trino:demo_ns> SELECT count(*) FROM orders;      -- STILL 5 — does NOT see Spark's commit
+trino:demo_ns> SELECT count(*) FROM customers;   -- STILL 3 — consistent with orders
+
+-- The killer line: the cross-table invariant HOLDS on the pinned snapshot, even though a
+-- dangling FK now exists in the live catalog. The pinned reader is shielded from it.
+trino:demo_ns> SELECT count(*) AS dangling FROM orders o
+                 LEFT JOIN customers c ON o.customer_id = c.customer_id
+                 WHERE c.customer_id IS NULL;    -- 0  ← no torn read
 
 trino:demo_ns> COMMIT;
 
--- New (autocommit) statement — fresh read sees the latest committed data.
-trino:demo_ns> SELECT count(*) FROM orders;   -- 6
+-- New (autocommit) statements — fresh reads see the latest committed data.
+trino:demo_ns> SELECT count(*) FROM orders;      -- 6
+trino:demo_ns> SELECT count(*) FROM customers;   -- 4
+
+-- Run the invariant BETWEEN Spark's two INSERTs (window still open) to see it fail:
+--   SELECT count(*) AS dangling ... WHERE c.customer_id IS NULL;   -- 1  ← the torn window is REAL
+-- After Step 2 (customer 6 inserted) the fresh invariant returns 0 again.
 ```
+
+> **The `0 → 1 → 0` story.** Inside the pinned transaction the invariant is always `0`. A fresh
+> (unpinned) read taken *between* Spark's two INSERTs returns `1` — proof the dangling FK genuinely
+> exists in the catalog. REPEATABLE READ is the difference between a reader that catches the torn
+> state and one that never does — the same guarantee Part 1 gives Spark, now delivered to Trino.
 
 ---
 
-## Part 4 — READ COMMITTED (reads latest each statement)
+## Part 4 — READ COMMITTED: flip one word, same session (the contrast)
 
 **Behavior:** `START TRANSACTION ISOLATION LEVEL READ COMMITTED` does NOT pin a snapshot — each
 statement reads the latest committed data, so a read that follows a concurrent commit reflects it,
 even within the same open transaction. This is the direct contrast to REPEATABLE READ in Part 3.
 
-Verified manually via the CLI:
+**No new terminals.** Right after the Part 3 `COMMIT`, stay in the **same Trino session** and change
+only the isolation level. Same query, different answer — that's the whole point.
+
+Verified live via the CLI (RR stayed `5` across a Spark commit; RC then jumped `5 → 7`):
 
 ```sql
--- Terminal A (Trino)
-trino:demo_ns> START TRANSACTION ISOLATION LEVEL READ COMMITTED;
-trino:demo_ns> SELECT count(*) FROM orders;   -- baseline, e.g. 5
+-- Terminal A (Trino) — same session as Part 3, immediately after COMMIT.
+trino:demo_ns> START TRANSACTION ISOLATION LEVEL READ COMMITTED;   -- was REPEATABLE READ
+trino:demo_ns> SELECT count(*) FROM orders;   -- baseline, e.g. 6
 
---   Terminal B (Spark): INSERT one row + commit  → latest is now 6
+--   Terminal B (Spark): INSERT another row + commit  → latest is now 7
 
-trino:demo_ns> SELECT count(*) FROM orders;   -- 6  ← sees the concurrent commit (latest)
+trino:demo_ns> SELECT count(*) FROM orders;   -- 7  ← MOVES: sees the concurrent commit (latest)
 trino:demo_ns> COMMIT;
-trino:demo_ns> SELECT count(*) FROM orders;   -- 6
+trino:demo_ns> SELECT count(*) FROM orders;   -- 7
 ```
+
+> **The A/B in one terminal:** REPEATABLE READ froze at its pinned instant across a concurrent Spark
+> write; READ COMMITTED — same session, same query, one word changed — tracks the latest. The reader
+> chooses stable-vs-fresh with a familiar SQL name, no third session and no client-side config.
 
 **How it works:** within one Trino connector transaction, a loaded table is cached at two layers —
 the connector's own per-transaction table cache (`TrinoRestCatalog.tableCache`) and the underlying
@@ -361,7 +414,7 @@ reads keep the cache for stable, repeatable reads.
 
 | Isolation (Trino) | How to request | Behavior | Status |
 |---|---|---|---|
-| REPEATABLE READ | `START TRANSACTION ISOLATION LEVEL REPEATABLE READ` (in SQL) | Pins a Polaris snapshot on first read; consistent view across concurrent Spark commits | Works |
+| REPEATABLE READ | `START TRANSACTION ISOLATION LEVEL REPEATABLE READ` (in SQL) | Pins a Polaris snapshot on first read; **one snapshot covers every table in the txn** — consistent multi-table view (no torn read) across concurrent Spark commits | Works |
 | READ COMMITTED | `START TRANSACTION ISOLATION LEVEL READ COMMITTED` (in SQL) | Reads latest committed data each statement (both cache layers invalidated per statement) | Works |
 | Explicit snapshot | `SET SESSION polaris.polaris_read_snapshot = <id>` | Pins reads to a specific Polaris `txn_snapshot_id` (allocate via `POST /transaction-snapshots`); works from any client | Works |
 

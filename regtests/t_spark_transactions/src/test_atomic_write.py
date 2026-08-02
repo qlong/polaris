@@ -349,6 +349,193 @@ class TestAtomicWrite:
         assert count(txn_spark, fq_customers) == init_customers + 1
 
 
+class TestRetrySubtransaction:
+    """Verify the Pillar-4 retry story end-to-end: one table's subtransaction
+    fails, a *new* subtransaction for that same table succeeds under the still-open
+    parent, and the parent COMMIT publishes every table atomically — without redoing
+    the sibling tables' already-staged work."""
+
+    def test_retry_failed_subtransaction_then_commit(self, txn_spark, test_ns, catalog_name):
+        """orders stages once (kept); customers' first subtxn ROLLBACKs, a second
+        subtxn for customers is created + committed; orchestrator COMMITs.
+
+        Result: BOTH tables get exactly +1 — the failed table was recovered by a
+        fresh subtransaction, and orders was never re-staged.
+        """
+        ns  = test_ns["ns"]
+        cat = catalog_name
+        fq_orders    = f"{cat}.{ns}.orders"
+        fq_customers = f"{cat}.{ns}.customers"
+        init_orders    = test_ns["init_orders"]
+        init_customers = test_ns["init_customers"]
+
+        # Phase 1: open the parent transaction.
+        txn_spark.sql("BEGIN TRANSACTION")
+
+        # Phase 2: orders stages successfully and stays staged for the rest of the txn.
+        subtxn_orders = create_subtxn(txn_spark, f"{ns}.orders")
+        run_worker(
+            txn_spark.new_session(), f"{ns}.orders", subtxn_orders,
+            f"INSERT INTO {fq_orders} VALUES (9101, 9, 111.00, 'kept')",
+        )
+
+        # Phase 3: customers' FIRST attempt fails (simulated transient error → ROLLBACK).
+        subtxn_customers_1 = create_subtxn(txn_spark, f"{ns}.customers")
+        run_worker_rollback(
+            txn_spark.new_session(), f"{ns}.customers", subtxn_customers_1,
+            f"INSERT INTO {fq_customers} VALUES (91, 'Doomed', 'doomed@example.com')",
+        )
+
+        # Phase 4: RETRY — a brand-new subtransaction for the SAME table under the
+        # SAME parent. This is the exact operation the slides/talk claim is possible.
+        subtxn_customers_2 = create_subtxn(txn_spark, f"{ns}.customers")
+        assert subtxn_customers_2.subtxn_id != subtxn_customers_1.subtxn_id, (
+            "retry must allocate a distinct subtxn_id"
+        )
+        run_worker(
+            txn_spark.new_session(), f"{ns}.customers", subtxn_customers_2,
+            f"INSERT INTO {fq_customers} VALUES (9, 'Zara', 'zara@example.com')",
+        )
+
+        # Phase 5: parent commit publishes both tables atomically.
+        txn_spark.sql("COMMIT")
+
+        refresh(txn_spark, fq_orders)
+        refresh(txn_spark, fq_customers)
+        # orders: exactly +1 (staged once, never retried).
+        assert count(txn_spark, fq_orders) == init_orders + 1, (
+            "orders should have +1 from its single staged subtransaction"
+        )
+        # customers: exactly +1 — only the retry survived; the rolled-back attempt did not.
+        assert count(txn_spark, fq_customers) == init_customers + 1, (
+            "customers should have +1 from the retry subtransaction only "
+            "(the rolled-back first attempt must not survive)"
+        )
+        # The 'Doomed' row from the failed attempt must not exist.
+        doomed = count(txn_spark, f"{fq_customers} WHERE customer_id = 91")
+        assert doomed == 0, "the rolled-back first attempt must leave no data"
+
+    def test_in_progress_subtransaction_blocks_parent_commit(
+        self, txn_spark, test_ns, catalog_name
+    ):
+        """SAFETY: a worker begins + inserts but never COMMIT/ROLLBACKs (a crash
+        mid-flight). The parent COMMIT must be REJECTED while that subtransaction is
+        still IN_PROGRESS — the server refuses to publish a half-finished transaction.
+        Neither table changes."""
+        import pytest
+
+        ns  = test_ns["ns"]
+        cat = catalog_name
+        fq_orders    = f"{cat}.{ns}.orders"
+        fq_customers = f"{cat}.{ns}.customers"
+        init_orders    = test_ns["init_orders"]
+        init_customers = test_ns["init_customers"]
+
+        txn_spark.sql("BEGIN TRANSACTION")
+
+        subtxn_orders = create_subtxn(txn_spark, f"{ns}.orders")
+        run_worker(
+            txn_spark.new_session(), f"{ns}.orders", subtxn_orders,
+            f"INSERT INTO {fq_orders} VALUES (9102, 9, 222.00, 'kept')",
+        )
+
+        # customers subtxn: begin + insert, then the worker "crashes" — it never
+        # issues COMMIT/ROLLBACK SUBTRANSACTION, so the subtxn stays IN_PROGRESS.
+        subtxn_customers = create_subtxn(txn_spark, f"{ns}.customers")
+        crashed = txn_spark.new_session()
+        crashed.sql(
+            f"BEGIN SUBTRANSACTION {ns}.customers "
+            f"SUBTXN_ID={subtxn_customers.subtxn_id}, "
+            f"SUBTXN_TOKEN='{subtxn_customers.subtxn_token}'"
+        )
+        crashed.sql(
+            f"INSERT INTO {fq_customers} VALUES (92, 'Abandoned', 'abandoned@example.com')"
+        )
+
+        # Parent COMMIT must be rejected: a subtransaction is still in progress.
+        with pytest.raises(Exception) as excinfo:
+            txn_spark.sql("COMMIT")
+        assert "IN_PROGRESS" in str(excinfo.value), (
+            "parent COMMIT must be rejected while a subtransaction is IN_PROGRESS; "
+            f"got: {excinfo.value}"
+        )
+
+        # Nothing was published — both tables are unchanged.
+        refresh(txn_spark, fq_orders)
+        refresh(txn_spark, fq_customers)
+        assert count(txn_spark, fq_orders)    == init_orders,    "orders unchanged"
+        assert count(txn_spark, fq_customers) == init_customers, "customers unchanged"
+
+    def test_retry_after_aborting_crashed_subtransaction_then_commit(
+        self, txn_spark, test_ns, catalog_name
+    ):
+        """RECOVERY: a worker crashes mid-flight (begin + insert, no terminal
+        statement). The orchestrator aborts the stale subtransaction (a session
+        re-binds to it and ROLLBACK SUBTRANSACTION), then retries the table with a
+        fresh subtransaction. The parent COMMITs — both tables land +1 and the
+        crashed attempt leaves no data. orders was staged exactly once."""
+        ns  = test_ns["ns"]
+        cat = catalog_name
+        fq_orders    = f"{cat}.{ns}.orders"
+        fq_customers = f"{cat}.{ns}.customers"
+        init_orders    = test_ns["init_orders"]
+        init_customers = test_ns["init_customers"]
+
+        txn_spark.sql("BEGIN TRANSACTION")
+
+        subtxn_orders = create_subtxn(txn_spark, f"{ns}.orders")
+        run_worker(
+            txn_spark.new_session(), f"{ns}.orders", subtxn_orders,
+            f"INSERT INTO {fq_orders} VALUES (9103, 9, 333.00, 'kept')",
+        )
+
+        # customers' first worker crashes: begin + insert, no COMMIT/ROLLBACK.
+        subtxn_customers_1 = create_subtxn(txn_spark, f"{ns}.customers")
+        crashed = txn_spark.new_session()
+        crashed.sql(
+            f"BEGIN SUBTRANSACTION {ns}.customers "
+            f"SUBTXN_ID={subtxn_customers_1.subtxn_id}, "
+            f"SUBTXN_TOKEN='{subtxn_customers_1.subtxn_token}'"
+        )
+        crashed.sql(
+            f"INSERT INTO {fq_customers} VALUES (92, 'Abandoned', 'abandoned@example.com')"
+        )
+
+        # RECOVERY step 1: abort the stale subtransaction so it no longer blocks the
+        # parent. A new session re-binds to it and ROLLBACK SUBTRANSACTION.
+        cleanup = txn_spark.new_session()
+        cleanup.sql(
+            f"BEGIN SUBTRANSACTION {ns}.customers "
+            f"SUBTXN_ID={subtxn_customers_1.subtxn_id}, "
+            f"SUBTXN_TOKEN='{subtxn_customers_1.subtxn_token}'"
+        )
+        cleanup.sql("ROLLBACK SUBTRANSACTION")
+
+        # RECOVERY step 2: a brand-new subtransaction for the SAME table succeeds.
+        subtxn_customers_2 = create_subtxn(txn_spark, f"{ns}.customers")
+        assert subtxn_customers_2.subtxn_id != subtxn_customers_1.subtxn_id, (
+            "retry must allocate a distinct subtxn_id"
+        )
+        run_worker(
+            txn_spark.new_session(), f"{ns}.customers", subtxn_customers_2,
+            f"INSERT INTO {fq_customers} VALUES (9, 'Zara', 'zara@example.com')",
+        )
+
+        # Parent can now commit: no subtransaction is left in progress.
+        txn_spark.sql("COMMIT")
+
+        refresh(txn_spark, fq_orders)
+        refresh(txn_spark, fq_customers)
+        assert count(txn_spark, fq_orders) == init_orders + 1, (
+            "orders should have +1 from its single staged subtransaction"
+        )
+        assert count(txn_spark, fq_customers) == init_customers + 1, (
+            "customers should have +1 from the retry subtransaction only"
+        )
+        abandoned = count(txn_spark, f"{fq_customers} WHERE customer_id = 92")
+        assert abandoned == 0, "the crashed first attempt must leave no data"
+
+
 class TestSubtxnParsing:
     """Lightweight tests for the CREATE SUBTRANSACTION FOR return value."""
 

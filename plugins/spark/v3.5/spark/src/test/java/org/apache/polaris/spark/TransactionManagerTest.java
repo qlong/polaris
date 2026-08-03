@@ -38,6 +38,7 @@ import java.util.Optional;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.polaris.spark.rest.GetSubtransactionRESTResponse;
+import org.apache.polaris.spark.rest.SubtransactionOperationRESTResponse;
 import org.apache.polaris.spark.rest.SubtransactionRESTResponse;
 import org.apache.polaris.spark.rest.TransactionRESTResponse;
 import org.apache.spark.sql.RuntimeConfig;
@@ -383,10 +384,10 @@ public class TransactionManagerTest {
         .isEqualTo("42");
     assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_SUBTXN_TOKEN, CATALOG)))
         .isEqualTo("subtok");
-    assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_TABLE, CATALOG)))
+    assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_TABLES, CATALOG)))
         .isEqualTo("demo_ns.orders");
-    assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_STAGING_PATH, CATALOG)))
-        .isEqualTo("file:///tmp/txn-42.metadata.json");
+    assertThat(txnManager.getWorkerStagingPath(mockSpark, orders))
+        .hasValue("file:///tmp/txn-42.metadata.json");
 
     // CRITICAL: staged-path conf key must NOT be set — if it were, resolveMetadataLocation would
     // return it as a RYOW path before the file exists, causing loadTable to fail.
@@ -412,7 +413,7 @@ public class TransactionManagerTest {
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
     txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok", orders, "ROW_EXCLUSIVE");
 
-    Optional<String> path = txnManager.getWorkerStagingPath(mockSpark);
+    Optional<String> path = txnManager.getWorkerStagingPath(mockSpark, orders);
     assertThat(path).hasValue("file:///tmp/txn-42.metadata.json");
   }
 
@@ -439,8 +440,9 @@ public class TransactionManagerTest {
     // All conf cleared after commit
     assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_SUBTXN_ID, CATALOG)))
         .isNull();
-    assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_STAGING_PATH, CATALOG)))
+    assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_TABLES, CATALOG)))
         .isNull();
+    assertThat(txnManager.getWorkerStagingPath(mockSpark, orders)).isEmpty();
     assertThat(confStore.get(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG)))
         .isNull();
   }
@@ -489,6 +491,156 @@ public class TransactionManagerTest {
     assertThatThrownBy(() -> txnManager.commit(mockSpark))
         .isInstanceOf(IllegalStateException.class)
         .hasMessageContaining("use COMMIT SUBTRANSACTION");
+  }
+
+  // -------------------------------------------------------------------------
+  // Multi-table subtransactions
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void testCreateSubtransactionForMultipleTablesSendsTablesList() {
+    // ACTIVE state so no lazy begin fires.
+    confStore.put(
+        String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG), "REPEATABLE_READ");
+    confStore.put(String.format(TransactionManager.CONF_TXN_ID, CATALOG), "77");
+    confStore.put(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG), "tok77");
+    SubtransactionRESTResponse subtxnResp = mock(SubtransactionRESTResponse.class);
+    when(mockRestCatalog.createSubtransaction(anyLong(), anyString(), anyList(), anyInt()))
+        .thenReturn(subtxnResp);
+
+    TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
+    TableIdentifier customers = TableIdentifier.of(Namespace.of("demo_ns"), "customers");
+    txnManager.createSubtransactionForOrchestrator(
+        mockSpark,
+        java.util.List.of(orders, customers),
+        java.util.List.of("EXCLUSIVE", "EXCLUSIVE"));
+
+    // The multi-table overload (tables[]) must be used, NOT the scalar shorthand.
+    org.mockito.ArgumentCaptor<
+            java.util.List<org.apache.polaris.spark.rest.SubtransactionTableRESTRequest>>
+        captor = org.mockito.ArgumentCaptor.forClass(java.util.List.class);
+    verify(mockRestCatalog)
+        .createSubtransaction(
+            eq(77L), eq("tok77"), captor.capture(), eq(TransactionManager.DEFAULT_LEASE_SECONDS));
+    verify(mockRestCatalog, never())
+        .createSubtransaction(anyLong(), anyString(), anyString(), anyString(), anyInt());
+    java.util.List<org.apache.polaris.spark.rest.SubtransactionTableRESTRequest> sent =
+        captor.getValue();
+    assertThat(sent).hasSize(2);
+    assertThat(sent.get(0).getTableIdentifier()).isEqualTo("demo_ns.orders");
+    assertThat(sent.get(0).getOperation()).isEqualTo("EXCLUSIVE");
+    assertThat(sent.get(1).getTableIdentifier()).isEqualTo("demo_ns.customers");
+    assertThat(sent.get(1).getOperation()).isEqualTo("EXCLUSIVE");
+  }
+
+  @Test
+  public void testCreateSubtransactionForSingleTableInListUsesScalarShorthand() {
+    confStore.put(
+        String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG), "REPEATABLE_READ");
+    confStore.put(String.format(TransactionManager.CONF_TXN_ID, CATALOG), "88");
+    confStore.put(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG), "tok88");
+    SubtransactionRESTResponse subtxnResp = mock(SubtransactionRESTResponse.class);
+    when(mockRestCatalog.createSubtransaction(
+            anyLong(), anyString(), anyString(), anyString(), anyInt()))
+        .thenReturn(subtxnResp);
+
+    TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
+    txnManager.createSubtransactionForOrchestrator(
+        mockSpark, java.util.List.of(orders), java.util.List.of("ROW_EXCLUSIVE"));
+
+    // A single-table list collapses to the scalar shorthand (backward compatible).
+    verify(mockRestCatalog)
+        .createSubtransaction(
+            88L,
+            "tok88",
+            "demo_ns.orders",
+            "ROW_EXCLUSIVE",
+            TransactionManager.DEFAULT_LEASE_SECONDS);
+    verify(mockRestCatalog, never())
+        .createSubtransaction(anyLong(), anyString(), anyList(), anyInt());
+  }
+
+  @Test
+  public void testCreateSubtransactionRejectsMismatchedTablesAndOperations() {
+    confStore.put(
+        String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG), "REPEATABLE_READ");
+    confStore.put(String.format(TransactionManager.CONF_TXN_ID, CATALOG), "1");
+    confStore.put(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG), "t");
+
+    TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
+    TableIdentifier customers = TableIdentifier.of(Namespace.of("demo_ns"), "customers");
+
+    assertThatThrownBy(
+            () ->
+                txnManager.createSubtransactionForOrchestrator(
+                    mockSpark,
+                    java.util.List.of(orders, customers),
+                    java.util.List.of("ROW_EXCLUSIVE")))
+        .isInstanceOf(IllegalArgumentException.class);
+  }
+
+  @Test
+  public void testWorkerSelfHydratesAllTablesFromOperations() {
+    // Server returns a 2-table subtransaction via operations[].
+    GetSubtransactionRESTResponse info = mock(GetSubtransactionRESTResponse.class);
+    when(info.txnId()).thenReturn(7L);
+    when(info.txnSnapshotId()).thenReturn(99L);
+    SubtransactionOperationRESTResponse op1 = mock(SubtransactionOperationRESTResponse.class);
+    when(op1.tableUuid()).thenReturn("demo_ns.orders");
+    when(op1.assignedStagingPath()).thenReturn("file:///tmp/orders-42.metadata.json");
+    SubtransactionOperationRESTResponse op2 = mock(SubtransactionOperationRESTResponse.class);
+    when(op2.tableUuid()).thenReturn("demo_ns.customers");
+    when(op2.assignedStagingPath()).thenReturn("file:///tmp/customers-42.metadata.json");
+    when(info.operations()).thenReturn(java.util.List.of(op1, op2));
+    when(mockRestCatalog.getSubtransaction(42L, "subtok")).thenReturn(info);
+
+    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok");
+
+    TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
+    TableIdentifier customers = TableIdentifier.of(Namespace.of("demo_ns"), "customers");
+    assertThat(txnManager.getWorkerTables(mockSpark))
+        .containsExactly("demo_ns.orders", "demo_ns.customers");
+    assertThat(txnManager.isWorkerTable(mockSpark, orders)).isTrue();
+    assertThat(txnManager.isWorkerTable(mockSpark, customers)).isTrue();
+    assertThat(txnManager.getWorkerStagingPath(mockSpark, orders))
+        .hasValue("file:///tmp/orders-42.metadata.json");
+    assertThat(txnManager.getWorkerStagingPath(mockSpark, customers))
+        .hasValue("file:///tmp/customers-42.metadata.json");
+
+    // A table NOT in the subtransaction is not a worker table.
+    TableIdentifier other = TableIdentifier.of(Namespace.of("demo_ns"), "products");
+    assertThat(txnManager.isWorkerTable(mockSpark, other)).isFalse();
+    assertThat(txnManager.getWorkerStagingPath(mockSpark, other)).isEmpty();
+  }
+
+  @Test
+  public void testCommitMultiTableWorkerRequiresAtLeastOneStaged() {
+    GetSubtransactionRESTResponse info = mock(GetSubtransactionRESTResponse.class);
+    when(info.txnId()).thenReturn(7L);
+    when(info.txnSnapshotId()).thenReturn(99L);
+    SubtransactionOperationRESTResponse op1 = mock(SubtransactionOperationRESTResponse.class);
+    when(op1.tableUuid()).thenReturn("demo_ns.orders");
+    when(op1.assignedStagingPath()).thenReturn("file:///tmp/orders-42.metadata.json");
+    SubtransactionOperationRESTResponse op2 = mock(SubtransactionOperationRESTResponse.class);
+    when(op2.tableUuid()).thenReturn("demo_ns.customers");
+    when(op2.assignedStagingPath()).thenReturn("file:///tmp/customers-42.metadata.json");
+    when(info.operations()).thenReturn(java.util.List.of(op1, op2));
+    when(mockRestCatalog.getSubtransaction(42L, "subtok")).thenReturn(info);
+
+    txnManager.beginWorkerSubtransaction(mockSpark, 42L, "subtok");
+
+    // Nothing staged yet -> commit must refuse.
+    assertThatThrownBy(() -> txnManager.commitWorkerSubtransaction(mockSpark))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("No staged data");
+
+    // Staging just ONE of the two tables is enough for the body-less commit to proceed.
+    TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
+    txnManager.stageWrite(
+        mockSpark, orders, "file:///tmp/orders-42.metadata.json", "ROW_EXCLUSIVE");
+    txnManager.commitWorkerSubtransaction(mockSpark);
+
+    verify(mockRestCatalog).commitSubtransaction(7L, 42L, "subtok");
   }
 
   // -------------------------------------------------------------------------

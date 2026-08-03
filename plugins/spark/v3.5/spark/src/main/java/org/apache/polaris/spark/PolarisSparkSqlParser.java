@@ -18,7 +18,9 @@
  */
 package org.apache.polaris.spark;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Locale;
 import java.util.regex.Matcher;
 import org.apache.polaris.spark.rest.SubtransactionRESTResponse;
@@ -141,8 +143,11 @@ public class PolarisSparkSqlParser implements ParserInterface {
       return delegate.parsePlan(statusSql("Subtransaction aborted"));
     }
 
-    // CREATE SUBTRANSACTION FOR <table> [WITH (ROW_EXCLUSIVE|EXCLUSIVE|ACCESS_EXCLUSIVE)]
+    // CREATE SUBTRANSACTION FOR <table>[, <table>...] [WITH (ROW_EXCLUSIVE|EXCLUSIVE|
+    // ACCESS_EXCLUSIVE)]
     // e.g.  CREATE SUBTRANSACTION FOR ns.orders WITH EXCLUSIVE
+    //       CREATE SUBTRANSACTION FOR ns.orders, ns.customers      -- one atomic unit over 2 tables
+    // A single WITH <lock> applies to every table in the list.
     if (normalized.startsWith("CREATE SUBTRANSACTION FOR ")) {
       SparkSession spark = SparkSession.active();
       // Use original sql to preserve the table name's natural case (server lookup is
@@ -152,9 +157,9 @@ public class PolarisSparkSqlParser implements ParserInterface {
       String rawUpper = rawSql.toUpperCase(Locale.ROOT);
       int withIdx = rawUpper.indexOf(" WITH ", "CREATE SUBTRANSACTION FOR ".length());
       String operation = "ROW_EXCLUSIVE";
-      String tableStr;
+      String tablesStr;
       if (withIdx >= 0) {
-        tableStr = rawSql.substring("CREATE SUBTRANSACTION FOR ".length(), withIdx).trim();
+        tablesStr = rawSql.substring("CREATE SUBTRANSACTION FOR ".length(), withIdx).trim();
         String opToken = rawUpper.substring(withIdx + " WITH ".length()).trim();
         if (opToken.equals("EXCLUSIVE")) {
           operation = "EXCLUSIVE";
@@ -162,11 +167,17 @@ public class PolarisSparkSqlParser implements ParserInterface {
           operation = "ACCESS_EXCLUSIVE";
         }
       } else {
-        tableStr = rawSql.substring("CREATE SUBTRANSACTION FOR ".length()).trim();
+        tablesStr = rawSql.substring("CREATE SUBTRANSACTION FOR ".length()).trim();
       }
-      org.apache.iceberg.catalog.TableIdentifier ident = parseTableIdentifierPolaris(tableStr);
+      List<org.apache.iceberg.catalog.TableIdentifier> idents =
+          parseTableIdentifierListPolaris(tablesStr);
+      // One lock mode applies to every table in the atomic unit.
+      List<String> operations = new ArrayList<>(idents.size());
+      for (int i = 0; i < idents.size(); i++) {
+        operations.add(operation);
+      }
       SubtransactionRESTResponse resp =
-          txnManager(spark).createSubtransactionForOrchestrator(spark, ident, operation);
+          txnManager(spark).createSubtransactionForOrchestrator(spark, idents, operations);
       String msg =
           "Subtransaction created  subtxn_id="
               + resp.subtxnId()
@@ -177,10 +188,12 @@ public class PolarisSparkSqlParser implements ParserInterface {
       return delegate.parsePlan(statusSql(msg));
     }
 
-    // BEGIN SUBTRANSACTION <table> SUBTXN_ID=<n>, SUBTXN_TOKEN='<s>'
+    // BEGIN SUBTRANSACTION <table>[, <table>...] SUBTXN_ID=<n>, SUBTXN_TOKEN='<s>'
     //
     // Minimal worker syntax: only subtxn_id and subtxn_token are required.
-    // The server fetches txn_id, txn_snapshot_id, and staging_path automatically.
+    // The server fetches txn_id, txn_snapshot_id, and every table's staging_path automatically
+    // (the worker self-hydrates all N tables from the subtransaction's operations[]), so the table
+    // list here is informational and may name one or many tables.
     // Parameter names are case-insensitive. Whitespace (spaces, tabs, newlines) and commas
     // between parameters are all treated as equivalent separators.
     if (normalized.startsWith("BEGIN SUBTRANSACTION ")) {
@@ -189,36 +202,31 @@ public class PolarisSparkSqlParser implements ParserInterface {
       String rawRest = sql.trim();
       if (rawRest.endsWith(";")) rawRest = rawRest.substring(0, rawRest.length() - 1).trim();
 
-      // normUpper: uppercase + collapse any run of [,\s]+ to a single space so that
-      // newlines, tabs, and comma-separated params all look the same to indexOf.
-      String normUpper = rawRest.toUpperCase(Locale.ROOT).replaceAll("[,\\s]+", " ").trim();
-
-      // normRest mirrors normUpper but preserves original case (for quoted value extraction).
-      String normRest = rawRest.replaceAll("[,\\s]+", " ").trim();
-
+      // The table list (before SUBTXN_ID=) is comma-separated, but the params (after it) may also
+      // be comma-separated. So we split the statement at " SUBTXN_ID=" and normalize each half:
+      //  - table half: collapse only whitespace (keep commas — they delimit tables)
+      //  - param half: collapse [,\s]+ so "SUBTXN_ID=5,SUBTXN_TOKEN='x'" parses like space-separated
       int after = "BEGIN SUBTRANSACTION ".length();
-      // Extract table name — everything between the command prefix and " SUBTXN_ID=".
-      int subtxnIdIdx = normUpper.indexOf(" SUBTXN_ID=");
+      String rawUpperCollapsed = rawRest.toUpperCase(Locale.ROOT).replaceAll("\\s+", " ").trim();
+      int subtxnIdIdx = rawUpperCollapsed.indexOf(" SUBTXN_ID=");
       if (subtxnIdIdx < 0) {
         throw new IllegalArgumentException("BEGIN SUBTRANSACTION: missing SUBTXN_ID=<n>");
       }
-      String tableStr = normRest.substring(after, subtxnIdIdx).trim();
-      if (tableStr.endsWith(",")) tableStr = tableStr.substring(0, tableStr.length() - 1).trim();
-      org.apache.iceberg.catalog.TableIdentifier ident = parseTableIdentifierPolaris(tableStr);
+      String rawCollapsed = rawRest.replaceAll("\\s+", " ").trim();
 
-      long subtxnId = parseLongParam(normRest, normUpper, "SUBTXN_ID");
-      String subtxnToken = parseStringParam(normRest, normUpper, "SUBTXN_TOKEN");
-      String operation = "ROW_EXCLUSIVE";
-      int opIdx = normUpper.indexOf(" OPERATION=");
-      if (opIdx >= 0) {
-        String opToken = normRest.substring(opIdx + " OPERATION=".length()).trim();
-        int end = opToken.indexOf(' ');
-        opToken = (end >= 0 ? opToken.substring(0, end) : opToken).trim().toUpperCase(Locale.ROOT);
-        if (opToken.equals("EXCLUSIVE")) operation = "EXCLUSIVE";
-        else if (opToken.equals("ACCESS_EXCLUSIVE")) operation = "ACCESS_EXCLUSIVE";
-      }
+      String tablesStr = rawCollapsed.substring(after, subtxnIdIdx).trim();
+      if (tablesStr.endsWith(",")) tablesStr = tablesStr.substring(0, tablesStr.length() - 1).trim();
+      // Validate the list parses (informational — the worker hydrates from the server), so a
+      // malformed name here is a clear error rather than a silent no-op.
+      parseTableIdentifierListPolaris(tablesStr);
 
-      txnManager(spark).beginWorkerSubtransaction(spark, subtxnId, subtxnToken, ident, operation);
+      // Params half: leading space keeps " SUBTXN_ID=" findable after [,\s]+ collapse.
+      String paramRest = " " + rawCollapsed.substring(subtxnIdIdx).trim().replaceAll("[,\\s]+", " ");
+      String paramUpper = paramRest.toUpperCase(Locale.ROOT);
+      long subtxnId = parseLongParam(paramRest, paramUpper, "SUBTXN_ID");
+      String subtxnToken = parseStringParam(paramRest, paramUpper, "SUBTXN_TOKEN");
+
+      txnManager(spark).beginWorkerSubtransaction(spark, subtxnId, subtxnToken);
       return delegate.parsePlan(statusSql("Worker subtransaction started, subtxn_id=" + subtxnId));
     }
 
@@ -287,6 +295,28 @@ public class PolarisSparkSqlParser implements ParserInterface {
     String[] nsParts = Arrays.copyOf(parts, parts.length - 1);
     return org.apache.iceberg.catalog.TableIdentifier.of(
         org.apache.iceberg.catalog.Namespace.of(nsParts), parts[parts.length - 1]);
+  }
+
+  /**
+   * Parses a comma-separated list of table identifiers, e.g. {@code "ns.orders, ns.customers"}. Each
+   * entry is parsed by {@link #parseTableIdentifierPolaris}. Blank entries are rejected so a trailing
+   * comma or {@code "a,,b"} is a clear error rather than a silent drop.
+   */
+  private static List<org.apache.iceberg.catalog.TableIdentifier> parseTableIdentifierListPolaris(
+      String tablesStr) {
+    List<org.apache.iceberg.catalog.TableIdentifier> idents = new ArrayList<>();
+    for (String part : tablesStr.split(",")) {
+      String trimmed = part.trim();
+      if (trimmed.isEmpty()) {
+        throw new IllegalArgumentException(
+            "Empty table identifier in list '" + tablesStr + "' (check for a stray comma)");
+      }
+      idents.add(parseTableIdentifierPolaris(trimmed));
+    }
+    if (idents.isEmpty()) {
+      throw new IllegalArgumentException("Expected at least one table identifier");
+    }
+    return idents;
   }
 
   /**

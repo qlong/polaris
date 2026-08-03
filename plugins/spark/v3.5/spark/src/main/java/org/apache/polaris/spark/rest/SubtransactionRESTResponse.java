@@ -18,11 +18,17 @@
  */
 package org.apache.polaris.spark.rest;
 
+import java.util.List;
 import org.apache.iceberg.rest.RESTResponse;
 import org.apache.iceberg.shaded.com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import org.apache.iceberg.shaded.com.fasterxml.jackson.annotation.JsonProperty;
 
-/** Response from POST /transactions/{txnId}/subtransactions (createSubtransaction). */
+/**
+ * Response from POST /transactions/{txnId}/subtransactions (createSubtransaction).
+ *
+ * <p>{@link #operations()} carries one entry per table for a multi-table subtransaction; the scalar
+ * {@link #assignedStagingPath()} mirrors the first operation for the single-table path.
+ */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class SubtransactionRESTResponse implements RESTResponse {
   @JsonProperty("subtxn_id")
@@ -33,6 +39,9 @@ public class SubtransactionRESTResponse implements RESTResponse {
 
   @JsonProperty("assigned_staging_path")
   private String assignedStagingPath;
+
+  @JsonProperty("operations")
+  private List<SubtransactionOperationRESTResponse> operations;
 
   public SubtransactionRESTResponse() {}
 
@@ -46,6 +55,11 @@ public class SubtransactionRESTResponse implements RESTResponse {
 
   public String assignedStagingPath() {
     return assignedStagingPath;
+  }
+
+  /** Per-table operations of this subtransaction, or {@code null} if the server omitted them. */
+  public List<SubtransactionOperationRESTResponse> operations() {
+    return operations;
   }
 
   @Override

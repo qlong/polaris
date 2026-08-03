@@ -880,6 +880,14 @@ components:
         parent_txn_id:
           type: integer
           format: int64
+        txn_snapshot_id:
+          type: integer
+          format: int64
+          description: >
+            The parent transaction's pinned snapshot id (REPEATABLE READ), or null for a
+            READ COMMITTED parent. A resuming worker uses this to pin all of its reads —
+            including tables it does not own — to the snapshot the parent transaction took,
+            so every read in the subtransaction shares the parent's read point.
         name:
           type: string
           description: Optional stable subtransaction name (savepoint name / worker task key).

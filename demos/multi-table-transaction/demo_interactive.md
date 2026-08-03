@@ -277,6 +277,14 @@ This is the same REPEATABLE READ guarantee as Part 1, but now **across engines a
   JAVA_HOME=<jdk25> ./mvnw -pl client/trino-cli -am -q -DskipTests package
   # jar: client/trino-cli/target/trino-cli-*-executable.jar
   ```
+- **Idle timeout:** Trino's default idle transaction timeout is **5 minutes**
+  (`TransactionManagerConfig.idleTimeout`). If you pause too long between statements during the
+  demo, Trino evicts the transaction and the next statement fails with:
+  `Unknown transaction ID: ... Possibly expired? Commands ignored until end of transaction block`
+  The `testing/trino-server-dev/etc/config-polaris.properties` used by `start-polaris-dev.sh`
+  sets `transaction.idle-timeout=60m` to give the demo enough headroom. If you hit this error,
+  restart Trino (`pkill -f DevelopmentServer`, then re-run `start-polaris-dev.sh`) and redo the
+  part from `START TRANSACTION`.
 
 ### IMPORTANT — isolation level MUST be set in SQL
 

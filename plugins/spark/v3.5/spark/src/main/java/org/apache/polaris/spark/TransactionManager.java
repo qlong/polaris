@@ -28,7 +28,9 @@ import java.util.Optional;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.polaris.spark.rest.GetSubtransactionRESTResponse;
 import org.apache.polaris.spark.rest.StagedTableCommitRESTRequest;
+import org.apache.polaris.spark.rest.SubtransactionOperationRESTResponse;
 import org.apache.polaris.spark.rest.SubtransactionRESTResponse;
+import org.apache.polaris.spark.rest.SubtransactionTableRESTRequest;
 import org.apache.polaris.spark.rest.TransactionRESTResponse;
 import org.apache.spark.sql.SparkSession;
 import org.slf4j.Logger;
@@ -67,12 +69,13 @@ public class TransactionManager {
   // Worker mode conf keys — formatted with catalogName only
   static final String CONF_WORKER_SUBTXN_ID = "spark.sql.catalog.%s.active_worker_subtxn_id";
   static final String CONF_WORKER_SUBTXN_TOKEN = "spark.sql.catalog.%s.active_worker_subtxn_token";
-  static final String CONF_WORKER_TABLE = "spark.sql.catalog.%s.active_worker_table";
-  // Separate key for the server-allocated staging path in worker mode.
-  // NOT the same as the RYOW staged-path key — that key is only set AFTER the metadata file
-  // has been written (by PinnedTableOperations.commit), so the RYOW check in
-  // resolveMetadataLocation cannot fire prematurely on the first loadTable call.
-  static final String CONF_WORKER_STAGING_PATH = "spark.sql.catalog.%s.active_worker_staging_path";
+  // Comma-separated list of table keys this worker owns in the current subtransaction. A
+  // subtransaction may span 1..N tables; every entry is staged/committed as one atomic unit.
+  static final String CONF_WORKER_TABLES = "spark.sql.catalog.%s.active_worker_tables";
+  // Per-table server-allocated staging paths use the workerStagingPathConfKey(tableKey) helper.
+  // These are deliberately SEPARATE from the RYOW staged-path keys: the staged-path key is only
+  // set AFTER the metadata file has been written (by PinnedTableOperations.commit), so the RYOW
+  // check in resolveMetadataLocation cannot fire prematurely on the first loadTable call.
 
   static final String DEFAULT_ISOLATION = "REPEATABLE_READ";
   static final int DEFAULT_LEASE_SECONDS = 3600;
@@ -313,9 +316,10 @@ public class TransactionManager {
   // -------------------------------------------------------------------------
 
   /**
-   * Enters worker mode: fetches txn_id, txn_snapshot_id, and assigned_staging_path from the server
-   * using only the subtxn_id and subtxn_token. The worker does not need the orchestrator to pass
-   * those values explicitly.
+   * Single-table convenience wrapper over {@link #beginWorkerSubtransaction(SparkSession, long,
+   * String)}. The {@code table} and {@code operation} arguments are ignored for hydration — the
+   * worker self-hydrates every table it owns from the server's {@code operations[]}; they are kept
+   * only so the {@code BEGIN SUBTRANSACTION <table> ...} syntax stays backward compatible.
    */
   public void beginWorkerSubtransaction(
       SparkSession spark,
@@ -323,6 +327,19 @@ public class TransactionManager {
       String subtxnToken,
       TableIdentifier table,
       String operation) {
+    beginWorkerSubtransaction(spark, subtxnId, subtxnToken);
+  }
+
+  /**
+   * Enters worker mode: fetches txn_id, txn_snapshot_id, and — for every table in the
+   * subtransaction — its server-allocated staging path, using only the subtxn_id and subtxn_token.
+   *
+   * <p>A subtransaction may span 1..N tables. The worker self-hydrates the full set from the GET
+   * response's {@code operations[]} (option a): it does not need the orchestrator to pass the tables
+   * or their staging paths explicitly. Each operation's {@code table_uuid} is the table key and its
+   * {@code assigned_staging_path} is where PinnedTableOperations writes that table's metadata.
+   */
+  public void beginWorkerSubtransaction(SparkSession spark, long subtxnId, String subtxnToken) {
     String pending = getConf(spark, CONF_PENDING_ISOLATION);
     if (pending != null) {
       throw new IllegalStateException("Transaction already in progress. COMMIT or ROLLBACK first.");
@@ -335,13 +352,27 @@ public class TransactionManager {
     }
     setConf(spark, CONF_WORKER_SUBTXN_ID, String.valueOf(subtxnId));
     setConf(spark, CONF_WORKER_SUBTXN_TOKEN, subtxnToken);
-    setConf(spark, CONF_WORKER_TABLE, identToKey(table));
-    // Store the server-allocated staging path under a dedicated key so PinnedTableOperations
-    // knows where to write. Do NOT call stageWrite() here — that would trigger the RYOW branch
-    // in resolveMetadataLocation before any metadata file has been written, causing loadTable
-    // to attempt reading a non-existent path.  stageWrite is called by PinnedTableOperations
-    // after the file is written.
-    setConf(spark, CONF_WORKER_STAGING_PATH, info.assignedStagingPath());
+
+    // Hydrate every table the subtransaction owns. Prefer the multi-table operations[]; fall back
+    // to the scalar mirror (table_uuid + assigned_staging_path) for an older single-table server.
+    List<String> workerTables = new ArrayList<>();
+    List<SubtransactionOperationRESTResponse> ops = info.operations();
+    if (ops != null && !ops.isEmpty()) {
+      for (SubtransactionOperationRESTResponse op : ops) {
+        String tableKey = op.tableUuid();
+        workerTables.add(tableKey);
+        // Store each server-allocated staging path under a dedicated per-table key so
+        // PinnedTableOperations knows where to write. Do NOT call stageWrite() here — that would
+        // trigger the RYOW branch in resolveMetadataLocation before any metadata file has been
+        // written. stageWrite is called by PinnedTableOperations after the file is written.
+        setWorkerStagingPath(spark, tableKey, op.assignedStagingPath());
+      }
+    } else {
+      String tableKey = info.tableUuid();
+      workerTables.add(tableKey);
+      setWorkerStagingPath(spark, tableKey, info.assignedStagingPath());
+    }
+    setConf(spark, CONF_WORKER_TABLES, String.join(",", workerTables));
   }
 
   /**
@@ -355,12 +386,14 @@ public class TransactionManager {
     }
     String subtxnToken = getConf(spark, CONF_WORKER_SUBTXN_TOKEN);
     String txnId = getConf(spark, CONF_TXN_ID);
-    String workerTable = getConf(spark, CONF_WORKER_TABLE);
-    String stagedPath =
-        spark.conf().getOption(stagedPathConfKey(workerTable)).getOrElse(() -> null);
-    if (stagedPath == null) {
+    List<String> workerTables = getWorkerTables(spark);
+    boolean anyStaged =
+        workerTables.stream()
+            .anyMatch(
+                t -> spark.conf().getOption(stagedPathConfKey(t)).getOrElse(() -> null) != null);
+    if (!anyStaged) {
       throw new IllegalStateException(
-          "No staged data for worker table: " + workerTable + ". Write at least one row first.");
+          "No staged data for worker tables: " + workerTables + ". Write at least one row first.");
     }
     try {
       // Body-less commit: the worker already wrote its staged metadata to the server-assigned
@@ -413,47 +446,115 @@ public class TransactionManager {
   }
 
   /**
-   * Called by orchestrator SQL: {@code CREATE SUBTRANSACTION FOR <table>}. If the session is still
-   * PENDING, fires {@code beginTransaction} REST first (snapshot pinned at the first statement,
-   * consistent with PostgreSQL REPEATABLE READ semantics — no dummy SELECT required). Then
-   * allocates a server-side staging path and returns the subtransaction credentials.
+   * Single-table convenience wrapper over {@link #createSubtransactionForOrchestrator(SparkSession,
+   * List, List)}.
    */
   public SubtransactionRESTResponse createSubtransactionForOrchestrator(
       SparkSession spark, TableIdentifier table, String operation) {
-    ensureTransactionStarted(spark); // PENDING → ACTIVE if needed; throws if no transaction
-    String txnId = getConf(spark, CONF_TXN_ID);
-    String txnToken = getConf(spark, CONF_TXN_TOKEN);
-    return createSubtransactionWithRetry(
-        Long.parseLong(txnId), txnToken, identToKey(table), operation);
+    return createSubtransactionForOrchestrator(
+        spark, Collections.singletonList(table), Collections.singletonList(operation));
   }
 
   /**
-   * Calls {@code createSubtransaction} with retry-with-backoff for EXCLUSIVE lock conflicts. The
-   * server returns HTTP 409 with type={@code LockConflictError} and a {@code retry_after_ms} hint
-   * when an EXCLUSIVE request finds in-flight ROW_EXCLUSIVE holders. This method sleeps the
-   * suggested delay and retries up to {@link #MAX_LOCK_WAIT_RETRIES} times before throwing {@link
-   * PolarisRESTCatalog.LockWaitTimeoutException}.
+   * Called by orchestrator SQL: {@code CREATE SUBTRANSACTION FOR <table>[, <table> ...]}. The user
+   * chooses the subtransaction granularity — 1 table or N tables — and every table in {@code tables}
+   * is staged and committed as one atomic unit.
+   *
+   * <p>If the session is still PENDING, fires {@code beginTransaction} REST first (snapshot pinned
+   * at the first statement, consistent with PostgreSQL REPEATABLE READ semantics — no dummy SELECT
+   * required). Then allocates a single server-side subtransaction covering all tables and returns
+   * its credentials; the response's {@code operations[]} carries the per-table staging paths.
+   *
+   * @param tables the tables the subtransaction spans (must be non-empty)
+   * @param operations the lock mode per table, index-aligned with {@code tables}
+   */
+  public SubtransactionRESTResponse createSubtransactionForOrchestrator(
+      SparkSession spark, List<TableIdentifier> tables, List<String> operations) {
+    if (tables == null || tables.isEmpty()) {
+      throw new IllegalArgumentException("CREATE SUBTRANSACTION requires at least one table.");
+    }
+    if (operations.size() != tables.size()) {
+      throw new IllegalArgumentException(
+          "operations and tables must have the same length (got "
+              + operations.size()
+              + " vs "
+              + tables.size()
+              + ").");
+    }
+    ensureTransactionStarted(spark); // PENDING → ACTIVE if needed; throws if no transaction
+    long txnId = Long.parseLong(getConf(spark, CONF_TXN_ID));
+    String txnToken = getConf(spark, CONF_TXN_TOKEN);
+
+    if (tables.size() == 1) {
+      // Single-table: use the scalar shorthand so an older server still understands it.
+      return createSubtransactionWithRetry(
+          txnId, txnToken, identToKey(tables.get(0)), operations.get(0));
+    }
+
+    List<SubtransactionTableRESTRequest> tableSpecs = new ArrayList<>();
+    List<String> tableKeys = new ArrayList<>();
+    for (int i = 0; i < tables.size(); i++) {
+      String tableKey = identToKey(tables.get(i));
+      tableKeys.add(tableKey);
+      tableSpecs.add(new SubtransactionTableRESTRequest(tableKey, operations.get(i)));
+    }
+    return createSubtransactionWithRetry(txnId, txnToken, tableSpecs, String.join(", ", tableKeys));
+  }
+
+  /**
+   * Calls the single-table {@code createSubtransaction} with retry-with-backoff for EXCLUSIVE lock
+   * conflicts. See {@link #createSubtransactionWithRetry(long, String, List, String)} for the retry
+   * contract.
    */
   SubtransactionRESTResponse createSubtransactionWithRetry(
       long txnId, String txnToken, String tableKey, String operation) {
+    return withLockWaitRetry(
+        tableKey,
+        () ->
+            restCatalog.createSubtransaction(
+                txnId, txnToken, tableKey, operation, DEFAULT_LEASE_SECONDS));
+  }
+
+  /**
+   * Multi-table form: allocates one subtransaction spanning every table in {@code tableSpecs}, with
+   * retry-with-backoff for EXCLUSIVE lock conflicts. {@code tableKeysLabel} is used only for log /
+   * error messages.
+   */
+  SubtransactionRESTResponse createSubtransactionWithRetry(
+      long txnId,
+      String txnToken,
+      List<SubtransactionTableRESTRequest> tableSpecs,
+      String tableKeysLabel) {
+    return withLockWaitRetry(
+        tableKeysLabel,
+        () ->
+            restCatalog.createSubtransaction(txnId, txnToken, tableSpecs, DEFAULT_LEASE_SECONDS));
+  }
+
+  /**
+   * Runs {@code action} with retry-with-backoff for EXCLUSIVE lock conflicts. The server returns
+   * HTTP 409 with type={@code LockConflictError} and a {@code retry_after_ms} hint when an EXCLUSIVE
+   * request finds in-flight ROW_EXCLUSIVE holders. This sleeps the suggested delay and retries up to
+   * {@link #MAX_LOCK_WAIT_RETRIES} times before throwing {@link
+   * PolarisRESTCatalog.LockWaitTimeoutException}. {@code label} identifies the table(s) in messages.
+   */
+  private SubtransactionRESTResponse withLockWaitRetry(
+      String label, java.util.function.Supplier<SubtransactionRESTResponse> action) {
     for (int attempt = 0; attempt <= MAX_LOCK_WAIT_RETRIES; attempt++) {
       try {
-        return restCatalog.createSubtransaction(
-            txnId, txnToken, tableKey, operation, DEFAULT_LEASE_SECONDS);
+        return action.get();
       } catch (PolarisRESTCatalog.LockConflictRetryException e) {
         if (attempt >= MAX_LOCK_WAIT_RETRIES) {
           throw new PolarisRESTCatalog.LockWaitTimeoutException(
-              "Lock wait timeout acquiring "
-                  + operation
-                  + " on "
-                  + tableKey
+              "Lock wait timeout acquiring lock on "
+                  + label
                   + " after "
                   + MAX_LOCK_WAIT_RETRIES
                   + " retries");
         }
         LOG.info(
             "Lock conflict on {} (attempt {}/{}); retrying after {} ms",
-            tableKey,
+            label,
             attempt + 1,
             MAX_LOCK_WAIT_RETRIES,
             e.retryAfterMs);
@@ -462,12 +563,12 @@ public class TransactionManager {
         } catch (InterruptedException ie) {
           Thread.currentThread().interrupt();
           throw new PolarisRESTCatalog.LockWaitTimeoutException(
-              "Interrupted while waiting for lock on " + tableKey);
+              "Interrupted while waiting for lock on " + label);
         }
       }
     }
     // unreachable
-    throw new PolarisRESTCatalog.LockWaitTimeoutException("Lock wait timeout on " + tableKey);
+    throw new PolarisRESTCatalog.LockWaitTimeoutException("Lock wait timeout on " + label);
   }
 
   /** Returns true if this session is in worker subtransaction mode. */
@@ -475,18 +576,39 @@ public class TransactionManager {
     return getConf(spark, CONF_WORKER_SUBTXN_ID) != null;
   }
 
-  /** Returns the worker's assigned table key (used by PinnedTableOperations for lock guard). */
-  public String getWorkerTable(SparkSession spark) {
-    return getConf(spark, CONF_WORKER_TABLE);
+  /**
+   * Returns the table keys this worker owns in the current subtransaction (used by SparkCatalog to
+   * decide whether a loadTable belongs to the worker's subtransaction). Empty if not in worker mode.
+   */
+  public List<String> getWorkerTables(SparkSession spark) {
+    String tablesStr = getConf(spark, CONF_WORKER_TABLES);
+    if (tablesStr == null || tablesStr.isEmpty()) {
+      return Collections.emptyList();
+    }
+    return Arrays.asList(tablesStr.split(","));
+  }
+
+  /** Returns true if {@code ident} is one of the tables this worker's subtransaction owns. */
+  public boolean isWorkerTable(SparkSession spark, TableIdentifier ident) {
+    return getWorkerTables(spark).contains(identToKey(ident));
   }
 
   /**
-   * Returns the server-allocated staging path for this worker session. Set by
-   * beginWorkerSubtransaction; read by PinnedTableOperations.commit() to know where to write the
-   * staged metadata file.
+   * Returns the server-allocated staging path for the given table in this worker subtransaction. Set
+   * by beginWorkerSubtransaction; read by PinnedTableOperations.commit() to know where to write that
+   * table's staged metadata file.
    */
-  public Optional<String> getWorkerStagingPath(SparkSession spark) {
-    return Optional.ofNullable(getConf(spark, CONF_WORKER_STAGING_PATH));
+  public Optional<String> getWorkerStagingPath(SparkSession spark, TableIdentifier ident) {
+    return Optional.ofNullable(
+        spark.conf().getOption(workerStagingPathConfKey(identToKey(ident))).getOrElse(() -> null));
+  }
+
+  private void setWorkerStagingPath(SparkSession spark, String tableKey, String stagingPath) {
+    spark.conf().set(workerStagingPathConfKey(tableKey), stagingPath);
+  }
+
+  private String workerStagingPathConfKey(String tableKey) {
+    return "spark.sql.catalog." + catalogName + ".active_worker_staging." + tableKey;
   }
 
   // -------------------------------------------------------------------------
@@ -604,14 +726,20 @@ public class TransactionManager {
 
   private void clearConf(SparkSession spark) {
     clearStagedConf(spark);
+    // Unset each worker's per-table staging path before dropping the table list.
+    String workerTablesStr = getConf(spark, CONF_WORKER_TABLES);
+    if (workerTablesStr != null && !workerTablesStr.isEmpty()) {
+      for (String tableKey : workerTablesStr.split(",")) {
+        spark.conf().unset(workerStagingPathConfKey(tableKey));
+      }
+    }
     spark.conf().unset(confKey(CONF_PENDING_ISOLATION));
     spark.conf().unset(confKey(CONF_TXN_ID));
     spark.conf().unset(confKey(CONF_TXN_TOKEN));
     spark.conf().unset(confKey(CONF_TXN_SNAPSHOT_ID));
     spark.conf().unset(confKey(CONF_WORKER_SUBTXN_ID));
     spark.conf().unset(confKey(CONF_WORKER_SUBTXN_TOKEN));
-    spark.conf().unset(confKey(CONF_WORKER_TABLE));
-    spark.conf().unset(confKey(CONF_WORKER_STAGING_PATH));
+    spark.conf().unset(confKey(CONF_WORKER_TABLES));
     savepoints.clear();
   }
 }

@@ -20,6 +20,7 @@ package org.apache.polaris.spark;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -266,7 +267,7 @@ public class PolarisSparkSqlParserTest {
     when(mockResp.subtxnId()).thenReturn(10L);
     when(mockResp.subtxnToken()).thenReturn("tok");
     when(mockResp.assignedStagingPath()).thenReturn("s3://bucket/path");
-    when(mockTxnManager.createSubtransactionForOrchestrator(any(), any(), anyString()))
+    when(mockTxnManager.createSubtransactionForOrchestrator(any(), anyList(), anyList()))
         .thenReturn(mockResp);
 
     try (org.mockito.MockedStatic<SparkSession> staticMock =
@@ -278,8 +279,8 @@ public class PolarisSparkSqlParserTest {
       verify(mockTxnManager)
           .createSubtransactionForOrchestrator(
               eq(mockSpark),
-              eq(TableIdentifier.of(Namespace.of("ns"), "orders")),
-              eq("ROW_EXCLUSIVE"));
+              eq(java.util.List.of(TableIdentifier.of(Namespace.of("ns"), "orders"))),
+              eq(java.util.List.of("ROW_EXCLUSIVE")));
     }
   }
 
@@ -289,7 +290,7 @@ public class PolarisSparkSqlParserTest {
     when(mockResp.subtxnId()).thenReturn(11L);
     when(mockResp.subtxnToken()).thenReturn("tok2");
     when(mockResp.assignedStagingPath()).thenReturn("s3://bucket/path2");
-    when(mockTxnManager.createSubtransactionForOrchestrator(any(), any(), anyString()))
+    when(mockTxnManager.createSubtransactionForOrchestrator(any(), anyList(), anyList()))
         .thenReturn(mockResp);
 
     try (org.mockito.MockedStatic<SparkSession> staticMock =
@@ -300,7 +301,73 @@ public class PolarisSparkSqlParserTest {
 
       verify(mockTxnManager)
           .createSubtransactionForOrchestrator(
-              eq(mockSpark), eq(TableIdentifier.of(Namespace.of("ns"), "orders")), eq("EXCLUSIVE"));
+              eq(mockSpark),
+              eq(java.util.List.of(TableIdentifier.of(Namespace.of("ns"), "orders"))),
+              eq(java.util.List.of("EXCLUSIVE")));
+    }
+  }
+
+  @Test
+  public void testCreateSubtransactionForMultipleTablesAppliesLockToAll() throws Exception {
+    SubtransactionRESTResponse mockResp = mock(SubtransactionRESTResponse.class);
+    when(mockResp.subtxnId()).thenReturn(12L);
+    when(mockResp.subtxnToken()).thenReturn("tok3");
+    when(mockResp.assignedStagingPath()).thenReturn("s3://bucket/path3");
+    when(mockTxnManager.createSubtransactionForOrchestrator(any(), anyList(), anyList()))
+        .thenReturn(mockResp);
+
+    try (org.mockito.MockedStatic<SparkSession> staticMock =
+        org.mockito.Mockito.mockStatic(SparkSession.class)) {
+      staticMock.when(SparkSession::active).thenReturn(mockSpark);
+
+      // One WITH <lock> applies to every table in the list.
+      parser.parsePlan("CREATE SUBTRANSACTION FOR ns.orders, ns.customers WITH EXCLUSIVE");
+
+      verify(mockTxnManager)
+          .createSubtransactionForOrchestrator(
+              eq(mockSpark),
+              eq(
+                  java.util.List.of(
+                      TableIdentifier.of(Namespace.of("ns"), "orders"),
+                      TableIdentifier.of(Namespace.of("ns"), "customers"))),
+              eq(java.util.List.of("EXCLUSIVE", "EXCLUSIVE")));
+    }
+  }
+
+  @Test
+  public void testCreateSubtransactionForMultipleTablesDefaultsRowExclusive() throws Exception {
+    SubtransactionRESTResponse mockResp = mock(SubtransactionRESTResponse.class);
+    when(mockResp.subtxnId()).thenReturn(13L);
+    when(mockResp.subtxnToken()).thenReturn("tok4");
+    when(mockResp.assignedStagingPath()).thenReturn("s3://bucket/path4");
+    when(mockTxnManager.createSubtransactionForOrchestrator(any(), anyList(), anyList()))
+        .thenReturn(mockResp);
+
+    try (org.mockito.MockedStatic<SparkSession> staticMock =
+        org.mockito.Mockito.mockStatic(SparkSession.class)) {
+      staticMock.when(SparkSession::active).thenReturn(mockSpark);
+
+      parser.parsePlan("CREATE SUBTRANSACTION FOR ns.orders, ns.customers");
+
+      verify(mockTxnManager)
+          .createSubtransactionForOrchestrator(
+              eq(mockSpark),
+              eq(
+                  java.util.List.of(
+                      TableIdentifier.of(Namespace.of("ns"), "orders"),
+                      TableIdentifier.of(Namespace.of("ns"), "customers"))),
+              eq(java.util.List.of("ROW_EXCLUSIVE", "ROW_EXCLUSIVE")));
+    }
+  }
+
+  @Test
+  public void testCreateSubtransactionStrayCommaThrows() throws Exception {
+    try (org.mockito.MockedStatic<SparkSession> staticMock =
+        org.mockito.Mockito.mockStatic(SparkSession.class)) {
+      staticMock.when(SparkSession::active).thenReturn(mockSpark);
+
+      assertThatThrownBy(() -> parser.parsePlan("CREATE SUBTRANSACTION FOR ns.orders,, ns.customers"))
+          .isInstanceOf(IllegalArgumentException.class);
     }
   }
 
@@ -316,13 +383,9 @@ public class PolarisSparkSqlParserTest {
 
       parser.parsePlan("BEGIN SUBTRANSACTION ns.orders SUBTXN_ID=100, SUBTXN_TOKEN='secret-tok'");
 
-      verify(mockTxnManager)
-          .beginWorkerSubtransaction(
-              eq(mockSpark),
-              eq(100L),
-              eq("secret-tok"),
-              eq(TableIdentifier.of(Namespace.of("ns"), "orders")),
-              eq("ROW_EXCLUSIVE"));
+      // The worker self-hydrates every table it owns from the server, so only subtxn_id and
+      // subtxn_token are passed through (the table list is informational).
+      verify(mockTxnManager).beginWorkerSubtransaction(eq(mockSpark), eq(100L), eq("secret-tok"));
     }
   }
 
@@ -338,13 +401,7 @@ public class PolarisSparkSqlParserTest {
               + "  subtxn_id=100,\n"
               + "  subtxn_token='secret-tok'");
 
-      verify(mockTxnManager)
-          .beginWorkerSubtransaction(
-              eq(mockSpark),
-              eq(100L),
-              eq("secret-tok"),
-              eq(TableIdentifier.of(Namespace.of("ns"), "orders")),
-              eq("ROW_EXCLUSIVE"));
+      verify(mockTxnManager).beginWorkerSubtransaction(eq(mockSpark), eq(100L), eq("secret-tok"));
     }
   }
 
@@ -356,13 +413,22 @@ public class PolarisSparkSqlParserTest {
 
       parser.parsePlan("BEGIN SUBTRANSACTION ns.orders\t" + "SUBTXN_ID=100  SUBTXN_TOKEN='tok'");
 
-      verify(mockTxnManager)
-          .beginWorkerSubtransaction(
-              eq(mockSpark),
-              eq(100L),
-              eq("tok"),
-              eq(TableIdentifier.of(Namespace.of("ns"), "orders")),
-              eq("ROW_EXCLUSIVE"));
+      verify(mockTxnManager).beginWorkerSubtransaction(eq(mockSpark), eq(100L), eq("tok"));
+    }
+  }
+
+  @Test
+  public void testBeginSubtransactionMultipleTablesStillHydratesFromServer() throws Exception {
+    try (org.mockito.MockedStatic<SparkSession> staticMock =
+        org.mockito.Mockito.mockStatic(SparkSession.class)) {
+      staticMock.when(SparkSession::active).thenReturn(mockSpark);
+
+      // Comma-separated table list before SUBTXN_ID must not confuse param parsing, and the
+      // worker still hydrates all tables from the server via subtxn_id/subtxn_token alone.
+      parser.parsePlan(
+          "BEGIN SUBTRANSACTION ns.orders, ns.customers SUBTXN_ID=100, SUBTXN_TOKEN='tok'");
+
+      verify(mockTxnManager).beginWorkerSubtransaction(eq(mockSpark), eq(100L), eq("tok"));
     }
   }
 

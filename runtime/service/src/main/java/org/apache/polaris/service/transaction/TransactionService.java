@@ -430,7 +430,9 @@ public class TransactionService {
    * stage a single table.
    */
   public record SubtxnInfo(
-      JdbcTransactionPersistence.SubtxnRow subtxn, List<OperationRow> operations) {}
+      JdbcTransactionPersistence.SubtxnRow subtxn,
+      List<OperationRow> operations,
+      @Nullable Long parentTxnSnapshotId) {}
 
   /**
    * Creates a subtransaction that groups {@code tables.size()} per-table operations under a single
@@ -502,7 +504,8 @@ public class TransactionService {
 
     LOGGER.info(
         "Subtransaction created: subtxn_id={} txn_id={} tables={}", subtxnId, txnId, tables.size());
-    return new SubtxnInfo(persistence.findSubtxn(subtxnId).orElseThrow(), ops);
+    return new SubtxnInfo(
+        persistence.findSubtxn(subtxnId).orElseThrow(), ops, txn.txnSnapshotId());
   }
 
   /**
@@ -651,7 +654,10 @@ public class TransactionService {
    */
   public SubtxnInfo getSubtransactionInfo(long subtxnId, String subtxnToken) throws SQLException {
     JdbcTransactionPersistence.SubtxnRow subtxn = validateSubtxnToken(subtxnId, subtxnToken);
-    return new SubtxnInfo(subtxn, persistence.findOperationsForSubtxn(subtxnId));
+    Long parentSnapshotId =
+        persistence.findTransaction(subtxn.txnId()).map(TransactionRow::txnSnapshotId).orElse(null);
+    return new SubtxnInfo(
+        subtxn, persistence.findOperationsForSubtxn(subtxnId), parentSnapshotId);
   }
 
   /**
@@ -669,9 +675,12 @@ public class TransactionService {
     Instant expiresAt = Instant.now().plus(effective, ChronoUnit.SECONDS);
     persistence.renewSubtxn(subtxnId, expiresAt);
     persistence.renewTransaction(txnId, expiresAt);
+    Long parentSnapshotId =
+        persistence.findTransaction(txnId).map(TransactionRow::txnSnapshotId).orElse(null);
     return new SubtxnInfo(
         persistence.findSubtxn(subtxnId).orElseThrow(),
-        persistence.findOperationsForSubtxn(subtxnId));
+        persistence.findOperationsForSubtxn(subtxnId),
+        parentSnapshotId);
   }
 
   // ---------------------------------------------------------------------------

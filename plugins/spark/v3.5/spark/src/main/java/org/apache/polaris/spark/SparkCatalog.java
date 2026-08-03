@@ -167,26 +167,20 @@ public class SparkCatalog
       Configuration conf = SparkUtil.hadoopConfCatalogOverrides(spark, catalogName);
       HadoopFileIO fileIO = new HadoopFileIO(conf);
       TableMetadata pinnedMetadata = TableMetadataParser.read(fileIO, metadataLocation.get());
+
       Table wrapped = tryWrapPinned(spark, ident, icebergIdent, pinnedMetadata, fileIO);
       if (wrapped != null) {
         return wrapped;
       }
       // Read-only fallback when the live table cannot be loaded.
-      LocationProvider locationProvider =
-          LocationProviders.locationsFor(pinnedMetadata.location(), pinnedMetadata.properties());
-      StaticTableOperations ops =
-          new StaticTableOperations(pinnedMetadata, fileIO, locationProvider);
-      org.apache.iceberg.Table icebergTable =
-          new BaseTable(ops, ident.namespace()[ident.namespace().length - 1] + "." + ident.name());
-      return newSparkTable(icebergTable);
+      return newStaticPinnedTable(ident, pinnedMetadata, fileIO);
     }
 
     // Worker mode with no pinned snapshot (READ_COMMITTED parent): the worker must still stage
     // its write to the server-allocated path, but its read base is the table's LATEST committed
     // metadata (READ_COMMITTED = no pinning). Wrap the live table in PinnedTableOperations using
     // the live metadata as the base so writes route to the staged path just like REPEATABLE_READ.
-    if (txnManager.isWorkerMode(spark)
-        && TransactionManager.identToKey(icebergIdent).equals(txnManager.getWorkerTable(spark))) {
+    if (txnManager.isWorkerMode(spark) && txnManager.isWorkerTable(spark, icebergIdent)) {
       Configuration conf = SparkUtil.hadoopConfCatalogOverrides(spark, catalogName);
       HadoopFileIO fileIO = new HadoopFileIO(conf);
       Table wrapped = tryWrapPinned(spark, ident, icebergIdent, null, fileIO);
@@ -209,6 +203,21 @@ public class SparkCatalog
    * used as the base (READ_COMMITTED worker path — read latest, stage writes). Returns null if the
    * live table is not a {@link BaseTable} (caller falls back).
    */
+  /**
+   * Builds a self-contained, read-only Spark table pinned to {@code pinnedMetadata}. Backed by a
+   * {@link StaticTableOperations}, it holds no handle to the live table and never re-fetches server
+   * state. Used as the read-only fallback when the live table cannot be loaded for wrapping.
+   */
+  private Table newStaticPinnedTable(
+      Identifier ident, TableMetadata pinnedMetadata, HadoopFileIO fileIO) {
+    LocationProvider locationProvider =
+        LocationProviders.locationsFor(pinnedMetadata.location(), pinnedMetadata.properties());
+    StaticTableOperations ops = new StaticTableOperations(pinnedMetadata, fileIO, locationProvider);
+    org.apache.iceberg.Table icebergTable =
+        new BaseTable(ops, ident.namespace()[ident.namespace().length - 1] + "." + ident.name());
+    return newSparkTable(icebergTable);
+  }
+
   private Table tryWrapPinned(
       org.apache.spark.sql.SparkSession spark,
       Identifier ident,
@@ -324,24 +333,22 @@ public class SparkCatalog
 
     @Override
     public void commit(TableMetadata base, TableMetadata metadata) {
-      // Worker mode guard: prevent writing to a table other than the assigned one
-      if (txnManager.isWorkerMode(spark)) {
-        String assignedTable = txnManager.getWorkerTable(spark);
-        if (!TransactionManager.identToKey(tableIdent).equals(assignedTable)) {
-          throw new IllegalStateException(
-              "Worker session is assigned to table '"
-                  + assignedTable
-                  + "' — cannot write to '"
-                  + TransactionManager.identToKey(tableIdent)
-                  + "'");
-        }
+      // Worker mode guard: prevent writing to a table outside the worker's subtransaction. A
+      // subtransaction may span multiple tables, so the check is set membership, not equality.
+      if (txnManager.isWorkerMode(spark) && !txnManager.isWorkerTable(spark, tableIdent)) {
+        throw new IllegalStateException(
+            "Worker subtransaction owns tables "
+                + txnManager.getWorkerTables(spark)
+                + " — cannot write to '"
+                + TransactionManager.identToKey(tableIdent)
+                + "'");
       }
 
-      // In worker mode, use the server-allocated path from beginWorkerSubtransaction; otherwise
-      // allocate a new local path (new UUID per commit keeps savepoint history intact).
+      // In worker mode, use this table's server-allocated path from beginWorkerSubtransaction;
+      // otherwise allocate a new local path (new UUID per commit keeps savepoint history intact).
       String stagingPath =
           txnManager
-              .getWorkerStagingPath(spark)
+              .getWorkerStagingPath(spark, tableIdent)
               .orElseGet(
                   () ->
                       liveOps.metadataFileLocation(

@@ -46,6 +46,10 @@ import threading
 from typing import NamedTuple
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 class SubtxnInfo(NamedTuple):
     subtxn_id: int
     subtxn_token: str
@@ -103,6 +107,10 @@ def run_in_session(txn_spark, fn, *args):
     if box:
         raise box[0]
 
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
 class TestCrossProcessUnitRetry:
     """A rolled-back subtransaction is reopened and retried by a different session."""

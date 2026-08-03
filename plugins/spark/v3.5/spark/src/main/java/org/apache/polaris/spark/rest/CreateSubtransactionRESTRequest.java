@@ -18,11 +18,29 @@
  */
 package org.apache.polaris.spark.rest;
 
+import java.util.List;
 import org.apache.iceberg.rest.RESTRequest;
+import org.apache.iceberg.shaded.com.fasterxml.jackson.annotation.JsonInclude;
 import org.apache.iceberg.shaded.com.fasterxml.jackson.annotation.JsonProperty;
 
-/** Request body for POST /transactions/{txnId}/subtransactions (createSubtransaction). */
+/**
+ * Request body for POST /transactions/{txnId}/subtransactions (createSubtransaction).
+ *
+ * <p>Two shapes, both accepted by the server:
+ *
+ * <ul>
+ *   <li><b>Multi-table:</b> {@link #tables} carries one entry per table — the subtransaction spans
+ *       them all as one atomic unit.
+ *   <li><b>Single-table shorthand:</b> the scalar {@link #tableIdentifier} + {@link #operation}.
+ * </ul>
+ *
+ * Null fields are omitted so the server sees exactly one of the two shapes.
+ */
+@JsonInclude(JsonInclude.Include.NON_NULL)
 public class CreateSubtransactionRESTRequest implements RESTRequest {
+  @JsonProperty("tables")
+  private final List<SubtransactionTableRESTRequest> tables;
+
   @JsonProperty("table_identifier")
   private final String tableIdentifier;
 
@@ -32,11 +50,26 @@ public class CreateSubtransactionRESTRequest implements RESTRequest {
   @JsonProperty("lease_seconds")
   private final int leaseSeconds;
 
+  /** Single-table shorthand. */
   public CreateSubtransactionRESTRequest(
       String tableIdentifier, String operation, int leaseSeconds) {
+    this.tables = null;
     this.tableIdentifier = tableIdentifier;
     this.operation = operation;
     this.leaseSeconds = leaseSeconds;
+  }
+
+  /** Multi-table form: the subtransaction spans every table in {@code tables} atomically. */
+  public CreateSubtransactionRESTRequest(
+      List<SubtransactionTableRESTRequest> tables, int leaseSeconds) {
+    this.tables = tables;
+    this.tableIdentifier = null;
+    this.operation = null;
+    this.leaseSeconds = leaseSeconds;
+  }
+
+  public List<SubtransactionTableRESTRequest> tables() {
+    return tables;
   }
 
   public String tableIdentifier() {

@@ -696,6 +696,7 @@ public class TransactionCatalogAdapter
         subtxn.subtxnId(),
         includeToken ? subtxn.subtxnToken() : null,
         subtxn.txnId(),
+        info.parentTxnSnapshotId(),
         subtxn.name(),
         subtxn.attempt(),
         ops,

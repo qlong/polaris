@@ -60,6 +60,7 @@ import org.apache.polaris.spark.rest.LoadGenericTableRESTResponse;
 import org.apache.polaris.spark.rest.RollbackSubtransactionRESTRequest;
 import org.apache.polaris.spark.rest.StagedTableCommitRESTRequest;
 import org.apache.polaris.spark.rest.SubtransactionRESTResponse;
+import org.apache.polaris.spark.rest.SubtransactionTableRESTRequest;
 import org.apache.polaris.spark.rest.TransactionRESTResponse;
 
 /**
@@ -347,11 +348,28 @@ public class PolarisRESTCatalog implements PolarisCatalog, Closeable {
    */
   public SubtransactionRESTResponse createSubtransaction(
       long txnId, String txnToken, String tableIdentifier, String operation, int leaseSeconds) {
+    return postCreateSubtransaction(
+        txnId, txnToken, new CreateSubtransactionRESTRequest(tableIdentifier, operation, leaseSeconds));
+  }
+
+  /**
+   * Multi-table form of {@link #createSubtransaction}: allocates one subtransaction spanning every
+   * table in {@code tables}, each with its own assigned staging path and lock, as one atomic unit.
+   * The response's {@code operations[]} carries the per-table staging paths.
+   */
+  public SubtransactionRESTResponse createSubtransaction(
+      long txnId, String txnToken, List<SubtransactionTableRESTRequest> tables, int leaseSeconds) {
+    return postCreateSubtransaction(
+        txnId, txnToken, new CreateSubtransactionRESTRequest(tables, leaseSeconds));
+  }
+
+  private SubtransactionRESTResponse postCreateSubtransaction(
+      long txnId, String txnToken, CreateSubtransactionRESTRequest body) {
     return restClient
         .withAuthSession(this.catalogAuth)
         .post(
             pathGenerator.subtransactions(txnId),
-            new CreateSubtransactionRESTRequest(tableIdentifier, operation, leaseSeconds),
+            body,
             SubtransactionRESTResponse.class,
             Map.of("X-Txn-Token", txnToken),
             LOCK_AWARE_ERROR_HANDLER);

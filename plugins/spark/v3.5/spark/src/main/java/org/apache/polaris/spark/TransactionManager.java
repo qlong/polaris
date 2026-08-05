@@ -62,6 +62,15 @@ public class TransactionManager {
   static final String CONF_TXN_SNAPSHOT_ID = "spark.sql.catalog.%s.active_txn_snapshot_id";
   static final String CONF_SESSION_ISOLATION = "spark.sql.catalog.%s.isolation_level";
 
+  // Externally-supplied snapshot to attach reads to (Pillar 2 — exportable TxnSnapshots). Set by
+  // `USE SNAPSHOT <id>`, cleared by `USE SNAPSHOT NONE`. This is deliberately SEPARATE from
+  // CONF_TXN_SNAPSHOT_ID: that one is the pin of the session's OWN transaction (set internally by
+  // beginTransaction / worker GetSubtransaction), whereas this one is a read-only handle a
+  // coordinator created via POST /transaction-snapshots and handed to this session. A session may
+  // attach to an external snapshot without ever running BEGIN — reads resolve against the shared
+  // read_point, no local transaction, no locks, no writes.
+  static final String CONF_ATTACHED_SNAPSHOT_ID = "spark.sql.catalog.%s.attached_txn_snapshot_id";
+
   // Staged write tracking — CONF_STAGED_TABLES holds comma-separated table keys;
   // per-table path/op use stagedPathConfKey/stagedOpConfKey helpers (not sprintf templates)
   static final String CONF_STAGED_TABLES = "spark.sql.catalog.%s.active_staged_tables";
@@ -206,6 +215,20 @@ public class TransactionManager {
    */
   public Optional<String> resolveMetadataLocation(SparkSession spark, TableIdentifier ident) {
     if (getConf(spark, CONF_PENDING_ISOLATION) == null) {
+      // No local transaction. But the session may be attached to an EXTERNAL snapshot handed to it
+      // by a coordinator (USE SNAPSHOT <id>). If so, resolve every read against that shared
+      // read_point — read-only, no locks, no writes. This is the consuming side of Pillar 2.
+      String attached = getConf(spark, CONF_ATTACHED_SNAPSHOT_ID);
+      if (attached != null) {
+        long snapId = Long.parseLong(attached);
+        String metadataLocation = restCatalog.resolveTableMetadataLocation(ident, snapId);
+        LOG.debug(
+            "Resolved pinned metadata location for {} at ATTACHED snapshot {}: {}",
+            ident,
+            snapId,
+            metadataLocation);
+        return Optional.of(metadataLocation);
+      }
       return Optional.empty();
     }
 
@@ -237,6 +260,42 @@ public class TransactionManager {
         snapId,
         metadataLocation);
     return Optional.of(metadataLocation);
+  }
+
+  /**
+   * Attaches this session's reads to an externally-created snapshot (Pillar 2 — exportable
+   * TxnSnapshots). The snapshot is created elsewhere (a coordinator's {@code POST
+   * /transaction-snapshots}); this session merely consumes its {@code read_point}. From here every
+   * {@code loadTable} resolves against that shared cutoff — read-only, no locks, no writes, no local
+   * transaction. Mirrors Trino's {@code SET SESSION polaris.polaris_read_snapshot = <id>}.
+   *
+   * @throws IllegalStateException if a local transaction is already in progress (its own pin would
+   *     conflict with the attached one — commit/rollback the local transaction first)
+   */
+  public void attachSnapshot(SparkSession spark, long txnSnapshotId) {
+    if (getConf(spark, CONF_PENDING_ISOLATION) != null) {
+      throw new IllegalStateException(
+          "Cannot USE SNAPSHOT while a transaction is in progress. COMMIT or ROLLBACK first.");
+    }
+    setConf(spark, CONF_ATTACHED_SNAPSHOT_ID, String.valueOf(txnSnapshotId));
+    LOG.debug("Attached session reads to external snapshot {}", txnSnapshotId);
+  }
+
+  /** Detaches from an externally-created snapshot; subsequent reads see the latest committed data. */
+  public void detachSnapshot(SparkSession spark) {
+    spark.conf().unset(confKey(CONF_ATTACHED_SNAPSHOT_ID));
+    LOG.debug("Detached session from external snapshot");
+  }
+
+  /**
+   * True when this session is attached to an external snapshot (via {@code USE SNAPSHOT}) and is NOT
+   * running its own transaction. In this mode reads are pinned but writes are disallowed — the
+   * session consumes a shared read_point it does not own. {@link SparkCatalog#loadTable} uses this
+   * to return a read-only static table rather than a writable pinned wrapper.
+   */
+  boolean isAttachedSnapshotMode(SparkSession spark) {
+    return getConf(spark, CONF_PENDING_ISOLATION) == null
+        && getConf(spark, CONF_ATTACHED_SNAPSHOT_ID) != null;
   }
 
   /**
@@ -737,6 +796,7 @@ public class TransactionManager {
     spark.conf().unset(confKey(CONF_TXN_ID));
     spark.conf().unset(confKey(CONF_TXN_TOKEN));
     spark.conf().unset(confKey(CONF_TXN_SNAPSHOT_ID));
+    spark.conf().unset(confKey(CONF_ATTACHED_SNAPSHOT_ID));
     spark.conf().unset(confKey(CONF_WORKER_SUBTXN_ID));
     spark.conf().unset(confKey(CONF_WORKER_SUBTXN_TOKEN));
     spark.conf().unset(confKey(CONF_WORKER_TABLES));

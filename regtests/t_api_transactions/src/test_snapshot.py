@@ -120,3 +120,80 @@ class TestSnapshotConsistentRead:
         resp = client.iceberg_get(f"/namespaces/{namespace}/tables/{table_orders}")
         assert resp.status_code == 200
         assert resp.json().get("metadata-location")
+
+
+class TestSnapshotExportableHandle:
+    """The exportable-handle contract behind cross-engine consumption.
+
+    A TxnSnapshot is minted once and handed to any number of independent engines
+    (Spark ``USE SNAPSHOT <id>`` and Trino ``SET SESSION polaris_read_snapshot``
+    in the demo).  These tests assert the properties those consumers rely on:
+    the id is not bound to the creating session, it resolves the SAME
+    metadata-location on every load, and every engine holding it sees one
+    consistent read point.
+    """
+
+    def test_snapshot_consumable_by_independent_client(
+        self, polaris_host, catalog_name, credentials, snapshot, namespace, table_orders
+    ):
+        """A snapshot minted by one client is consumable by a fresh client/token.
+
+        The id is a bare read_point cutoff — it carries no session affinity, which
+        is exactly what lets a coordinator hand it to other engines.
+        """
+        from polaris_client import PolarisClient
+
+        other = PolarisClient(host=polaris_host, catalog=catalog_name, credentials=credentials)
+        snap_id = snapshot["txn_snapshot_id"]
+        resp = other.iceberg_get(
+            f"/namespaces/{namespace}/tables/{table_orders}",
+            params={"txn_snapshot_id": snap_id},
+        )
+        assert resp.status_code == 200, f"independent client load failed: {resp.text}"
+        assert resp.json().get("metadata-location")
+
+    def test_pinned_load_is_stable_across_repeated_reads(
+        self, client, snapshot, namespace, table_orders
+    ):
+        """Loading the same table at the same snapshot twice resolves the same location.
+
+        This is the invariant a pinned reader depends on: the read_point does not
+        drift between calls, so repeated queries in an attached session are stable.
+        """
+        snap_id = snapshot["txn_snapshot_id"]
+        params = {"txn_snapshot_id": snap_id}
+        loc1 = client.iceberg_get(
+            f"/namespaces/{namespace}/tables/{table_orders}", params=params
+        ).json()["metadata-location"]
+        loc2 = client.iceberg_get(
+            f"/namespaces/{namespace}/tables/{table_orders}", params=params
+        ).json()["metadata-location"]
+        assert loc1 == loc2, f"pinned metadata-location drifted: {loc1} != {loc2}"
+
+    def test_two_engines_same_id_resolve_identically(
+        self, client, polaris_host, catalog_name, credentials, snapshot, namespace, table_orders
+    ):
+        """Two independent clients holding the same id resolve the identical location.
+
+        This is the cross-engine parity the demo shows on screen: Reader S (Spark)
+        and Reader T (Trino) return the same view because they share one read_point.
+        Here two independent PolarisClients stand in for the two engines.
+        """
+        from polaris_client import PolarisClient
+
+        snap_id = snapshot["txn_snapshot_id"]
+        params = {"txn_snapshot_id": snap_id}
+
+        engine_a = client
+        engine_b = PolarisClient(host=polaris_host, catalog=catalog_name, credentials=credentials)
+
+        loc_a = engine_a.iceberg_get(
+            f"/namespaces/{namespace}/tables/{table_orders}", params=params
+        ).json()["metadata-location"]
+        loc_b = engine_b.iceberg_get(
+            f"/namespaces/{namespace}/tables/{table_orders}", params=params
+        ).json()["metadata-location"]
+
+        assert loc_a == loc_b, (
+            f"two engines at the same snapshot disagree: A={loc_a}, B={loc_b}"
+        )

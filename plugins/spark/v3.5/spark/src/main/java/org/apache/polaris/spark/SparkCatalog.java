@@ -168,6 +168,13 @@ public class SparkCatalog
       HadoopFileIO fileIO = new HadoopFileIO(conf);
       TableMetadata pinnedMetadata = TableMetadataParser.read(fileIO, metadataLocation.get());
 
+      // Attached to a coordinator's exported snapshot (USE SNAPSHOT) with no local transaction:
+      // reads are pinned, writes are not this session's to make. Return a self-contained read-only
+      // table so an accidental write fails cleanly instead of staging against a phantom txn.
+      if (txnManager.isAttachedSnapshotMode(spark)) {
+        return newStaticPinnedTable(ident, pinnedMetadata, fileIO);
+      }
+
       Table wrapped = tryWrapPinned(spark, ident, icebergIdent, pinnedMetadata, fileIO);
       if (wrapped != null) {
         return wrapped;

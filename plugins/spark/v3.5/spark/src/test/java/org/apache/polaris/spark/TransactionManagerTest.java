@@ -236,6 +236,61 @@ public class TransactionManagerTest {
   }
 
   // -------------------------------------------------------------------------
+  // attachSnapshot() / detachSnapshot() — Pillar 2, consuming an external snapshot
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void testAttachSnapshotResolvesWithoutLocalBegin() {
+    when(mockRestCatalog.resolveTableMetadataLocation(any(), eq(555L)))
+        .thenReturn("file:///tmp/pinned/v9.metadata.json");
+
+    // No begin() — the session merely attaches to a coordinator's exported snapshot.
+    txnManager.attachSnapshot(mockSpark, 555L);
+    TableIdentifier ident = TableIdentifier.of(Namespace.of("ns"), "orders");
+    Optional<String> result = txnManager.resolveMetadataLocation(mockSpark, ident);
+
+    assertThat(result).hasValue("file:///tmp/pinned/v9.metadata.json");
+    // Never starts a local transaction to consume an external snapshot.
+    verify(mockRestCatalog, never()).beginTransaction(anyString(), anyInt());
+    verify(mockRestCatalog).resolveTableMetadataLocation(any(), eq(555L));
+    assertThat(confStore.get(String.format(TransactionManager.CONF_ATTACHED_SNAPSHOT_ID, CATALOG)))
+        .isEqualTo("555");
+  }
+
+  @Test
+  public void testDetachSnapshotReturnsToLatest() {
+    when(mockRestCatalog.resolveTableMetadataLocation(any(), anyLong()))
+        .thenReturn("file:///tmp/pinned/v9.metadata.json");
+    txnManager.attachSnapshot(mockSpark, 555L);
+    txnManager.detachSnapshot(mockSpark);
+
+    TableIdentifier ident = TableIdentifier.of(Namespace.of("ns"), "orders");
+    Optional<String> result = txnManager.resolveMetadataLocation(mockSpark, ident);
+
+    assertThat(result).isEmpty();
+    assertThat(confStore.get(String.format(TransactionManager.CONF_ATTACHED_SNAPSHOT_ID, CATALOG)))
+        .isNull();
+  }
+
+  @Test
+  public void testIsAttachedSnapshotMode() {
+    assertThat(txnManager.isAttachedSnapshotMode(mockSpark)).isFalse();
+    txnManager.attachSnapshot(mockSpark, 555L);
+    assertThat(txnManager.isAttachedSnapshotMode(mockSpark)).isTrue();
+    txnManager.detachSnapshot(mockSpark);
+    assertThat(txnManager.isAttachedSnapshotMode(mockSpark)).isFalse();
+  }
+
+  @Test
+  public void testAttachSnapshotThrowsIfTransactionInProgress() {
+    txnManager.begin(mockSpark, "REPEATABLE_READ");
+
+    assertThatThrownBy(() -> txnManager.attachSnapshot(mockSpark, 555L))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("transaction is in progress");
+  }
+
+  // -------------------------------------------------------------------------
   // commit()
   // -------------------------------------------------------------------------
 

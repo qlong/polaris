@@ -258,6 +258,34 @@ public class PolarisSparkSqlParser implements ParserInterface {
       return delegate.parsePlan(statusSql("Rolled back to savepoint: " + name));
     }
 
+    // -------------------------------------------------------------------------
+    // Exportable TxnSnapshot consumption (Pillar 2 — attach reads to an external snapshot)
+    // -------------------------------------------------------------------------
+
+    // USE SNAPSHOT NONE — detach; reads return to latest committed.
+    // Must be checked before the numeric form so "NONE" is not parsed as an id.
+    if (normalized.equals("USE SNAPSHOT NONE")) {
+      SparkSession spark = SparkSession.active();
+      txnManager(spark).detachSnapshot(spark);
+      return delegate.parsePlan(statusSql("Detached from snapshot"));
+    }
+
+    // USE SNAPSHOT <id> — attach this session's reads to a snapshot a coordinator exported.
+    // Only intercept the SNAPSHOT form; plain `USE <ns>` / `USE CATALOG ...` fall through.
+    if (normalized.startsWith("USE SNAPSHOT ")) {
+      SparkSession spark = SparkSession.active();
+      String idStr = normalized.substring("USE SNAPSHOT ".length()).trim();
+      long snapId;
+      try {
+        snapId = Long.parseLong(idStr);
+      } catch (NumberFormatException e) {
+        throw new IllegalArgumentException(
+            "USE SNAPSHOT: expected a numeric snapshot id (or NONE), got: " + idStr);
+      }
+      txnManager(spark).attachSnapshot(spark, snapId);
+      return delegate.parsePlan(statusSql("Attached to snapshot " + snapId));
+    }
+
     return delegate.parsePlan(sql);
   }
 

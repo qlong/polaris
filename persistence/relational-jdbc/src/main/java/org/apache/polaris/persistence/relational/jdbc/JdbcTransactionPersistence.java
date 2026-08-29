@@ -561,6 +561,7 @@ public class JdbcTransactionPersistence {
       long catalogId,
       String tableUuid,
       String lockMode,
+      @Nullable String tableEntityId,
       @Nullable Long baseSnapshotId,
       @Nullable String serverBaseMetadataLocation,
       String assignedStagingPath,
@@ -576,9 +577,9 @@ public class JdbcTransactionPersistence {
     String sql =
         "INSERT INTO POLARIS_SCHEMA.transaction_operations "
             + "(op_id, txn_id, subtxn_id, realm_id, catalog_id, table_uuid, lock_mode, "
-            + " base_snapshot_id, server_base_metadata_location, assigned_staging_path, "
-            + " op_token, status, retry_of_op_id, created_at, expires_at) "
-            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            + " table_entity_id, base_snapshot_id, server_base_metadata_location, "
+            + " assigned_staging_path, op_token, status, retry_of_op_id, created_at, expires_at) "
+            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     try (Connection conn = dataSource.getConnection();
         PreparedStatement ps = conn.prepareStatement(sql)) {
       conn.setAutoCommit(true);
@@ -589,21 +590,22 @@ public class JdbcTransactionPersistence {
       ps.setLong(5, row.catalogId());
       ps.setString(6, row.tableUuid());
       ps.setString(7, row.lockMode());
-      setNullableLong(ps, 8, row.baseSnapshotId());
-      ps.setString(9, row.serverBaseMetadataLocation());
-      ps.setString(10, row.assignedStagingPath());
-      ps.setString(11, row.opToken());
-      ps.setInt(12, row.status());
-      setNullableLong(ps, 13, row.retryOfOpId());
-      ps.setTimestamp(14, Timestamp.from(row.createdAt()));
-      ps.setTimestamp(15, Timestamp.from(row.expiresAt()));
+      ps.setString(8, row.tableEntityId());
+      setNullableLong(ps, 9, row.baseSnapshotId());
+      ps.setString(10, row.serverBaseMetadataLocation());
+      ps.setString(11, row.assignedStagingPath());
+      ps.setString(12, row.opToken());
+      ps.setInt(13, row.status());
+      setNullableLong(ps, 14, row.retryOfOpId());
+      ps.setTimestamp(15, Timestamp.from(row.createdAt()));
+      ps.setTimestamp(16, Timestamp.from(row.expiresAt()));
       ps.executeUpdate();
     }
   }
 
   private static final String OP_COLUMNS =
       "op_id, txn_id, subtxn_id, realm_id, catalog_id, table_uuid, lock_mode, "
-          + "base_snapshot_id, server_base_metadata_location, assigned_staging_path, "
+          + "table_entity_id, base_snapshot_id, server_base_metadata_location, assigned_staging_path, "
           + "staged_metadata_location, op_token, status, retry_of_op_id, "
           + "created_at, expires_at, ended_at";
 
@@ -698,6 +700,7 @@ public class JdbcTransactionPersistence {
         rs.getLong("catalog_id"),
         rs.getString("table_uuid"),
         rs.getString("lock_mode"),
+        rs.getString("table_entity_id"),
         getNullableLong(rs, "base_snapshot_id"),
         rs.getString("server_base_metadata_location"),
         rs.getString("assigned_staging_path"),

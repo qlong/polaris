@@ -353,4 +353,73 @@ class TransactionConflictTest {
         .isInstanceOf(jakarta.ws.rs.BadRequestException.class)
         .hasMessageContaining("not IN_PROGRESS");
   }
+
+  // ---------------------------------------------------------------------------
+  // 4. Keyspace-split regression: committed_table_snapshots is keyed by the numeric entity id,
+  //    but the operation's tableUuid is the qualified name. prepareCommit must look up CTS by the
+  //    op's tableEntityId (not the name), or conflict detection silently mis-fires and a
+  //    destructive op is routed to direct instead of raising SerializationFailure.
+  //
+  //    Before Fix 1, prepareCommit looked up CTS by tableUuid (the name) → found nothing (CTS was
+  //    written under the numeric id) → server_base == null → no conflict → routed to direct. These
+  //    cases fail (no exception thrown / wrong routing) before the fix and pass after it.
+  // ---------------------------------------------------------------------------
+
+  private static final String ENTITY_ID = "9001"; // numeric id ≠ TABLE_UUID ("ns.orders")
+
+  /**
+   * Creates a subtransaction operation carrying an explicit {@code tableEntityId} (the numeric CTS
+   * key), then marks it COMMITTED. Mirrors {@link #beginOpAndStage} but exercises the extension
+   * path that threads the entity id, and uses a name that differs from the CTS key.
+   */
+  private long beginOpWithEntityId(long txnId, String txnToken, String lockMode) throws Exception {
+    var op =
+        service.createOperation(
+            txnId,
+            txnToken,
+            null,
+            TABLE_UUID,
+            lockMode,
+            ENTITY_ID,
+            null,
+            null,
+            3600,
+            TABLE_META_DIR);
+    service.commitOperation(txnId, op.opId(), op.opToken(), op.assignedStagingPath());
+    return op.opId();
+  }
+
+  @Test
+  void exclusiveConflict_ctsKeyedByEntityId_throwsSerializationFailure() throws Exception {
+    // CTS written under the NUMERIC id, not the name.
+    commitTableVersion(ENTITY_ID, "s3://bucket/ns/orders/metadata/v1.json");
+
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
+    beginOpWithEntityId(txn.txnId(), txn.txnToken(), "EXCLUSIVE");
+
+    // Concurrent writer commits v2 under the same numeric id.
+    commitTableVersion(ENTITY_ID, "s3://bucket/ns/orders/metadata/v2.json");
+
+    assertThatThrownBy(() -> service.prepareCommit(txn.txnId(), txn.txnToken()))
+        .as("conflict must be detected via the numeric CTS key, not the qualified name")
+        .isInstanceOf(TransactionService.SerializationFailureException.class)
+        .hasMessageContaining(TABLE_UUID);
+  }
+
+  @Test
+  void rowExclusiveConflict_ctsKeyedByEntityId_routesToMergeRetry() throws Exception {
+    commitTableVersion(ENTITY_ID, "s3://bucket/ns/orders/metadata/v1.json");
+
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
+    beginOpWithEntityId(txn.txnId(), txn.txnToken(), "ROW_EXCLUSIVE");
+
+    commitTableVersion(ENTITY_ID, "s3://bucket/ns/orders/metadata/v2.json");
+
+    var result = service.prepareCommit(txn.txnId(), txn.txnToken());
+
+    assertThat(result.direct()).isEmpty();
+    assertThat(result.mergeRetry()).hasSize(1);
+    assertThat(result.mergeRetry().get(0).tableUuid()).isEqualTo(TABLE_UUID);
+    assertThat(result.mergeRetry().get(0).tableEntityId()).isEqualTo(ENTITY_ID);
+  }
 }

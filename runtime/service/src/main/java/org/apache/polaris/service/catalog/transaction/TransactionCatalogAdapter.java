@@ -293,8 +293,9 @@ public class TransactionCatalogAdapter
             && commitTransactionRequest.getTables() != null
             && !commitTransactionRequest.getTables().isEmpty();
 
+    // Hoisted so the SerializationFailure (409) catch can abort the transaction + release locks.
+    TransactionService txnService = openTxnService(securityContext, prefix);
     try {
-      TransactionService txnService = openTxnService(securityContext, prefix);
       IcebergCatalogHandler handler = handlerFactory.createHandler(catalogName, principal);
       try {
         handler.listNamespaces(org.apache.iceberg.catalog.Namespace.of());
@@ -323,7 +324,7 @@ public class TransactionCatalogAdapter
               result.direct().size(),
               result.mergeRetry().size());
           handler.finalizeInlineTables(
-              result.direct(), result.mergeRetry(), handlerFactory, catalogName, principal);
+              result.direct(), result.mergeRetry(), handlerFactory, catalogName, principal, txnId);
         } else {
           // Use Case 2: multi-app subtransaction path
           TransactionService.PrepareCommitResult result =
@@ -344,6 +345,14 @@ public class TransactionCatalogAdapter
       return Response.noContent().build();
     } catch (TransactionService.SerializationFailureException e) {
       LOGGER.info("Serialization failure for txn={}: {}", txnId, e.getMessage());
+      // The failure fired before finalizeCommit + finalizeEntitiesWithCommittedSnapshots, so no
+      // entity writes were persisted. Abort the transaction (mark ABORTED + release locks) so it
+      // does not linger IN_PROGRESS until the reaper. Wrap so an abort failure still returns 409.
+      try {
+        txnService.abortTransaction(txnId, xTxnToken);
+      } catch (Exception abortEx) {
+        LOGGER.warn("Failed to abort txn={} after serialization failure", txnId, abortEx);
+      }
       return Response.status(409)
           .entity(
               ErrorResponse.builder()
@@ -467,19 +476,31 @@ public class TransactionCatalogAdapter
           String metadataDir =
               resolveTableMetadataDir(
                   handlerFactory, catalogName, principal, t.getTableIdentifier());
+          // Resolve the numeric entity id (matching committed_table_snapshots.table_uuid) so the
+          // extension commit path can look up CTS by the same key IcebergCatalog writes it under.
+          String tableEntityId =
+              resolveTableEntityId(handlerFactory, catalogName, principal, t.getTableIdentifier());
           String lockMode =
               (t.getOperation() != null ? t.getOperation() : LockMode.ROW_EXCLUSIVE).name();
           specs.add(
               new TransactionService.SubtxnTableSpec(
-                  t.getTableIdentifier(), metadataDir, lockMode, t.getBaseSnapshotId()));
+                  t.getTableIdentifier(),
+                  metadataDir,
+                  lockMode,
+                  t.getBaseSnapshotId(),
+                  tableEntityId));
         }
       } else if (createSubtransactionRequest.getTableIdentifier() != null) {
         String tableId = createSubtransactionRequest.getTableIdentifier();
         String metadataDir =
             resolveTableMetadataDir(handlerFactory, catalogName, principal, tableId);
+        String tableEntityId =
+            resolveTableEntityId(handlerFactory, catalogName, principal, tableId);
         LockMode lockModeEnum = createSubtransactionRequest.getOperation();
         String lockMode = (lockModeEnum != null ? lockModeEnum : LockMode.ROW_EXCLUSIVE).name();
-        specs.add(new TransactionService.SubtxnTableSpec(tableId, metadataDir, lockMode, null));
+        specs.add(
+            new TransactionService.SubtxnTableSpec(
+                tableId, metadataDir, lockMode, null, tableEntityId));
       } else {
         return Response.status(400)
             .entity(

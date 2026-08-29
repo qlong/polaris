@@ -1032,6 +1032,16 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
     ((IcebergCatalog) baseCatalog).setMetaStoreManager(workspace);
   }
 
+  /**
+   * Tells this handler's catalog which transaction is committing, so the commit-time lock check in
+   * {@code IcebergCatalog.doCommit} excludes that transaction's OWN held lock (the EXCLUSIVE lock
+   * holder must commit through its own lock; a concurrent transaction is still blocked). Pass
+   * {@code -1} to clear (legacy/non-transactional commit).
+   */
+  public void setActiveCommitTxnId(long txnId) {
+    ((IcebergCatalog) baseCatalog).setActiveCommitTxnId(txnId);
+  }
+
   public TransactionService newTransactionServiceForCatalog() {
     if (!jdbcDataSource().isResolvable() || !datasourceOperations().isResolvable()) {
       throw new ServiceUnavailableException(
@@ -1511,12 +1521,17 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
         tableHandler.loadTable(tableId, null);
         Table table = tableHandler.loadRawTable(tableId);
         tableHandler.setWorkspaceMetaStoreManager(workspace);
+        // The lock holder is committing through its own EXCLUSIVE lock; exclude it from the
+        // commit-time conflict check so it does not 409 against itself (self-conflict).
+        tableHandler.setActiveCommitTxnId(sub.txnId());
         TableOperations ops = ((BaseTable) table).operations();
         FileIO io = ops.io();
-        TableMetadata base =
-            sub.serverBaseMetadataLocation() != null
-                ? TableMetadataParser.read(io, sub.serverBaseMetadataLocation())
-                : ops.current();
+        // base must be ops.current() (reference equality required by IcebergCatalog.commit's OCC
+        // guard). Conflict detection does NOT depend on base: it already ran in prepareCommit (CTS
+        // compare) and the snapshot-chain guard below, and the CAS in doCommit is the real atomic
+        // guard. Reading serverBaseMetadataLocation here would yield base != ops.current() → a
+        // spurious CommitFailedException/500. Mirror finalizeInlineTables.
+        TableMetadata base = ops.current();
         TableMetadata staged = TableMetadataParser.read(io, sub.stagedMetadataLocation());
         // Guard: staged was built on a snapshot that pre-dates base's current snapshot.
         // This happens when the EXCLUSIVE lock retry fires after a concurrent transaction
@@ -1544,8 +1559,29 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
         tableHandler.loadTable(tableId, null);
         Table liveTable = tableHandler.loadRawTable(tableId);
         tableHandler.setWorkspaceMetaStoreManager(workspace);
+        // Exclude the committing txn's own lock from the doCommit conflict check (self-conflict).
+        tableHandler.setActiveCommitTxnId(sub.txnId());
         FileIO io = ((BaseTable) liveTable).operations().io();
         TableMetadata staged = TableMetadataParser.read(io, sub.stagedMetadataLocation());
+        // Route on the STAGED SNAPSHOT'S operation, not the lock mode (lock-protocol design §5):
+        // only an "append" may be merge-retried, because extractAddedDataFiles + newAppend treats
+        // every staged entry as ADDED. An EXCLUSIVE lock holder that merely INSERTs (op="append")
+        // lands here when its client staged against a snapshot older than the live tip (a benign
+        // client-cache lag — the EXCLUSIVE lock already excludes any concurrent writer), and it is
+        // safe to re-parent its appended files. A destructive staged op ("overwrite"/"delete"/
+        // "replace") reaching mergeRetry means a concurrent commit was detected at finalize time
+        // (the
+        // snapshot-chain guard promoted it): re-appending would re-materialize survivors/replaced
+        // rows on top of that commit — silent corruption (duplicate PKs, lost replace). That is a
+        // first-committer-wins loss → fail with 409 instead of degrading to an append.
+        if (!isMergeRetryableAppend(staged)) {
+          throw new TransactionService.SerializationFailureException(
+              "Destructive operation ("
+                  + stagedOperation(staged)
+                  + ") on table "
+                  + sub.tableUuid()
+                  + " conflicts with a concurrent commit; cannot merge-retry a non-append operation");
+        }
         List<DataFile> addedFiles = extractAddedDataFiles(staged, io);
         AppendFiles append = liveTable.newAppend();
         addedFiles.forEach(append::appendFile);
@@ -1575,13 +1611,16 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
    * @param direct tables with no concurrent conflict — apply staged pointer swap
    * @param mergeRetry APPEND tables that had a concurrent commit — re-parent data files onto live
    *     head
+   * @param txnId the committing transaction's id, so doCommit's lock check excludes its own held
+   *     lock (self-conflict); pass {@code -1} for a non-transactional commit
    */
   public void finalizeInlineTables(
       List<TransactionService.StagedTableInfo> direct,
       List<TransactionService.StagedTableInfo> mergeRetry,
       IcebergCatalogHandlerFactory handlerFactory,
       String catalogName,
-      org.apache.polaris.core.auth.PolarisPrincipal principal) {
+      org.apache.polaris.core.auth.PolarisPrincipal principal,
+      long txnId) {
 
     // Each table needs its own handler initialized via loadTable so that the resolution manifest
     // has the table's passthrough path registered. We inject a shared workspace metastore so that
@@ -1601,6 +1640,8 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
         tableHandler.loadTable(tableId, null);
         Table table = tableHandler.loadRawTable(tableId);
         tableHandler.setWorkspaceMetaStoreManager(workspace);
+        // Exclude the committing txn's own lock from the doCommit conflict check (self-conflict).
+        tableHandler.setActiveCommitTxnId(txnId);
         TableOperations ops = ((BaseTable) table).operations();
         FileIO io = ops.io();
         // base must be ops.current() (reference equality required by IcebergCatalog.commit).
@@ -1616,8 +1657,25 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
         tableHandler.loadTable(tableId, null);
         Table liveTable = tableHandler.loadRawTable(tableId);
         tableHandler.setWorkspaceMetaStoreManager(workspace);
+        // Exclude the committing txn's own lock from the doCommit conflict check (self-conflict).
+        tableHandler.setActiveCommitTxnId(txnId);
         FileIO io = ((BaseTable) liveTable).operations().io();
         TableMetadata staged = TableMetadataParser.read(io, info.stagedMetadataLocation());
+        // Parity with finalizeExtensionTransaction: route on the STAGED SNAPSHOT'S operation, not
+        // the
+        // lock mode (lock-protocol design §5). Only an append (or no snapshot) may be
+        // merge-retried;
+        // a destructive staged op reaching here is a real first-committer-wins conflict → 409.
+        // Inline mergeRetry is always empty today (prepareInlineCommit aborts on any conflict), so
+        // this is defense-in-depth against a future finalize-time promotion.
+        if (!isMergeRetryableAppend(staged)) {
+          throw new TransactionService.SerializationFailureException(
+              "Destructive operation ("
+                  + stagedOperation(staged)
+                  + ") on table "
+                  + info.tableIdentifier()
+                  + " conflicts with a concurrent commit; cannot merge-retry a non-append operation");
+        }
         List<DataFile> addedFiles = extractAddedDataFiles(staged, io);
         AppendFiles append = liveTable.newAppend();
         addedFiles.forEach(append::appendFile);
@@ -1666,6 +1724,28 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
       }
     }
     return out;
+  }
+
+  /**
+   * The operation of the staged snapshot ({@code append}/{@code overwrite}/{@code delete}/{@code
+   * replace}), or {@code "empty"} when the staged metadata has no current snapshot (e.g. a schema-
+   * only change). Used to route the finalize mergeRetry decision on the actual staged operation
+   * rather than on the lock mode (lock-protocol design §5).
+   */
+  private static String stagedOperation(TableMetadata staged) {
+    org.apache.iceberg.Snapshot snap = staged.currentSnapshot();
+    return snap == null ? "empty" : snap.operation();
+  }
+
+  /**
+   * A staged commit may be merge-retried (its added files re-parented onto the live tip via {@code
+   * newAppend}) only when it is an append or carries no snapshot. Any destructive staged operation
+   * ({@code overwrite}/{@code delete}/{@code replace}) reaching the mergeRetry loop signals a real
+   * first-committer-wins conflict and must fail with 409 rather than silently degrade to an append.
+   */
+  private static boolean isMergeRetryableAppend(TableMetadata staged) {
+    org.apache.iceberg.Snapshot snap = staged.currentSnapshot();
+    return snap == null || org.apache.iceberg.DataOperations.APPEND.equals(snap.operation());
   }
 
   public ListTablesResponse listViews(Namespace namespace, String pageToken, Integer pageSize) {

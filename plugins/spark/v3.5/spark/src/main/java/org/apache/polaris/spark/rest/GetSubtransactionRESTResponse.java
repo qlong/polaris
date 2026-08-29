@@ -27,8 +27,8 @@ import org.apache.iceberg.shaded.com.fasterxml.jackson.annotation.JsonProperty;
  * Response from GET /transactions/subtransactions/{subtxn-id}.
  *
  * <p>A subtransaction may span multiple tables. {@link #operations()} carries one entry per table
- * (its {@code table_uuid} + {@code assigned_staging_path}); the worker hydrates every table from it.
- * The scalar mirrors ({@link #assignedStagingPath()}, {@link #tableUuid()}) reflect the first
+ * (its {@code table_uuid} + {@code assigned_staging_path}); the worker hydrates every table from
+ * it. The scalar mirrors ({@link #assignedStagingPath()}, {@link #tableUuid()}) reflect the first
  * operation and remain for the single-table path.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)

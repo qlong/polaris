@@ -207,6 +207,16 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
   /** Optional lock manager for pessimistic locking (injected when schema v5 is active). */
   @Nullable private LockManager lockManager;
 
+  /**
+   * The txn_id of the transaction whose commit is currently flowing through this catalog instance,
+   * or {@code -1} for a legacy/non-transactional commit. Set by the extension/inline finalize path
+   * before each {@code ops.commit(...)} so {@link #doCommit}'s commit-time lock check can EXCLUDE
+   * the committing transaction's OWN granted lock: a transaction holding an EXCLUSIVE lock must be
+   * allowed to commit through it, while a concurrent transaction is still blocked. Without this,
+   * the lock holder would 409 against its own lock (self-conflict).
+   */
+  private long activeCommitTxnId = -1L;
+
   /** Optional JDBC bridge for {@code committed_table_snapshots} (schema v5). */
   @Nullable private JdbcTransactionPersistence jdbcTransactionPersistence;
 
@@ -253,6 +263,16 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
   /** Allows injecting a LockManager when the schema-v5 transaction extension is active. */
   public void setLockManager(@Nullable LockManager lockManager) {
     this.lockManager = lockManager;
+  }
+
+  /**
+   * Sets the txn_id of the transaction currently committing through this catalog, so {@link
+   * #doCommit}'s lock check excludes the committing transaction's own held lock (see {@link
+   * #activeCommitTxnId}). The finalize path calls this before each {@code ops.commit(...)}; pass
+   * {@code -1} for legacy/non-transactional commits.
+   */
+  public void setActiveCommitTxnId(long txnId) {
+    this.activeCommitTxnId = txnId;
   }
 
   /** JDBC persistence for recording committed Iceberg snapshots (schema v5). */
@@ -1838,11 +1858,18 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
         // Lock check: enforce pessimistic locks from new-API transactions for ALL commits
         // (old and new clients). This is the only enforcement point because old clients
         // are invisible to the server until they call doCommit.
-        String tableUuid = entity.getId() + "";
+        // Locks are keyed by the qualified table name (ns.table), the same resource string the
+        // transaction layer passes to LockManager.acquire — NOT the numeric entity id. Use
+        // tableIdentifier.toString() so a held EXCLUSIVE/ACCESS_EXCLUSIVE lock is actually found.
+        String lockResource = tableIdentifier.toString();
         try {
           LockManager lockManager = getLockManagerIfPresent();
           if (lockManager != null) {
-            lockManager.checkConflictAtCommit(tableUuid, -1L);
+            // Exclude the committing transaction's OWN lock: the EXCLUSIVE lock holder must commit
+            // through its own lock; only a CONCURRENT transaction's conflicting lock blocks (409).
+            // activeCommitTxnId is set by the finalize path before ops.commit(); -1 (legacy/old
+            // client) excludes nothing, preserving the original behavior.
+            lockManager.checkConflictAtCommit(lockResource, activeCommitTxnId);
           }
         } catch (CommitFailedException e) {
           throw e;

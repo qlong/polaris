@@ -366,7 +366,8 @@ public class PolarisSparkSqlParserTest {
         org.mockito.Mockito.mockStatic(SparkSession.class)) {
       staticMock.when(SparkSession::active).thenReturn(mockSpark);
 
-      assertThatThrownBy(() -> parser.parsePlan("CREATE SUBTRANSACTION FOR ns.orders,, ns.customers"))
+      assertThatThrownBy(
+              () -> parser.parsePlan("CREATE SUBTRANSACTION FOR ns.orders,, ns.customers"))
           .isInstanceOf(IllegalArgumentException.class);
     }
   }
@@ -520,8 +521,7 @@ public class PolarisSparkSqlParserTest {
         org.mockito.Mockito.mockStatic(SparkSession.class)) {
       staticMock.when(SparkSession::active).thenReturn(mockSpark);
 
-      org.assertj.core.api.Assertions.assertThatThrownBy(
-              () -> parser.parsePlan("USE SNAPSHOT abc"))
+      org.assertj.core.api.Assertions.assertThatThrownBy(() -> parser.parsePlan("USE SNAPSHOT abc"))
           .isInstanceOf(IllegalArgumentException.class)
           .hasMessageContaining("numeric snapshot id");
     }

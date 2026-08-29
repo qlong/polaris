@@ -349,7 +349,9 @@ public class PolarisRESTCatalog implements PolarisCatalog, Closeable {
   public SubtransactionRESTResponse createSubtransaction(
       long txnId, String txnToken, String tableIdentifier, String operation, int leaseSeconds) {
     return postCreateSubtransaction(
-        txnId, txnToken, new CreateSubtransactionRESTRequest(tableIdentifier, operation, leaseSeconds));
+        txnId,
+        txnToken,
+        new CreateSubtransactionRESTRequest(tableIdentifier, operation, leaseSeconds));
   }
 
   /**

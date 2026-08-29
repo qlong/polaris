@@ -211,6 +211,7 @@ class JdbcTransactionPersistenceTest {
             CATALOG_ID,
             "table-uuid-1",
             "ROW_EXCLUSIVE",
+            null, // tableEntityId
             null,
             null,
             "s3://staging/path",
@@ -593,6 +594,7 @@ class JdbcTransactionPersistenceTest {
             CATALOG_ID,
             "table-uuid-sub",
             "ROW_EXCLUSIVE",
+            null, // tableEntityId
             null,
             null,
             "s3://staging/" + opId,

@@ -404,7 +404,7 @@ CREATE TABLE IF NOT EXISTS transaction_operations (
     subtxn_id                     BIGINT REFERENCES subtransactions(subtxn_id),  -- NULL = bare inline op
     realm_id                      TEXT NOT NULL,
     catalog_id                    BIGINT NOT NULL,
-    table_uuid                    TEXT NOT NULL,   -- stable UUID of the Iceberg table entity
+    table_uuid                    TEXT NOT NULL,   -- qualified identifier string (ns.table); lock/CTS-by-name key
     lock_mode                     TEXT NOT NULL DEFAULT 'ROW_EXCLUSIVE',
     base_snapshot_id              BIGINT,          -- Iceberg snapshot ID at op creation time
     server_base_metadata_location TEXT,            -- table's metadata-location at op creation (server-captured)
@@ -413,6 +413,7 @@ CREATE TABLE IF NOT EXISTS transaction_operations (
     op_token                      TEXT NOT NULL,   -- random 32-byte hex; given to worker app
     status                        SMALLINT NOT NULL DEFAULT 0,
     retry_of_op_id                BIGINT,          -- set when this op retries a failed predecessor
+    table_entity_id               TEXT,            -- numeric Iceberg table entity id; committed_table_snapshots lookup key
     created_at                    TIMESTAMP NOT NULL DEFAULT now(),
     expires_at                    TIMESTAMP NOT NULL,
     ended_at                      TIMESTAMP

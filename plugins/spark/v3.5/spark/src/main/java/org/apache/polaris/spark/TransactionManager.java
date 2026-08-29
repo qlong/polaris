@@ -266,8 +266,8 @@ public class TransactionManager {
    * Attaches this session's reads to an externally-created snapshot (Pillar 2 — exportable
    * TxnSnapshots). The snapshot is created elsewhere (a coordinator's {@code POST
    * /transaction-snapshots}); this session merely consumes its {@code read_point}. From here every
-   * {@code loadTable} resolves against that shared cutoff — read-only, no locks, no writes, no local
-   * transaction. Mirrors Trino's {@code SET SESSION polaris.polaris_read_snapshot = <id>}.
+   * {@code loadTable} resolves against that shared cutoff — read-only, no locks, no writes, no
+   * local transaction. Mirrors Trino's {@code SET SESSION polaris.polaris_read_snapshot = <id>}.
    *
    * @throws IllegalStateException if a local transaction is already in progress (its own pin would
    *     conflict with the attached one — commit/rollback the local transaction first)
@@ -281,15 +281,17 @@ public class TransactionManager {
     LOG.debug("Attached session reads to external snapshot {}", txnSnapshotId);
   }
 
-  /** Detaches from an externally-created snapshot; subsequent reads see the latest committed data. */
+  /**
+   * Detaches from an externally-created snapshot; subsequent reads see the latest committed data.
+   */
   public void detachSnapshot(SparkSession spark) {
     spark.conf().unset(confKey(CONF_ATTACHED_SNAPSHOT_ID));
     LOG.debug("Detached session from external snapshot");
   }
 
   /**
-   * True when this session is attached to an external snapshot (via {@code USE SNAPSHOT}) and is NOT
-   * running its own transaction. In this mode reads are pinned but writes are disallowed — the
+   * True when this session is attached to an external snapshot (via {@code USE SNAPSHOT}) and is
+   * NOT running its own transaction. In this mode reads are pinned but writes are disallowed — the
    * session consumes a shared read_point it does not own. {@link SparkCatalog#loadTable} uses this
    * to return a read-only static table rather than a writable pinned wrapper.
    */
@@ -394,9 +396,10 @@ public class TransactionManager {
    * subtransaction — its server-allocated staging path, using only the subtxn_id and subtxn_token.
    *
    * <p>A subtransaction may span 1..N tables. The worker self-hydrates the full set from the GET
-   * response's {@code operations[]} (option a): it does not need the orchestrator to pass the tables
-   * or their staging paths explicitly. Each operation's {@code table_uuid} is the table key and its
-   * {@code assigned_staging_path} is where PinnedTableOperations writes that table's metadata.
+   * response's {@code operations[]} (option a): it does not need the orchestrator to pass the
+   * tables or their staging paths explicitly. Each operation's {@code table_uuid} is the table key
+   * and its {@code assigned_staging_path} is where PinnedTableOperations writes that table's
+   * metadata.
    */
   public void beginWorkerSubtransaction(SparkSession spark, long subtxnId, String subtxnToken) {
     String pending = getConf(spark, CONF_PENDING_ISOLATION);
@@ -516,8 +519,8 @@ public class TransactionManager {
 
   /**
    * Called by orchestrator SQL: {@code CREATE SUBTRANSACTION FOR <table>[, <table> ...]}. The user
-   * chooses the subtransaction granularity — 1 table or N tables — and every table in {@code tables}
-   * is staged and committed as one atomic unit.
+   * chooses the subtransaction granularity — 1 table or N tables — and every table in {@code
+   * tables} is staged and committed as one atomic unit.
    *
    * <p>If the session is still PENDING, fires {@code beginTransaction} REST first (snapshot pinned
    * at the first statement, consistent with PostgreSQL REPEATABLE READ semantics — no dummy SELECT
@@ -586,16 +589,16 @@ public class TransactionManager {
       String tableKeysLabel) {
     return withLockWaitRetry(
         tableKeysLabel,
-        () ->
-            restCatalog.createSubtransaction(txnId, txnToken, tableSpecs, DEFAULT_LEASE_SECONDS));
+        () -> restCatalog.createSubtransaction(txnId, txnToken, tableSpecs, DEFAULT_LEASE_SECONDS));
   }
 
   /**
    * Runs {@code action} with retry-with-backoff for EXCLUSIVE lock conflicts. The server returns
-   * HTTP 409 with type={@code LockConflictError} and a {@code retry_after_ms} hint when an EXCLUSIVE
-   * request finds in-flight ROW_EXCLUSIVE holders. This sleeps the suggested delay and retries up to
-   * {@link #MAX_LOCK_WAIT_RETRIES} times before throwing {@link
-   * PolarisRESTCatalog.LockWaitTimeoutException}. {@code label} identifies the table(s) in messages.
+   * HTTP 409 with type={@code LockConflictError} and a {@code retry_after_ms} hint when an
+   * EXCLUSIVE request finds in-flight ROW_EXCLUSIVE holders. This sleeps the suggested delay and
+   * retries up to {@link #MAX_LOCK_WAIT_RETRIES} times before throwing {@link
+   * PolarisRESTCatalog.LockWaitTimeoutException}. {@code label} identifies the table(s) in
+   * messages.
    */
   private SubtransactionRESTResponse withLockWaitRetry(
       String label, java.util.function.Supplier<SubtransactionRESTResponse> action) {
@@ -637,7 +640,8 @@ public class TransactionManager {
 
   /**
    * Returns the table keys this worker owns in the current subtransaction (used by SparkCatalog to
-   * decide whether a loadTable belongs to the worker's subtransaction). Empty if not in worker mode.
+   * decide whether a loadTable belongs to the worker's subtransaction). Empty if not in worker
+   * mode.
    */
   public List<String> getWorkerTables(SparkSession spark) {
     String tablesStr = getConf(spark, CONF_WORKER_TABLES);
@@ -653,9 +657,9 @@ public class TransactionManager {
   }
 
   /**
-   * Returns the server-allocated staging path for the given table in this worker subtransaction. Set
-   * by beginWorkerSubtransaction; read by PinnedTableOperations.commit() to know where to write that
-   * table's staged metadata file.
+   * Returns the server-allocated staging path for the given table in this worker subtransaction.
+   * Set by beginWorkerSubtransaction; read by PinnedTableOperations.commit() to know where to write
+   * that table's staged metadata file.
    */
   public Optional<String> getWorkerStagingPath(SparkSession spark, TableIdentifier ident) {
     return Optional.ofNullable(

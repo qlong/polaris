@@ -368,6 +368,7 @@ CREATE TABLE IF NOT EXISTS transaction_operations (
     op_token                      TEXT NOT NULL,
     status                        SMALLINT NOT NULL DEFAULT 0,
     retry_of_op_id                BIGINT,
+    table_entity_id               TEXT,
     created_at                    TIMESTAMP NOT NULL DEFAULT now(),
     expires_at                    TIMESTAMP NOT NULL,
     ended_at                      TIMESTAMP

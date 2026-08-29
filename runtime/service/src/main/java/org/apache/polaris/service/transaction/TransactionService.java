@@ -248,6 +248,7 @@ public class TransactionService {
         null,
         tableUuid,
         lockMode,
+        null,
         baseSnapshotId,
         retryOfOpId,
         leaseSeconds,
@@ -266,6 +267,7 @@ public class TransactionService {
       Long subtxnId,
       String tableUuid,
       String lockMode,
+      String tableEntityId,
       Long baseSnapshotId,
       Long retryOfOpId,
       int leaseSeconds,
@@ -299,7 +301,10 @@ public class TransactionService {
 
     // Capture the table's current committed metadata-location so we can detect concurrent commits
     // at finalization time (conflict detection for merge-and-retry / serialization failure).
-    String serverBase = persistence.findLatestCommittedMetadataLocation(tableUuid).orElse(null);
+    // committed_table_snapshots is keyed by the numeric entity id, so look up by tableEntityId when
+    // it is known; fall back to tableUuid (the qualified name) only for legacy/unresolved callers.
+    String ctsKey = tableEntityId != null ? tableEntityId : tableUuid;
+    String serverBase = persistence.findLatestCommittedMetadataLocation(ctsKey).orElse(null);
 
     OperationRow row =
         new OperationRow(
@@ -310,6 +315,7 @@ public class TransactionService {
             persistence.getCatalogId(),
             tableUuid,
             normalizedMode,
+            tableEntityId,
             baseSnapshotId,
             serverBase,
             stagingPath,
@@ -421,7 +427,18 @@ public class TransactionService {
    * @param baseSnapshotId optional Iceberg base snapshot the worker read from
    */
   public record SubtxnTableSpec(
-      String tableUuid, String tableMetadataDir, String lockMode, Long baseSnapshotId) {}
+      String tableUuid,
+      String tableMetadataDir,
+      String lockMode,
+      Long baseSnapshotId,
+      @Nullable String tableEntityId) {
+
+    /** Convenience constructor for callers that cannot resolve the numeric entity id. */
+    public SubtxnTableSpec(
+        String tableUuid, String tableMetadataDir, String lockMode, Long baseSnapshotId) {
+      this(tableUuid, tableMetadataDir, lockMode, baseSnapshotId, null);
+    }
+  }
 
   /**
    * A subtransaction plus its per-table child operations. Returned by {@link
@@ -483,6 +500,7 @@ public class TransactionService {
                 subtxnId,
                 t.tableUuid(),
                 t.lockMode(),
+                t.tableEntityId(),
                 t.baseSnapshotId(),
                 null,
                 leaseSeconds,
@@ -504,8 +522,7 @@ public class TransactionService {
 
     LOGGER.info(
         "Subtransaction created: subtxn_id={} txn_id={} tables={}", subtxnId, txnId, tables.size());
-    return new SubtxnInfo(
-        persistence.findSubtxn(subtxnId).orElseThrow(), ops, txn.txnSnapshotId());
+    return new SubtxnInfo(persistence.findSubtxn(subtxnId).orElseThrow(), ops, txn.txnSnapshotId());
   }
 
   /**
@@ -590,8 +607,8 @@ public class TransactionService {
                 + "-"
                 + UUID.randomUUID()
                 + ".metadata.json";
-        String serverBase =
-            persistence.findLatestCommittedMetadataLocation(old.tableUuid()).orElse(null);
+        String ctsKey = old.tableEntityId() != null ? old.tableEntityId() : old.tableUuid();
+        String serverBase = persistence.findLatestCommittedMetadataLocation(ctsKey).orElse(null);
         OperationRow retry =
             new OperationRow(
                 newOpId,
@@ -601,6 +618,7 @@ public class TransactionService {
                 old.catalogId(),
                 old.tableUuid(),
                 old.lockMode(),
+                old.tableEntityId(),
                 old.baseSnapshotId(),
                 serverBase,
                 newStagingPath,
@@ -656,8 +674,7 @@ public class TransactionService {
     JdbcTransactionPersistence.SubtxnRow subtxn = validateSubtxnToken(subtxnId, subtxnToken);
     Long parentSnapshotId =
         persistence.findTransaction(subtxn.txnId()).map(TransactionRow::txnSnapshotId).orElse(null);
-    return new SubtxnInfo(
-        subtxn, persistence.findOperationsForSubtxn(subtxnId), parentSnapshotId);
+    return new SubtxnInfo(subtxn, persistence.findOperationsForSubtxn(subtxnId), parentSnapshotId);
   }
 
   /**
@@ -866,8 +883,10 @@ public class TransactionService {
         live.stream()
             .filter(s -> s.status() == JdbcTransactionPersistence.OP_STATUS_COMMITTED)
             .toList()) {
-      String currentMeta =
-          persistence.findLatestCommittedMetadataLocation(s.tableUuid()).orElse(null);
+      // committed_table_snapshots is keyed by the numeric entity id; look up by tableEntityId when
+      // known (fall back to tableUuid only for legacy ops created before the id was recorded).
+      String ctsKey = s.tableEntityId() != null ? s.tableEntityId() : s.tableUuid();
+      String currentMeta = persistence.findLatestCommittedMetadataLocation(ctsKey).orElse(null);
       // Conflict when the live committed state diverges from our recorded baseline.
       // Two cases require mergeRetry:
       // 1. serverBase is set and differs from currentMeta — a concurrent transaction committed

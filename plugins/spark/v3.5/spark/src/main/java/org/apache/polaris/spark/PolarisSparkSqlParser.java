@@ -205,7 +205,8 @@ public class PolarisSparkSqlParser implements ParserInterface {
       // The table list (before SUBTXN_ID=) is comma-separated, but the params (after it) may also
       // be comma-separated. So we split the statement at " SUBTXN_ID=" and normalize each half:
       //  - table half: collapse only whitespace (keep commas — they delimit tables)
-      //  - param half: collapse [,\s]+ so "SUBTXN_ID=5,SUBTXN_TOKEN='x'" parses like space-separated
+      //  - param half: collapse [,\s]+ so "SUBTXN_ID=5,SUBTXN_TOKEN='x'" parses like
+      // space-separated
       int after = "BEGIN SUBTRANSACTION ".length();
       String rawUpperCollapsed = rawRest.toUpperCase(Locale.ROOT).replaceAll("\\s+", " ").trim();
       int subtxnIdIdx = rawUpperCollapsed.indexOf(" SUBTXN_ID=");
@@ -215,13 +216,15 @@ public class PolarisSparkSqlParser implements ParserInterface {
       String rawCollapsed = rawRest.replaceAll("\\s+", " ").trim();
 
       String tablesStr = rawCollapsed.substring(after, subtxnIdIdx).trim();
-      if (tablesStr.endsWith(",")) tablesStr = tablesStr.substring(0, tablesStr.length() - 1).trim();
+      if (tablesStr.endsWith(","))
+        tablesStr = tablesStr.substring(0, tablesStr.length() - 1).trim();
       // Validate the list parses (informational — the worker hydrates from the server), so a
       // malformed name here is a clear error rather than a silent no-op.
       parseTableIdentifierListPolaris(tablesStr);
 
       // Params half: leading space keeps " SUBTXN_ID=" findable after [,\s]+ collapse.
-      String paramRest = " " + rawCollapsed.substring(subtxnIdIdx).trim().replaceAll("[,\\s]+", " ");
+      String paramRest =
+          " " + rawCollapsed.substring(subtxnIdIdx).trim().replaceAll("[,\\s]+", " ");
       String paramUpper = paramRest.toUpperCase(Locale.ROOT);
       long subtxnId = parseLongParam(paramRest, paramUpper, "SUBTXN_ID");
       String subtxnToken = parseStringParam(paramRest, paramUpper, "SUBTXN_TOKEN");
@@ -326,9 +329,9 @@ public class PolarisSparkSqlParser implements ParserInterface {
   }
 
   /**
-   * Parses a comma-separated list of table identifiers, e.g. {@code "ns.orders, ns.customers"}. Each
-   * entry is parsed by {@link #parseTableIdentifierPolaris}. Blank entries are rejected so a trailing
-   * comma or {@code "a,,b"} is a clear error rather than a silent drop.
+   * Parses a comma-separated list of table identifiers, e.g. {@code "ns.orders, ns.customers"}.
+   * Each entry is parsed by {@link #parseTableIdentifierPolaris}. Blank entries are rejected so a
+   * trailing comma or {@code "a,,b"} is a clear error rather than a silent drop.
    */
   private static List<org.apache.iceberg.catalog.TableIdentifier> parseTableIdentifierListPolaris(
       String tablesStr) {

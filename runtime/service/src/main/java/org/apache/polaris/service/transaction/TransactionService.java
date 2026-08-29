@@ -583,6 +583,26 @@ public class TransactionService {
       throw new BadRequestException(
           "Subtransaction " + subtxnId + " does not belong to transaction " + txnId);
     }
+    // Only an OPEN subtransaction can be rolled back or aborted. A STAGED subtransaction has
+    // already
+    // been committed by its (winning) worker and is waiting for the parent's atomic pointer swap;
+    // aborting it here would discard that worker's committed operations and orphan its staged files
+    // (abortSubtxn discards COMMITTED ops too). This is exactly the concurrent-worker case: a loser
+    // that reacts to losing by issuing ROLLBACK/ABORT would silently revert the winner. Reject up
+    // front — before abortSubtxn mutates anything — so the winner's staged work is never touched.
+    // The loser's client still resets its own session (clearConf runs in its finally), so it
+    // becomes
+    // usable again without damaging the subtransaction. An ABORTED subtransaction is already
+    // terminal.
+    if (subtxn.status() != JdbcTransactionPersistence.SUBTXN_STATUS_OPEN) {
+      throw new BadRequestException(
+          "Subtransaction "
+              + subtxnId
+              + " is not OPEN (status="
+              + subtxn.status()
+              + "); it cannot be rolled back or aborted. A STAGED subtransaction was already committed"
+              + " by another worker and will be applied when the parent transaction commits.");
+    }
 
     List<OperationRow> aborted = persistence.abortSubtxn(subtxnId);
     releaseSubtxnLocks(txnId, aborted);
@@ -672,6 +692,21 @@ public class TransactionService {
    */
   public SubtxnInfo getSubtransactionInfo(long subtxnId, String subtxnToken) throws SQLException {
     JdbcTransactionPersistence.SubtxnRow subtxn = validateSubtxnToken(subtxnId, subtxnToken);
+    // Only an OPEN subtransaction is resumable. Re-beginning a STAGED (already committed) or
+    // ABORTED
+    // subtransaction is a client mistake: commitSubtransaction would reject the eventual write
+    // anyway (it guards status == OPEN), but by then beginWorkerSubtransaction has already set the
+    // worker's full session state (txn_id, pinned snapshot id, worker keys). That state then
+    // outlives the failed write and poisons every subsequent read against a released snapshot. Fail
+    // the resume up front, before any session state is set, so the worker session stays clean.
+    if (subtxn.status() != JdbcTransactionPersistence.SUBTXN_STATUS_OPEN) {
+      throw new BadRequestException(
+          "Subtransaction "
+              + subtxnId
+              + " is not OPEN (status="
+              + subtxn.status()
+              + "); it cannot be resumed. ROLLBACK SUBTRANSACTION to retry it, or start a new one.");
+    }
     Long parentSnapshotId =
         persistence.findTransaction(subtxn.txnId()).map(TransactionRow::txnSnapshotId).orElse(null);
     return new SubtxnInfo(subtxn, persistence.findOperationsForSubtxn(subtxnId), parentSnapshotId);

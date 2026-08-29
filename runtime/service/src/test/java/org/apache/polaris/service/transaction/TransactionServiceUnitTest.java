@@ -25,6 +25,7 @@ import jakarta.ws.rs.BadRequestException;
 import jakarta.ws.rs.ForbiddenException;
 import jakarta.ws.rs.NotFoundException;
 import java.io.InputStream;
+import java.util.List;
 import java.util.UUID;
 import javax.sql.DataSource;
 import org.apache.polaris.persistence.relational.jdbc.DatabaseType;
@@ -341,5 +342,186 @@ class TransactionServiceUnitTest {
     var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
 
     assertThat(txn.txnSnapshotId()).isNotEqualTo(txn.txnId());
+  }
+
+  // ---------------------------------------------------------------------------
+  // Subtransaction resume guard (getSubtransactionInfo requires OPEN)
+  // ---------------------------------------------------------------------------
+
+  @Test
+  void getSubtransactionInfoResolvesOpenSubtxn() throws Exception {
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
+    var subtxn =
+        service.createSubtransaction(
+            txn.txnId(),
+            txn.txnToken(),
+            "sp-open",
+            3600,
+            List.of(
+                new TransactionService.SubtxnTableSpec(
+                    "ns.orders", TABLE_METADATA_DIR, "ROW_EXCLUSIVE", null)));
+
+    // A freshly created (OPEN) subtransaction is resumable: a worker can look it up to get every
+    // operation's assigned staging path.
+    var info =
+        service.getSubtransactionInfo(subtxn.subtxn().subtxnId(), subtxn.subtxn().subtxnToken());
+
+    assertThat(info.subtxn().subtxnId()).isEqualTo(subtxn.subtxn().subtxnId());
+    assertThat(info.subtxn().status()).isEqualTo(JdbcTransactionPersistence.SUBTXN_STATUS_OPEN);
+    assertThat(info.operations()).hasSize(1);
+    assertThat(info.parentTxnSnapshotId()).isEqualTo(txn.txnSnapshotId());
+  }
+
+  @Test
+  void getSubtransactionInfoRejectsStagedSubtxn() throws Exception {
+    // Regression: re-beginning an already-committed (STAGED) subtransaction used to succeed here,
+    // letting the client set full worker session state that then poisoned every later read against
+    // a released snapshot. getSubtransactionInfo must reject a non-OPEN subtransaction up front.
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
+    var subtxn =
+        service.createSubtransaction(
+            txn.txnId(),
+            txn.txnToken(),
+            "sp-staged",
+            3600,
+            List.of(
+                new TransactionService.SubtxnTableSpec(
+                    "ns.orders", TABLE_METADATA_DIR, "ROW_EXCLUSIVE", null)));
+    long subtxnId = subtxn.subtxn().subtxnId();
+    String subtxnToken = subtxn.subtxn().subtxnToken();
+
+    // Commit (stage) the subtransaction: ops → COMMITTED, subtxn → STAGED, waiting for the parent
+    // transaction's atomic pointer swap.
+    service.commitSubtransaction(subtxnId, subtxnToken);
+
+    assertThatThrownBy(() -> service.getSubtransactionInfo(subtxnId, subtxnToken))
+        .isInstanceOf(BadRequestException.class)
+        .hasMessageContaining("is not OPEN");
+  }
+
+  @Test
+  void getSubtransactionInfoResolvesAfterRollbackReopensSubtxn() throws Exception {
+    // A worker that has NOT yet committed rolls its OPEN subtransaction back for retry; it is
+    // re-opened (status → OPEN, attempt++) so a fresh worker can legitimately resume it. This
+    // guards against the resume check over-rejecting a genuinely reopened subtransaction.
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
+    var subtxn =
+        service.createSubtransaction(
+            txn.txnId(),
+            txn.txnToken(),
+            "sp-retry",
+            3600,
+            List.of(
+                new TransactionService.SubtxnTableSpec(
+                    "ns.orders", TABLE_METADATA_DIR, "ROW_EXCLUSIVE", null)));
+    long subtxnId = subtxn.subtxn().subtxnId();
+    String subtxnToken = subtxn.subtxn().subtxnToken();
+
+    // Rolling back an OPEN (uncommitted) subtransaction with reopen=true re-opens it for retry.
+    service.rollbackSubtransaction(
+        txn.txnId(), subtxnId, subtxnToken, txn.txnToken(), /* reopenForRetry= */ true); // → OPEN
+
+    var info = service.getSubtransactionInfo(subtxnId, subtxnToken);
+    assertThat(info.subtxn().status()).isEqualTo(JdbcTransactionPersistence.SUBTXN_STATUS_OPEN);
+    assertThat(info.operations()).hasSize(1);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Rollback / abort guard (a STAGED subtransaction belongs to the winning worker
+  // and must not be reverted by a losing concurrent worker)
+  // ---------------------------------------------------------------------------
+
+  @Test
+  void rollbackRejectsStagedSubtxnAndLeavesWinnerIntact() throws Exception {
+    // Concurrent-worker case: w1 (winner) stages subtxn1 → STAGED. w2 (loser) reacts to losing by
+    // issuing ROLLBACK. That must be rejected up front — before abortSubtxn touches anything — so
+    // the winner's committed operations and staged files are left untouched for the parent commit.
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
+    var subtxn =
+        service.createSubtransaction(
+            txn.txnId(),
+            txn.txnToken(),
+            "sp-winner",
+            3600,
+            List.of(
+                new TransactionService.SubtxnTableSpec(
+                    "ns.orders", TABLE_METADATA_DIR, "ROW_EXCLUSIVE", null)));
+    long subtxnId = subtxn.subtxn().subtxnId();
+    String subtxnToken = subtxn.subtxn().subtxnToken();
+
+    service.commitSubtransaction(subtxnId, subtxnToken); // winner → STAGED
+
+    assertThatThrownBy(
+            () ->
+                service.rollbackSubtransaction(
+                    txn.txnId(), subtxnId, subtxnToken, txn.txnToken(), /* reopenForRetry= */ true))
+        .isInstanceOf(BadRequestException.class)
+        .hasMessageContaining("is not OPEN");
+
+    // Winner's subtransaction is untouched: still STAGED, and its operation is still COMMITTED at
+    // its staged path (not aborted, not orphaned).
+    var stillStaged = persistence.findSubtxn(subtxnId).orElseThrow();
+    assertThat(stillStaged.status()).isEqualTo(JdbcTransactionPersistence.SUBTXN_STATUS_STAGED);
+    var ops = persistence.findOperationsForSubtxn(subtxnId);
+    assertThat(ops).hasSize(1);
+    assertThat(ops.get(0).status()).isEqualTo(JdbcTransactionPersistence.OP_STATUS_COMMITTED);
+  }
+
+  @Test
+  void abortRejectsStagedSubtxnAndLeavesWinnerIntact() throws Exception {
+    // Same as above via the ABORT entry point (rollbackSubtransaction with reopenForRetry=false):
+    // aborting the winner's STAGED subtransaction must be rejected.
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
+    var subtxn =
+        service.createSubtransaction(
+            txn.txnId(),
+            txn.txnToken(),
+            "sp-winner-abort",
+            3600,
+            List.of(
+                new TransactionService.SubtxnTableSpec(
+                    "ns.orders", TABLE_METADATA_DIR, "ROW_EXCLUSIVE", null)));
+    long subtxnId = subtxn.subtxn().subtxnId();
+    String subtxnToken = subtxn.subtxn().subtxnToken();
+
+    service.commitSubtransaction(subtxnId, subtxnToken); // winner → STAGED
+
+    assertThatThrownBy(
+            () ->
+                service.rollbackSubtransaction(
+                    txn.txnId(),
+                    subtxnId,
+                    subtxnToken,
+                    txn.txnToken(),
+                    /* reopenForRetry= */ false))
+        .isInstanceOf(BadRequestException.class)
+        .hasMessageContaining("is not OPEN");
+
+    var stillStaged = persistence.findSubtxn(subtxnId).orElseThrow();
+    assertThat(stillStaged.status()).isEqualTo(JdbcTransactionPersistence.SUBTXN_STATUS_STAGED);
+  }
+
+  @Test
+  void rollbackReopensOpenSubtxn() throws Exception {
+    // Control: rolling back an OPEN (uncommitted) subtransaction is still allowed and reopens it.
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
+    var subtxn =
+        service.createSubtransaction(
+            txn.txnId(),
+            txn.txnToken(),
+            "sp-open-rollback",
+            3600,
+            List.of(
+                new TransactionService.SubtxnTableSpec(
+                    "ns.orders", TABLE_METADATA_DIR, "ROW_EXCLUSIVE", null)));
+    long subtxnId = subtxn.subtxn().subtxnId();
+    String subtxnToken = subtxn.subtxn().subtxnToken();
+
+    service.rollbackSubtransaction(
+        txn.txnId(), subtxnId, subtxnToken, txn.txnToken(), /* reopenForRetry= */ true);
+
+    var reopened = persistence.findSubtxn(subtxnId).orElseThrow();
+    assertThat(reopened.status()).isEqualTo(JdbcTransactionPersistence.SUBTXN_STATUS_OPEN);
+    assertThat(reopened.attempt()).isEqualTo(2);
   }
 }

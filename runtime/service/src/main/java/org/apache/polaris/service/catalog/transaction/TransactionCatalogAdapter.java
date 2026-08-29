@@ -395,6 +395,8 @@ public class TransactionCatalogAdapter
       // subtransaction so a resuming worker sees every operation's assigned staging path.
       TransactionService.SubtxnInfo info = txnService.getSubtransactionInfo(subtxnId, xSubtxnToken);
       return Response.ok(toSubtransaction(info, false)).build();
+    } catch (jakarta.ws.rs.BadRequestException e) {
+      return Response.status(400).entity(simpleError(e.getMessage())).build();
     } catch (jakarta.ws.rs.ForbiddenException e) {
       return Response.status(403).entity(simpleError(e.getMessage())).build();
     } catch (jakarta.ws.rs.NotFoundException e) {

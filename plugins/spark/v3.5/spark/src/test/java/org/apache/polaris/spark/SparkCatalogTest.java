@@ -27,6 +27,7 @@ import com.google.common.collect.Maps;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -788,6 +789,132 @@ public class SparkCatalogTest {
           .as("Fallback StaticTableOperations must throw UnsupportedOperationException on writes")
           .isInstanceOf(UnsupportedOperationException.class)
           .hasMessageContaining("static table");
+    }
+  }
+
+  /**
+   * Worker-mode re-stage regression test. A worker operation gets ONE fixed, server-allocated
+   * staging path (validated at commitSubtransaction). A re-attach or a repeated INSERT into an
+   * already-created-but-not-yet-committed worker operation calls commit() again on that same fixed
+   * path. The staging write must be create-or-replace (TableMetadataParser.overwrite) so the second
+   * commit does NOT throw AlreadyExistsException — the previous fix for the distributable-subtxn
+   * "Path already exists" bug.
+   */
+  @Test
+  void testWorkerCommitOverwritesFixedStagingPath() throws Exception {
+    Identifier ident = Identifier.of(defaultNS, "worker-overwrite-test");
+    Map<String, String> props = Maps.newHashMap();
+    props.put(TableCatalog.PROP_LOCATION, "file:///tmp/polaris-worker-overwrite/");
+    catalog.createTable(ident, defaultSchema, new Transform[0], props);
+
+    // The single server-allocated staging path this worker operation writes to on every commit().
+    Path tempDir = Files.createTempDirectory("polaris-worker-staging-");
+    String workerStagingPath = tempDir.resolve("15-18-fixedstaging.metadata.json").toUri().toString();
+
+    // Simulate an active worker subtransaction for this table (READ_COMMITTED parent → no pin,
+    // resolveMetadataLocation stays empty; worker path is taken because isWorkerMode/isWorkerTable).
+    Mockito.when(catalog.txnManager.getConf(Mockito.any(), Mockito.eq(TransactionManager.CONF_TXN_ID)))
+        .thenReturn("15");
+    Mockito.when(catalog.txnManager.isWorkerMode(Mockito.any())).thenReturn(true);
+    Mockito.when(catalog.txnManager.isWorkerTable(Mockito.any(), Mockito.any())).thenReturn(true);
+    Mockito.when(catalog.txnManager.getWorkerStagingPath(Mockito.any(), Mockito.any()))
+        .thenReturn(Optional.of(workerStagingPath));
+
+    try (MockedStatic<SparkUtil> su = Mockito.mockStatic(SparkUtil.class)) {
+      su.when(() -> SparkUtil.hadoopConfCatalogOverrides(Mockito.any(), Mockito.any()))
+          .thenReturn(new Configuration());
+
+      Table txnTable = catalog.loadTable(ident);
+      TableOperations ops = ((BaseTable) ((SparkTable) txnTable).table()).operations();
+      TableMetadata base = ops.current();
+
+      // First commit stages to the fixed path.
+      TableMetadata firstUpdate =
+          base.replaceProperties(Collections.singletonMap("attempt", "1"));
+      assertThatCode(() -> ops.commit(base, firstUpdate))
+          .as("first worker commit stages to the fixed path")
+          .doesNotThrowAnyException();
+
+      // Second commit to the SAME fixed path (re-attach / repeated INSERT). With overwrite this
+      // must succeed; with strict create it would throw AlreadyExistsException.
+      TableMetadata secondUpdate =
+          base.replaceProperties(Collections.singletonMap("attempt", "2"));
+      assertThatCode(() -> ops.commit(base, secondUpdate))
+          .as("re-staging the same worker operation must overwrite, not throw AlreadyExistsException")
+          .doesNotThrowAnyException();
+
+      // The staged metadata file exists at the fixed worker path, and the write was staged there.
+      assertThat(new HadoopFileIO(new Configuration()).newInputFile(workerStagingPath).exists())
+          .as("staged metadata.json must exist at the fixed worker path")
+          .isTrue();
+      Mockito.verify(catalog.txnManager, Mockito.atLeast(2))
+          .stageWrite(Mockito.any(), Mockito.any(), Mockito.eq(workerStagingPath), Mockito.any());
+    }
+  }
+
+  /**
+   * Inline / orchestrator-direct writes (NOT worker mode) must keep strict-create staging: each
+   * commit() allocates a fresh UUID metadata path via liveOps.metadataFileLocation, so no two
+   * commits collide and TableMetadataParser.write's create-if-absent contract is unchanged. This
+   * pins the "scoped to worker commit only" guarantee of the overwrite fix.
+   */
+  @Test
+  void testInlineCommitUsesFreshPathPerCommitAndDoesNotOverwrite() throws Exception {
+    Identifier ident = Identifier.of(defaultNS, "inline-freshpath-test");
+    Map<String, String> props = Maps.newHashMap();
+    props.put(TableCatalog.PROP_LOCATION, "file:///tmp/polaris-inline-freshpath/");
+    catalog.createTable(ident, defaultSchema, new Transform[0], props);
+
+    // Pin reads so loadTable wraps in PinnedTableOperations, but NOT worker mode: the inline branch.
+    Path tempDir = Files.createTempDirectory("polaris-inline-pin-");
+    String pinnedMetaPath = tempDir.resolve("v1.metadata.json").toUri().toString();
+    TableMetadata pinnedMeta =
+        TableMetadata.newTableMetadata(
+            new Schema(Types.NestedField.required(1, "id", Types.LongType.get())),
+            PartitionSpec.unpartitioned(),
+            SortOrder.unsorted(),
+            "file:///tmp/polaris-inline-freshpath/",
+            Maps.newHashMap());
+    TableMetadataParser.write(
+        pinnedMeta, new HadoopFileIO(new Configuration()).newOutputFile(pinnedMetaPath));
+
+    Mockito.when(catalog.txnManager.getConf(Mockito.any(), Mockito.eq(TransactionManager.CONF_TXN_ID)))
+        .thenReturn("42");
+    Mockito.when(catalog.txnManager.resolveMetadataLocation(Mockito.any(), Mockito.any()))
+        .thenReturn(Optional.of(pinnedMetaPath));
+    // Inline path: not worker mode, no worker staging path.
+    Mockito.when(catalog.txnManager.isWorkerMode(Mockito.any())).thenReturn(false);
+    Mockito.when(catalog.txnManager.getWorkerStagingPath(Mockito.any(), Mockito.any()))
+        .thenReturn(Optional.empty());
+
+    // Capture the staging paths passed to stageWrite across two commits.
+    java.util.List<String> stagedPaths = new java.util.ArrayList<>();
+    Mockito.doAnswer(
+            inv -> {
+              stagedPaths.add(inv.getArgument(2));
+              return null;
+            })
+        .when(catalog.txnManager)
+        .stageWrite(Mockito.any(), Mockito.any(), Mockito.any(), Mockito.any());
+
+    try (MockedStatic<SparkUtil> su = Mockito.mockStatic(SparkUtil.class)) {
+      su.when(() -> SparkUtil.hadoopConfCatalogOverrides(Mockito.any(), Mockito.any()))
+          .thenReturn(new Configuration());
+
+      Table txnTable = catalog.loadTable(ident);
+      TableOperations ops = ((BaseTable) ((SparkTable) txnTable).table()).operations();
+      TableMetadata base = ops.current();
+
+      ops.commit(base, base.replaceProperties(Collections.singletonMap("attempt", "1")));
+      ops.commit(base, base.replaceProperties(Collections.singletonMap("attempt", "2")));
+
+      // Two commits → two DISTINCT fresh UUID paths (never the worker's fixed path), so strict
+      // create never collides. This is what keeps inline multi-table transactions unaffected.
+      assertThat(stagedPaths).as("two commits stage to two paths").hasSize(2);
+      assertThat(stagedPaths.get(0))
+          .as("inline commits allocate distinct fresh paths per commit")
+          .isNotEqualTo(stagedPaths.get(1));
+      assertThat(stagedPaths.get(0)).contains("42-");
     }
   }
 

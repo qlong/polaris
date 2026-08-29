@@ -22,6 +22,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;
 import java.util.Arrays;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Stream;
 import org.apache.arrow.util.VisibleForTesting;
@@ -39,6 +40,7 @@ import org.apache.iceberg.encryption.EncryptionManager;
 import org.apache.iceberg.hadoop.HadoopFileIO;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.LocationProvider;
+import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.rest.auth.OAuth2Util;
 import org.apache.iceberg.spark.SparkUtil;
 import org.apache.iceberg.spark.SupportsReplaceView;
@@ -353,19 +355,35 @@ public class SparkCatalog
 
       // In worker mode, use this table's server-allocated path from beginWorkerSubtransaction;
       // otherwise allocate a new local path (new UUID per commit keeps savepoint history intact).
+      Optional<String> workerStagingPath = txnManager.getWorkerStagingPath(spark, tableIdent);
       String stagingPath =
-          txnManager
-              .getWorkerStagingPath(spark, tableIdent)
-              .orElseGet(
-                  () ->
-                      liveOps.metadataFileLocation(
-                          txnId
-                              + "-"
-                              + UUID.randomUUID().toString().replace("-", "").substring(0, 12)
-                              + ".metadata.json"));
+          workerStagingPath.orElseGet(
+              () ->
+                  liveOps.metadataFileLocation(
+                      txnId
+                          + "-"
+                          + UUID.randomUUID().toString().replace("-", "").substring(0, 12)
+                          + ".metadata.json"));
 
-      // Write the staged metadata file
-      TableMetadataParser.write(metadata, fileIO.newOutputFile(stagingPath));
+      // Write the staged metadata file.
+      //
+      // Worker mode uses ONE fixed, server-allocated path per operation (validated at
+      // commitSubtransaction), so re-staging the same worker operation — a re-attach or a
+      // repeated INSERT into an already-created-but-not-yet-committed operation — targets a file
+      // that may already exist. Every PinnedTableOperations write re-parents off the pinned base
+      // (last-write-wins per operation, by design), so create-or-replace is the correct behavior:
+      // overwrite the stale staged metadata.json rather than throwing AlreadyExistsException.
+      // (Orphaned data files from the superseded write are a known leak — see the cleanup TODO in
+      // docs/transaction-lifecycle-and-locking.md.)
+      //
+      // The inline/orchestrator path allocates a fresh UUID path per commit, so a collision there
+      // would signal a real bug; it keeps strict create semantics unchanged.
+      OutputFile stagedMetadataFile = fileIO.newOutputFile(stagingPath);
+      if (workerStagingPath.isPresent()) {
+        TableMetadataParser.overwrite(metadata, stagedMetadataFile); // worker: create-or-replace
+      } else {
+        TableMetadataParser.write(metadata, stagedMetadataFile); // inline/orchestrator: strict create
+      }
 
       // Map the Iceberg snapshot operation to a server LockMode. The server keys its
       // conflict-resolution policy off the lock mode (not the raw Iceberg op): an additive

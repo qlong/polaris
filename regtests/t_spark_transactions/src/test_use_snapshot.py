@@ -17,19 +17,23 @@
 # under the License.
 #
 
-"""USE SNAPSHOT <id> / USE SNAPSHOT NONE — consuming an exported TxnSnapshot in Spark.
+"""USE SNAPSHOT <handle> / USE SNAPSHOT NONE — consuming an exported TxnSnapshot in Spark.
 
 This is the client-side half of the "exportable snapshot" superpower: a plain Spark
 session, with NO local BEGIN TRANSACTION, attaches its reads to a snapshot that some
 *other* coordinator minted via ``POST /transaction-snapshots``.  The coordinator here
 is the module's PolarisClient (standing in for a notebook / Airflow task / another
-engine); Spark consumes the same ``txn_snapshot_id`` the coordinator exported.
+engine); Spark consumes the same opaque ``txn_snapshot`` handle the coordinator exported.
+
+The handle is a server-minted, case-sensitive base64url string; the client stores and
+echoes it verbatim and never parses it.  Standalone read snapshots are reclaimed purely
+by TTL — there is no server-side DELETE, so the coordinator never releases one.
 
 Verb semantics under test:
 
-  * ``USE SNAPSHOT <id>``   — pin this session's reads to the exported read_point.
+  * ``USE SNAPSHOT <handle>`` — pin this session's reads to the exported read_point.
     No transaction is started; the session merely consumes a shared cutoff.
-  * ``USE SNAPSHOT NONE``   — detach; reads return to latest (READ COMMITTED).
+  * ``USE SNAPSHOT NONE``     — detach; reads return to latest (READ COMMITTED).
   * Attach is read-only: a write while attached must fail rather than stage against
     a non-existent transaction.
   * Attaching while a local transaction is in progress is rejected.
@@ -81,22 +85,20 @@ def polaris_client(catalog_name, credentials) -> PolarisClient:
 
 @pytest.fixture
 def exported_snapshot(polaris_client, test_ns):
-    """Coordinator mints a snapshot via REST; released on teardown.
+    """Coordinator mints a snapshot via REST; no teardown (TTL-reclaimed).
 
     Depends on ``test_ns`` so the snapshot's read_point is captured *after* the
     per-test tables are created and seeded — otherwise the pinned read_point
     predates the tables' first commit and loadTable raises NoSuchTable.
 
-    Returns the txn_snapshot_id the coordinator hands out to consumers.
+    Returns the response dict carrying the opaque ``txn_snapshot`` handle the
+    coordinator hands out to consumers. Standalone read handles have no
+    server-side DELETE, so teardown is a no-op.
     """
     resp = polaris_client.post("/transaction-snapshots", {"lease_seconds": 300})
     resp.raise_for_status()
     snap = resp.json()
     yield snap
-    try:
-        polaris_client.delete(f"/transaction-snapshots/{snap['txn_snapshot_id']}")
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +111,7 @@ class TestUseSnapshotAttach:
     def test_attach_pins_reads_across_concurrent_writer(
         self, txn_spark, exported_snapshot, test_ns, catalog_name
     ):
-        """USE SNAPSHOT <id> holds a consistent view while a writer commits underneath.
+        """USE SNAPSHOT <handle> holds a consistent view while a writer commits underneath.
 
         No BEGIN on the reader — it only attaches to the coordinator's read_point.
         A separate writer session inserts into both tables; the attached reader must
@@ -119,11 +121,12 @@ class TestUseSnapshotAttach:
         cat = catalog_name
         fq_orders = f"{cat}.{ns}.orders"
         fq_customers = f"{cat}.{ns}.customers"
-        snap_id = exported_snapshot["txn_snapshot_id"]
+        handle = exported_snapshot["txn_snapshot"]
 
-        # Attach the reader to the exported snapshot (no local transaction).
-        status = txn_spark.sql(f"USE SNAPSHOT {int(snap_id)}").collect()[0]["status"]
-        assert str(snap_id) in status, f"Unexpected USE SNAPSHOT status: {status}"
+        # Attach the reader to the exported snapshot (no local transaction). The handle is
+        # an opaque, case-sensitive base64url token — echo it verbatim, never coerce it.
+        status = txn_spark.sql(f"USE SNAPSHOT '{handle}'").collect()[0]["status"]
+        assert handle in status, f"Unexpected USE SNAPSHOT status: {status}"
 
         try:
             pre = (count(txn_spark, fq_orders), count(txn_spark, fq_customers))
@@ -153,9 +156,9 @@ class TestUseSnapshotAttach:
         ns = test_ns["ns"]
         cat = catalog_name
         fq_orders = f"{cat}.{ns}.orders"
-        snap_id = exported_snapshot["txn_snapshot_id"]
+        handle = exported_snapshot["txn_snapshot"]
 
-        txn_spark.sql(f"USE SNAPSHOT {int(snap_id)}")
+        txn_spark.sql(f"USE SNAPSHOT '{handle}'")
         try:
             # Writer advances orders while we are pinned.
             writer = txn_spark.new_session()
@@ -177,21 +180,21 @@ class TestUseSnapshotAttach:
     def test_two_spark_sessions_same_id_agree(
         self, txn_spark, exported_snapshot, test_ns, catalog_name
     ):
-        """Two independent Spark sessions attach to the SAME exported id and agree.
+        """Two independent Spark sessions attach to the SAME exported handle and agree.
 
         Mirrors the demo's cross-engine parity (Reader S + Reader T) using two Spark
-        sessions that share nothing but the coordinator's txn_snapshot_id.
+        sessions that share nothing but the coordinator's txn_snapshot handle.
         """
         ns = test_ns["ns"]
         cat = catalog_name
         fq_orders = f"{cat}.{ns}.orders"
-        snap_id = int(exported_snapshot["txn_snapshot_id"])
+        handle = exported_snapshot["txn_snapshot"]
 
         reader_a = txn_spark
         reader_b = txn_spark.new_session()
 
-        reader_a.sql(f"USE SNAPSHOT {snap_id}")
-        reader_b.sql(f"USE SNAPSHOT {snap_id}")
+        reader_a.sql(f"USE SNAPSHOT '{handle}'")
+        reader_b.sql(f"USE SNAPSHOT '{handle}'")
         try:
             # Writer moves the world after both readers attach.
             writer = txn_spark.new_session()
@@ -223,9 +226,9 @@ class TestUseSnapshotGuards:
         ns = test_ns["ns"]
         cat = catalog_name
         fq_orders = f"{cat}.{ns}.orders"
-        snap_id = int(exported_snapshot["txn_snapshot_id"])
+        handle = exported_snapshot["txn_snapshot"]
 
-        txn_spark.sql(f"USE SNAPSHOT {snap_id}")
+        txn_spark.sql(f"USE SNAPSHOT '{handle}'")
         try:
             with pytest.raises(Exception):
                 txn_spark.sql(f"INSERT INTO {fq_orders} VALUES (9104, 1, 2.00, 'nope')")
@@ -247,11 +250,11 @@ class TestUseSnapshotGuards:
         self, txn_spark, exported_snapshot, test_ns, catalog_name
     ):
         """USE SNAPSHOT is rejected while a local transaction is pending/active."""
-        snap_id = int(exported_snapshot["txn_snapshot_id"])
+        handle = exported_snapshot["txn_snapshot"]
         txn_spark.sql("BEGIN TRANSACTION")
         try:
             with pytest.raises(Exception):
-                txn_spark.sql(f"USE SNAPSHOT {snap_id}")
+                txn_spark.sql(f"USE SNAPSHOT '{handle}'")
         finally:
             txn_spark.sql("ROLLBACK")
 

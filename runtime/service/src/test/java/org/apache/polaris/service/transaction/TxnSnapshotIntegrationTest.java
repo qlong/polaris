@@ -30,7 +30,6 @@ import org.apache.polaris.persistence.relational.jdbc.DatabaseType;
 import org.apache.polaris.persistence.relational.jdbc.DatasourceOperations;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.CommittedTableSnapshotRow;
-import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.TxnSnapshotRow;
 import org.apache.polaris.persistence.relational.jdbc.RelationalJdbcConfiguration;
 import org.h2.jdbcx.JdbcConnectionPool;
 import org.junit.jupiter.api.BeforeEach;
@@ -98,17 +97,16 @@ class TxnSnapshotIntegrationTest {
     persistence.insertCommittedTableSnapshotRow(
         new CommittedTableSnapshotRow(TABLE_UUID, txnIdBefore, null, "s3://bucket/v-before.json"));
 
-    // Acquire a read snapshot — its xmax will be > txnIdBefore
-    TxnSnapshotRow snap = service.createTransactionSnapshot(3600);
+    // Acquire a read snapshot — its read point captures everything committed so far.
+    var snap = service.createTransactionSnapshot(3600);
 
     // Insert a committed snapshot after acquiring the read snapshot
     long txnIdAfter = persistence.nextTxnId();
     persistence.insertCommittedTableSnapshotRow(
         new CommittedTableSnapshotRow(TABLE_UUID, txnIdAfter, null, "s3://bucket/v-after.json"));
 
-    // Resolve: should see v-before but not v-after
-    Optional<String> resolved =
-        service.resolveTableMetadataLocation(TABLE_UUID, snap.txnSnapshotId());
+    // Resolve via the opaque handle: should see v-before but not v-after
+    Optional<String> resolved = service.resolveTableMetadataLocation(TABLE_UUID, snap.handle());
     assertThat(resolved).isPresent();
     assertThat(resolved.get()).isEqualTo("s3://bucket/v-before.json");
   }
@@ -123,23 +121,21 @@ class TxnSnapshotIntegrationTest {
     persistence.insertCommittedTableSnapshotRow(
         new CommittedTableSnapshotRow(TABLE_UUID, id2, null, "s3://bucket/v2.json"));
 
-    // Acquire snapshot — captures xmax = id2 + 1 or so
-    TxnSnapshotRow snap = service.createTransactionSnapshot(3600);
+    // Acquire snapshot — its read point captures both commits.
+    var snap = service.createTransactionSnapshot(3600);
 
     // Latest visible commit should be v2
-    Optional<String> resolved =
-        service.resolveTableMetadataLocation(TABLE_UUID, snap.txnSnapshotId());
+    Optional<String> resolved = service.resolveTableMetadataLocation(TABLE_UUID, snap.handle());
     assertThat(resolved).isPresent();
     assertThat(resolved.get()).isEqualTo("s3://bucket/v2.json");
   }
 
   @Test
-  void releasedSnapshotIsRejected() throws Exception {
-    TxnSnapshotRow snap = service.createTransactionSnapshot(3600);
-    service.releaseTransactionSnapshot(snap.txnSnapshotId());
-
-    // resolveTableMetadataLocation should throw because the snapshot is released
-    assertThatThrownBy(() -> service.resolveTableMetadataLocation(TABLE_UUID, snap.txnSnapshotId()))
+  void malformedHandleIsRejectedFailClosed() throws Exception {
+    // Standalone read handles are opaque and stateless — there is no release/GET/DELETE by id. The
+    // only rejection path is a handle we cannot decode, which must fail closed (never a torn read).
+    assertThatThrownBy(
+            () -> service.resolveTableMetadataLocation(TABLE_UUID, "not-a-real-handle!!!"))
         .isInstanceOf(BadRequestException.class);
   }
 
@@ -165,9 +161,10 @@ class TxnSnapshotIntegrationTest {
         new CommittedTableSnapshotRow(
             TABLE_UUID, postTxnCommit, null, "s3://bucket/post-begin.json"));
 
-    // The linked snapshot must see the pre-begin commit but not the post-begin one
+    // The linked snapshot must see the pre-begin commit but not the post-begin one. The write path
+    // keeps its live row, so resolution goes through the row-backed overload.
     Optional<String> resolved =
-        service.resolveTableMetadataLocation(TABLE_UUID, txn.txnSnapshotId());
+        service.resolveTableMetadataLocationByRow(TABLE_UUID, txn.txnSnapshotId());
     assertThat(resolved).isPresent();
     assertThat(resolved.get()).isEqualTo("s3://bucket/pre-begin.json");
   }
@@ -189,8 +186,8 @@ class TxnSnapshotIntegrationTest {
 
     service.abortTransaction(txn.txnId(), txn.txnToken());
 
-    // After abort, resolving the snapshot should fail (released)
-    assertThatThrownBy(() -> service.resolveTableMetadataLocation(TABLE_UUID, snapId))
+    // After abort, resolving the write-linked snapshot row should fail (released)
+    assertThatThrownBy(() -> service.resolveTableMetadataLocationByRow(TABLE_UUID, snapId))
         .isInstanceOf(BadRequestException.class);
   }
 }

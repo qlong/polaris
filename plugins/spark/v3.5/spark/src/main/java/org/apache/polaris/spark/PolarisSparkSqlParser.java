@@ -273,20 +273,30 @@ public class PolarisSparkSqlParser implements ParserInterface {
       return delegate.parsePlan(statusSql("Detached from snapshot"));
     }
 
-    // USE SNAPSHOT <id> — attach this session's reads to a snapshot a coordinator exported.
+    // USE SNAPSHOT <handle> — attach this session's reads to a snapshot a coordinator exported.
     // Only intercept the SNAPSHOT form; plain `USE <ns>` / `USE CATALOG ...` fall through.
+    // The handle is an opaque, server-minted, case-sensitive base64url token, so it must be
+    // sliced from the RAW sql (not the upper-cased `normalized`) and echoed verbatim — the client
+    // never parses it.
     if (normalized.startsWith("USE SNAPSHOT ")) {
       SparkSession spark = SparkSession.active();
-      String idStr = normalized.substring("USE SNAPSHOT ".length()).trim();
-      long snapId;
-      try {
-        snapId = Long.parseLong(idStr);
-      } catch (NumberFormatException e) {
-        throw new IllegalArgumentException(
-            "USE SNAPSHOT: expected a numeric snapshot id (or NONE), got: " + idStr);
+      String rawSnap = sql.trim();
+      if (rawSnap.endsWith(";")) {
+        rawSnap = rawSnap.substring(0, rawSnap.length() - 1).trim();
       }
-      txnManager(spark).attachSnapshot(spark, snapId);
-      return delegate.parsePlan(statusSql("Attached to snapshot " + snapId));
+      String handle = rawSnap.substring("USE SNAPSHOT ".length()).trim();
+      // Strip optional surrounding quotes (USE SNAPSHOT '<handle>').
+      if (handle.length() >= 2
+          && ((handle.startsWith("'") && handle.endsWith("'"))
+              || (handle.startsWith("\"") && handle.endsWith("\"")))) {
+        handle = handle.substring(1, handle.length() - 1);
+      }
+      if (handle.isEmpty()) {
+        throw new IllegalArgumentException(
+            "USE SNAPSHOT: expected a snapshot handle (or NONE), got an empty token.");
+      }
+      txnManager(spark).attachSnapshot(spark, handle);
+      return delegate.parsePlan(statusSql("Attached to snapshot " + handle));
     }
 
     return delegate.parsePlan(sql);

@@ -33,7 +33,6 @@ import org.apache.polaris.persistence.relational.jdbc.DatabaseType;
 import org.apache.polaris.persistence.relational.jdbc.DatasourceOperations;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.CommittedTableSnapshotRow;
-import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.TxnSnapshotRow;
 import org.apache.polaris.persistence.relational.jdbc.RelationalJdbcConfiguration;
 import org.h2.jdbcx.JdbcConnectionPool;
 import org.junit.jupiter.api.BeforeEach;
@@ -187,17 +186,17 @@ class MultiTableAtomicityTest {
     singleCommit(customers, "s3://customers/v1.json");
 
     // Snapshot acquired BEFORE the multi-table commit.
-    TxnSnapshotRow snap = service.createTransactionSnapshot(3600);
+    var snap = service.createTransactionSnapshot(3600);
 
     // Batch commit of new versions — single commit_scn above the snapshot's read_point.
     batchCommitWithSharedScn(
         new CommittedTableSnapshotRow(orders, 0L, null, "s3://orders/v2.json"),
         new CommittedTableSnapshotRow(customers, 0L, null, "s3://customers/v2.json"));
 
-    assertThat(service.resolveTableMetadataLocation(orders, snap.txnSnapshotId()))
+    assertThat(service.resolveTableMetadataLocation(orders, snap.handle()))
         .as("orders: pre-snapshot must see v1, not v2")
         .hasValue("s3://orders/v1.json");
-    assertThat(service.resolveTableMetadataLocation(customers, snap.txnSnapshotId()))
+    assertThat(service.resolveTableMetadataLocation(customers, snap.handle()))
         .as("customers: pre-snapshot must see v1, not v2")
         .hasValue("s3://customers/v1.json");
   }
@@ -208,16 +207,16 @@ class MultiTableAtomicityTest {
     String customers = "entity-customers-fresh-1";
 
     // Snapshot BEFORE any commit (read_point = 0).
-    TxnSnapshotRow snap = service.createTransactionSnapshot(3600);
+    var snap = service.createTransactionSnapshot(3600);
 
     batchCommitWithSharedScn(
         new CommittedTableSnapshotRow(orders, 0L, null, "s3://orders/v1.json"),
         new CommittedTableSnapshotRow(customers, 0L, null, "s3://customers/v1.json"));
 
-    assertThat(service.resolveTableMetadataLocation(orders, snap.txnSnapshotId()))
+    assertThat(service.resolveTableMetadataLocation(orders, snap.handle()))
         .as("orders: no commit visible before snapshot")
         .isEmpty();
-    assertThat(service.resolveTableMetadataLocation(customers, snap.txnSnapshotId()))
+    assertThat(service.resolveTableMetadataLocation(customers, snap.handle()))
         .as("customers: no commit visible before snapshot")
         .isEmpty();
   }
@@ -236,12 +235,12 @@ class MultiTableAtomicityTest {
         new CommittedTableSnapshotRow(customers, 0L, null, "s3://customers/v2.json"));
 
     // Snapshot AFTER the batch commit.
-    TxnSnapshotRow snap = service.createTransactionSnapshot(3600);
+    var snap = service.createTransactionSnapshot(3600);
 
-    assertThat(service.resolveTableMetadataLocation(orders, snap.txnSnapshotId()))
+    assertThat(service.resolveTableMetadataLocation(orders, snap.handle()))
         .as("orders: post-snapshot must see v2")
         .hasValue("s3://orders/v2.json");
-    assertThat(service.resolveTableMetadataLocation(customers, snap.txnSnapshotId()))
+    assertThat(service.resolveTableMetadataLocation(customers, snap.handle()))
         .as("customers: post-snapshot must see v2")
         .hasValue("s3://customers/v2.json");
   }
@@ -289,7 +288,7 @@ class MultiTableAtomicityTest {
     singleCommit(customers, "s3://customers/v1.json");
 
     // Reader pins a snapshot here.
-    TxnSnapshotRow readerSnap = service.createTransactionSnapshot(3600);
+    var readerSnap = service.createTransactionSnapshot(3600);
 
     // Writer batch-commits new versions.
     batchCommitWithSharedScn(
@@ -297,18 +296,18 @@ class MultiTableAtomicityTest {
         new CommittedTableSnapshotRow(customers, 0L, null, "s3://customers/v2.json"));
 
     // Reader's snapshot: both tables still at v1.
-    assertThat(service.resolveTableMetadataLocation(orders, readerSnap.txnSnapshotId()))
+    assertThat(service.resolveTableMetadataLocation(orders, readerSnap.handle()))
         .as("orders should be at v1 under reader's snapshot")
         .hasValue("s3://orders/v1.json");
-    assertThat(service.resolveTableMetadataLocation(customers, readerSnap.txnSnapshotId()))
+    assertThat(service.resolveTableMetadataLocation(customers, readerSnap.handle()))
         .as("customers should be at v1 under reader's snapshot")
         .hasValue("s3://customers/v1.json");
 
     // Fresh snapshot after commit: both tables at v2.
-    TxnSnapshotRow freshSnap = service.createTransactionSnapshot(3600);
-    assertThat(service.resolveTableMetadataLocation(orders, freshSnap.txnSnapshotId()))
+    var freshSnap = service.createTransactionSnapshot(3600);
+    assertThat(service.resolveTableMetadataLocation(orders, freshSnap.handle()))
         .hasValue("s3://orders/v2.json");
-    assertThat(service.resolveTableMetadataLocation(customers, freshSnap.txnSnapshotId()))
+    assertThat(service.resolveTableMetadataLocation(customers, freshSnap.handle()))
         .hasValue("s3://customers/v2.json");
   }
 

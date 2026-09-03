@@ -408,7 +408,7 @@ public class PolarisRESTCatalogTest {
 
     TableIdentifier ident =
         TableIdentifier.of(org.apache.iceberg.catalog.Namespace.of("ns"), "orders");
-    String location = catalog.resolveTableMetadataLocation(ident, 47L);
+    String location = catalog.resolveTableMetadataLocation(ident, "handle-47");
 
     assertThat(location).isEqualTo("file:///tmp/v5.metadata.json");
 
@@ -421,7 +421,8 @@ public class PolarisRESTCatalogTest {
             eq(org.apache.iceberg.rest.responses.LoadTableResponse.class),
             anyMap(),
             any());
-    assertThat(queryCaptor.getValue()).containsEntry("txn_snapshot_id", "47");
+    // The read-point rides the wire as the opaque handle string under the txn_snapshot key.
+    assertThat(queryCaptor.getValue()).containsEntry("txn_snapshot", "handle-47");
   }
 
   private void initializeCatalog() {

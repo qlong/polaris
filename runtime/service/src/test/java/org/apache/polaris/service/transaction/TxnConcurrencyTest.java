@@ -40,7 +40,6 @@ import org.apache.polaris.persistence.relational.jdbc.DatabaseType;
 import org.apache.polaris.persistence.relational.jdbc.DatasourceOperations;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence;
 import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.CommittedTableSnapshotRow;
-import org.apache.polaris.persistence.relational.jdbc.JdbcTransactionPersistence.TxnSnapshotRow;
 import org.apache.polaris.persistence.relational.jdbc.RelationalJdbcConfiguration;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -191,16 +190,15 @@ class TxnConcurrencyTest {
 
     // Reader: wait for orders commit, acquire snapshot, signal writer to proceed
     assertThat(ordersCommitted.await(5, TimeUnit.SECONDS)).isTrue();
-    TxnSnapshotRow snap = service.createTransactionSnapshot(300);
+    var snap = service.createTransactionSnapshot(300);
     snapshotAcquired.countDown();
     writer.join(5_000);
     assertThat(writerErrors).isEmpty();
 
     // At snap: orders committed before snap (visible), customers committed after (not visible)
-    Optional<String> ordersAtSnap =
-        service.resolveTableMetadataLocation(ordersUuid, snap.txnSnapshotId());
+    Optional<String> ordersAtSnap = service.resolveTableMetadataLocation(ordersUuid, snap.handle());
     Optional<String> customersAtSnap =
-        service.resolveTableMetadataLocation(customersUuid, snap.txnSnapshotId());
+        service.resolveTableMetadataLocation(customersUuid, snap.handle());
 
     assertThat(ordersAtSnap).as("orders should be visible at the pinned snapshot").isPresent();
     assertThat(ordersAtSnap.get()).isEqualTo("s3://orders/v2.json");
@@ -209,10 +207,10 @@ class TxnConcurrencyTest {
         .isEmpty();
 
     // A fresh snapshot (acquired after both commits) sees both — confirming the data is there
-    TxnSnapshotRow freshSnap = service.createTransactionSnapshot(300);
-    assertThat(service.resolveTableMetadataLocation(ordersUuid, freshSnap.txnSnapshotId()))
+    var freshSnap = service.createTransactionSnapshot(300);
+    assertThat(service.resolveTableMetadataLocation(ordersUuid, freshSnap.handle()))
         .hasValue("s3://orders/v2.json");
-    assertThat(service.resolveTableMetadataLocation(customersUuid, freshSnap.txnSnapshotId()))
+    assertThat(service.resolveTableMetadataLocation(customersUuid, freshSnap.handle()))
         .hasValue("s3://customers/v2.json");
   }
 

@@ -71,6 +71,23 @@ public class TransactionReaper {
   /** Default reaper interval in seconds. */
   public static final long DEFAULT_INTERVAL_SECONDS = 60L;
 
+  /**
+   * Retention lease for standalone read handles, in seconds. A handle whose read point falls below
+   * {@code read_floor(SNAPSHOT_LEASE_SECONDS, SKEW_PAD_SECONDS)} was minted longer ago than this
+   * and is treated as expired for purge purposes. Standalone reads carry no row, so this time bound
+   * is what keeps a live reader's {@code committed_table_snapshots} rows from being purged out from
+   * under it. Set to the maximum lease any client uses (the Trino resolver renews at 3600s; the
+   * server's own default snapshot lease is 300s) so the reaper is conservative for every client.
+   */
+  public static final long SNAPSHOT_LEASE_SECONDS = 3600L;
+
+  /**
+   * Clock-skew / in-flight padding added to the lease before treating a read handle as expired.
+   * Guards against a handle minted moments before the reaper runs on a node whose clock trails the
+   * DB, and against a request still in flight at the lease boundary.
+   */
+  public static final long SKEW_PAD_SECONDS = 30L;
+
   private final Instance<DataSource> dataSources;
   private final DatasourceOperations datasourceOperations;
   private final String realmsCsv;
@@ -225,16 +242,18 @@ public class TransactionReaper {
         JdbcTransactionPersistence perCatalog =
             new JdbcTransactionPersistence(
                 ds, datasourceOperations.getDatabaseType(), realm, catalogId);
-        // Purge horizon = MIN(read_point) over live snapshots (in-progress REPEATABLE_READ writers
-        // are covered via their linked live snapshot). With no live snapshots, everything below the
-        // current commit_scn is purgeable (the per-table survivor rule still keeps each table's
-        // latest row). read_point / commit_scn share the per-catalog commit clock, so they compare
-        // directly.
-        long minLive = perCatalog.minLiveReadPointForCatalog();
-        long watermark;
-        try (java.sql.Connection conn = ds.getConnection()) {
-          watermark = minLive >= 0 ? minLive : perCatalog.currentCommitScn(conn);
-        }
+        // Purge horizon W = MIN(write_floor, read_floor):
+        //  - write_floor = MIN(read_point) over live WRITE snapshots (in-progress REPEATABLE_READ
+        //    writers keep a linked live txn_snapshots row). Exact — we own those rows. -1 (no live
+        //    write) ⟹ +infinity (writes impose no floor).
+        //  - read_floor = MAX(commit_scn) among committed_table_snapshots old enough that any
+        //    standalone read handle referencing them must have exceeded its lease. Standalone reads
+        //    no longer persist a row, so this time-based floor is what protects a live reader.
+        // read_point / commit_scn share the per-catalog commit clock, so they compare directly.
+        long writeFloor = perCatalog.minLiveReadPointForCatalog();
+        long writeFloorOrInf = writeFloor >= 0 ? writeFloor : Long.MAX_VALUE;
+        long readFloor = perCatalog.readFloor(SNAPSHOT_LEASE_SECONDS, SKEW_PAD_SECONDS);
+        long watermark = Math.min(writeFloorOrInf, readFloor);
         if (watermark <= 0) {
           continue;
         }

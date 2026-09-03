@@ -415,6 +415,10 @@ CREATE INDEX IF NOT EXISTS idx_cts_table_txn
 CREATE INDEX IF NOT EXISTS idx_cts_txn
     ON committed_table_snapshots (commit_scn);
 
+-- Supports read_floor: MAX(commit_scn) over rows older than (now - lease - skew), by catalog.
+CREATE INDEX IF NOT EXISTS idx_cts_committed_at
+    ON committed_table_snapshots (realm_id, catalog_id, committed_at);
+
 -- Per-(realm, catalog) transactional commit clock. Allocated as
 -- `UPDATE ... SET scn = scn + 1` inside the commit transaction; the row lock is
 -- held until commit, so commit_scn order == commit order. See postgres schema

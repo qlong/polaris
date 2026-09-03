@@ -293,13 +293,14 @@ class TestXEngineRepeatableRead:
 
                 resp = polaris_client.post("/transaction-snapshots", {"lease_seconds": 300})
                 resp.raise_for_status()
-                snap_id = resp.json()["txn_snapshot_id"]
-                trino_snapshot["id"] = snap_id
+                handle = resp.json()["txn_snapshot"]
+                trino_snapshot["id"] = handle
 
                 cur = trino_conn.cursor()
-                # Pin Trino to this snapshot
+                # Pin Trino to this snapshot. polaris_read_snapshot is a string session
+                # property carrying the opaque, case-sensitive base64url handle verbatim.
                 cur.execute(
-                    f"SET SESSION {trino_catalog}.polaris_read_snapshot = {int(snap_id)}"
+                    f"SET SESSION {trino_catalog}.polaris_read_snapshot = '{handle}'"
                 )
                 cur.fetchall()  # consume SET SESSION result
 
@@ -322,11 +323,11 @@ class TestXEngineRepeatableRead:
                 trino_in_txn_done.set()
                 readers_done.wait(timeout=60)
 
-                # Release the snapshot ("end transaction")
-                polaris_client.delete(f"/transaction-snapshots/{snap_id}")
+                # Standalone read handles are TTL-reclaimed — there is no server-side
+                # release. "Ending the transaction" just detaches this session.
                 trino_snapshot.pop("id", None)
 
-                # After releasing the snapshot: clear polaris_read_snapshot and re-read
+                # After detaching: clear polaris_read_snapshot and re-read
                 cur.execute(f"RESET SESSION {trino_catalog}.polaris_read_snapshot")
                 cur.fetchall()
                 cur.execute(f"SELECT count(*) FROM {trino_catalog}.{ns}.orders")
@@ -387,12 +388,8 @@ class TestXEngineRepeatableRead:
         t_tr.join(timeout=120)
         t_wr.join(timeout=120)
 
-        # Release Trino snapshot if it was never released (e.g., error path)
-        if "id" in trino_snapshot:
-            try:
-                polaris_client.delete(f"/transaction-snapshots/{trino_snapshot['id']}")
-            except Exception:
-                pass
+        # Standalone read handles have no server-side release (TTL-reclaimed); nothing
+        # to clean up even on the error path.
 
         if errors:
             raise AssertionError(

@@ -467,17 +467,18 @@ public class PolarisRESTCatalog implements PolarisCatalog, Closeable {
   }
 
   /**
-   * GET /v1/{prefix}/namespaces/{ns}/tables/{table}?txn_snapshot_id={id} Calls the standard Iceberg
-   * loadTable endpoint with a Polaris extension query param. Returns the metadata-location pinned
-   * to the given transaction snapshot.
+   * GET /v1/{prefix}/namespaces/{ns}/tables/{table}?txn_snapshot={handle} Calls the standard
+   * Iceberg loadTable endpoint with a Polaris extension query param. Returns the metadata-location
+   * pinned to the given transaction snapshot. {@code txnSnapshot} is an opaque, server-minted
+   * handle; the client echoes it verbatim and never parses it.
    */
-  public String resolveTableMetadataLocation(TableIdentifier identifier, long txnSnapshotId) {
+  public String resolveTableMetadataLocation(TableIdentifier identifier, String txnSnapshot) {
     LoadTableResponse response =
         restClient
             .withAuthSession(this.catalogAuth)
             .get(
                 pathGenerator.table(identifier),
-                Map.of("txn_snapshot_id", String.valueOf(txnSnapshotId)),
+                Map.of("txn_snapshot", txnSnapshot),
                 LoadTableResponse.class,
                 Map.of(),
                 ErrorHandlers.tableErrorHandler());

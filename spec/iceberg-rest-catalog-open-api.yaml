@@ -965,15 +965,16 @@ paths:
             type: string
             enum: [ all, refs ]
         - in: query
-          name: txn_snapshot_id
+          name: txn_snapshot
           description: >
-            Optional Polaris multi-table transaction snapshot ID. When set, the server resolves
-            the table metadata location visible under that snapshot (consistent read) instead of
-            the catalog's current pointer.
+            Optional opaque Polaris multi-table read-point handle. When set, the server decodes it
+            (fail-closed) and resolves the table metadata location visible at that read point
+            (consistent read) instead of the catalog's current pointer. The value is the `txn_snapshot`
+            string returned by createTransactionSnapshot or on a REPEATABLE_READ begin/subtransaction
+            response; the client echoes it verbatim and never parses it.
           required: false
           schema:
-            type: integer
-            format: int64
+            type: string
         - in: query
           name: txn_id
           description: >

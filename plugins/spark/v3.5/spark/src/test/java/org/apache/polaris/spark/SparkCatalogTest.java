@@ -809,11 +809,14 @@ public class SparkCatalogTest {
 
     // The single server-allocated staging path this worker operation writes to on every commit().
     Path tempDir = Files.createTempDirectory("polaris-worker-staging-");
-    String workerStagingPath = tempDir.resolve("15-18-fixedstaging.metadata.json").toUri().toString();
+    String workerStagingPath =
+        tempDir.resolve("15-18-fixedstaging.metadata.json").toUri().toString();
 
     // Simulate an active worker subtransaction for this table (READ_COMMITTED parent → no pin,
-    // resolveMetadataLocation stays empty; worker path is taken because isWorkerMode/isWorkerTable).
-    Mockito.when(catalog.txnManager.getConf(Mockito.any(), Mockito.eq(TransactionManager.CONF_TXN_ID)))
+    // resolveMetadataLocation stays empty; worker path is taken because
+    // isWorkerMode/isWorkerTable).
+    Mockito.when(
+            catalog.txnManager.getConf(Mockito.any(), Mockito.eq(TransactionManager.CONF_TXN_ID)))
         .thenReturn("15");
     Mockito.when(catalog.txnManager.isWorkerMode(Mockito.any())).thenReturn(true);
     Mockito.when(catalog.txnManager.isWorkerTable(Mockito.any(), Mockito.any())).thenReturn(true);
@@ -829,18 +832,17 @@ public class SparkCatalogTest {
       TableMetadata base = ops.current();
 
       // First commit stages to the fixed path.
-      TableMetadata firstUpdate =
-          base.replaceProperties(Collections.singletonMap("attempt", "1"));
+      TableMetadata firstUpdate = base.replaceProperties(Collections.singletonMap("attempt", "1"));
       assertThatCode(() -> ops.commit(base, firstUpdate))
           .as("first worker commit stages to the fixed path")
           .doesNotThrowAnyException();
 
       // Second commit to the SAME fixed path (re-attach / repeated INSERT). With overwrite this
       // must succeed; with strict create it would throw AlreadyExistsException.
-      TableMetadata secondUpdate =
-          base.replaceProperties(Collections.singletonMap("attempt", "2"));
+      TableMetadata secondUpdate = base.replaceProperties(Collections.singletonMap("attempt", "2"));
       assertThatCode(() -> ops.commit(base, secondUpdate))
-          .as("re-staging the same worker operation must overwrite, not throw AlreadyExistsException")
+          .as(
+              "re-staging the same worker operation must overwrite, not throw AlreadyExistsException")
           .doesNotThrowAnyException();
 
       // The staged metadata file exists at the fixed worker path, and the write was staged there.
@@ -865,7 +867,8 @@ public class SparkCatalogTest {
     props.put(TableCatalog.PROP_LOCATION, "file:///tmp/polaris-inline-freshpath/");
     catalog.createTable(ident, defaultSchema, new Transform[0], props);
 
-    // Pin reads so loadTable wraps in PinnedTableOperations, but NOT worker mode: the inline branch.
+    // Pin reads so loadTable wraps in PinnedTableOperations, but NOT worker mode: the inline
+    // branch.
     Path tempDir = Files.createTempDirectory("polaris-inline-pin-");
     String pinnedMetaPath = tempDir.resolve("v1.metadata.json").toUri().toString();
     TableMetadata pinnedMeta =
@@ -878,7 +881,8 @@ public class SparkCatalogTest {
     TableMetadataParser.write(
         pinnedMeta, new HadoopFileIO(new Configuration()).newOutputFile(pinnedMetaPath));
 
-    Mockito.when(catalog.txnManager.getConf(Mockito.any(), Mockito.eq(TransactionManager.CONF_TXN_ID)))
+    Mockito.when(
+            catalog.txnManager.getConf(Mockito.any(), Mockito.eq(TransactionManager.CONF_TXN_ID)))
         .thenReturn("42");
     Mockito.when(catalog.txnManager.resolveMetadataLocation(Mockito.any(), Mockito.any()))
         .thenReturn(Optional.of(pinnedMetaPath));

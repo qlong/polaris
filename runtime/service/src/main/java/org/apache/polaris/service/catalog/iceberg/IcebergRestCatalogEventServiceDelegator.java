@@ -368,7 +368,7 @@ public class IcebergRestCatalogEventServiceDelegator
       String accessDelegationMode,
       String ifNoneMatchString,
       String snapshots,
-      Long txnSnapshotId,
+      String txnSnapshot,
       Long txnId,
       RealmContext realmContext,
       SecurityContext securityContext) {
@@ -396,7 +396,7 @@ public class IcebergRestCatalogEventServiceDelegator
             accessDelegationMode,
             ifNoneMatchString,
             snapshots,
-            txnSnapshotId,
+            txnSnapshot,
             txnId,
             realmContext,
             securityContext);

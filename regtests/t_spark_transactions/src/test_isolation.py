@@ -27,9 +27,18 @@ writer's new rows.
 All multi-session tests use threading.Event for deterministic observer/writer
 synchronization.  Writer sessions are created via txn_spark.new_session() — they share
 the same JVM SparkContext but have independent session conf (no transaction state).
+
+NoCtsHistory tests (regression for the orElseThrow bug): a REPEATABLE READ transaction
+must be able to loadTable on a table that has no committed_table_snapshots rows at or
+below the snapshot's read_point.  Before the fix, the handler threw NoSuchTableException
+instead of falling through to the live table.  Tables created and seeded via direct
+Iceberg writes (CREATE TABLE + INSERT outside any Polaris transaction) have CTS rows, so
+the existing tests never hit this path.  These new tests use a table that is created but
+never written before the snapshot is taken — exactly the zero-CTS scenario.
 """
 
 import threading
+import uuid
 
 
 # ---------------------------------------------------------------------------
@@ -366,3 +375,140 @@ class TestConcurrentIsolation:
         assert results["s2_in"] == results["s2_pre"], (
             f"Session 2 REPEATABLE READ violated: pre={results['s2_pre']}, in={results['s2_in']}"
         )
+
+
+class TestNoCtsHistoryRepeatableRead:
+    """Regression tests for the orElseThrow bug.
+
+    When a REPEATABLE_READ transaction sends ?txn_snapshot=<handle> to loadTable and the
+    table has no committed_table_snapshots rows visible at that read_point, the handler
+    must fall through to the live table — not throw NoSuchTableException.
+
+    The standard test_ns fixture seeds tables via direct Iceberg writes BEFORE any
+    transaction is started, so those tables always have CTS rows.  These tests create a
+    fresh table *inside* the transaction (or just before, with no prior transaction
+    commits) to exercise the zero-CTS path.
+    """
+
+    def test_repeatable_read_on_empty_table_does_not_throw(self, txn_spark, catalog_name):
+        """loadTable under REPEATABLE_READ on a table with no CTS history must not 404.
+
+        Regression: IcebergCatalogHandler.loadTable used orElseThrow when
+        resolveTableMetadataLocation returned Optional.empty(), so a freshly-created table
+        (no committed_table_snapshots rows) threw NoSuchTableException instead of falling
+        through to the live table.
+        """
+        ns = f"txn_nocts_{uuid.uuid4().hex[:8]}"
+        cat = catalog_name
+        fq = f"{cat}.{ns}.fresh"
+
+        txn_spark.sql(f"CREATE NAMESPACE {cat}.{ns}")
+        try:
+            # Create the table but do NOT insert any rows — no CTS rows exist yet.
+            txn_spark.sql(f"""
+                CREATE TABLE {fq} (id INT, val STRING) USING iceberg
+            """)
+
+            # BEGIN a REPEATABLE_READ transaction and immediately read the empty table.
+            # Before the fix this threw NoSuchTableException (HTTP 404) from the handler's
+            # orElseThrow; after the fix it falls through to the live table and returns 0.
+            txn_spark.sql("BEGIN TRANSACTION")
+            try:
+                n = txn_spark.sql(f"SELECT count(*) FROM {fq}").collect()[0][0]
+                assert n == 0, f"Expected 0 rows in fresh table, got {n}"
+            finally:
+                txn_spark.sql("ROLLBACK")
+        finally:
+            try:
+                txn_spark.sql(f"DROP TABLE IF EXISTS {fq}")
+            except Exception:
+                pass
+            try:
+                txn_spark.sql(f"DROP NAMESPACE IF EXISTS {cat}.{ns}")
+            except Exception:
+                pass
+
+    def test_repeatable_read_pins_snapshot_after_write_to_previously_empty_table(
+        self, txn_spark, catalog_name
+    ):
+        """Writer inserts into a table that had no CTS rows when the observer began.
+
+        The observer's REPEATABLE_READ snapshot is taken before the writer's insert.
+        The observer must see the table as empty (zero CTS rows at snapshot time →
+        fall-through to live table's pre-insert state), while the writer's insert is
+        invisible inside the transaction and visible after COMMIT.
+        """
+        ns = f"txn_nocts_{uuid.uuid4().hex[:8]}"
+        cat = catalog_name
+        fq = f"{cat}.{ns}.fresh"
+
+        txn_spark.sql(f"CREATE NAMESPACE {cat}.{ns}")
+        try:
+            txn_spark.sql(f"CREATE TABLE {fq} (id INT, val STRING) USING iceberg")
+
+            snapshot_pinned = threading.Event()
+            writer_done = threading.Event()
+            results: dict = {}
+            errors: list = []
+
+            def observer():
+                try:
+                    txn_spark.sql("BEGIN TRANSACTION")
+                    # First read on a zero-CTS table — must not throw.
+                    pre = txn_spark.sql(f"SELECT count(*) FROM {fq}").collect()[0][0]
+                    results["pre"] = pre
+                    snapshot_pinned.set()
+                    writer_done.wait(timeout=60)
+                    # In-transaction read — must still see pre-writer count.
+                    in_txn = txn_spark.sql(f"SELECT count(*) FROM {fq}").collect()[0][0]
+                    results["in_txn"] = in_txn
+                    txn_spark.sql("COMMIT")
+                    # Post-commit — must see writer's row.
+                    txn_spark.sql(f"REFRESH TABLE {fq}")
+                    results["post"] = txn_spark.sql(
+                        f"SELECT count(*) FROM {fq}"
+                    ).collect()[0][0]
+                except Exception as exc:
+                    errors.append(exc)
+                    snapshot_pinned.set()
+                    writer_done.set()
+                    try:
+                        txn_spark.sql("ROLLBACK")
+                    except Exception:
+                        pass
+
+            def writer():
+                ws = txn_spark.new_session()
+                try:
+                    snapshot_pinned.wait(timeout=60)
+                    ws.sql(f"INSERT INTO {fq} VALUES (1, 'after-snapshot')")
+                except Exception as exc:
+                    errors.append(exc)
+                finally:
+                    writer_done.set()
+
+            obs_t = threading.Thread(target=observer, daemon=True)
+            wrt_t = threading.Thread(target=writer, daemon=True)
+            obs_t.start(); wrt_t.start()
+            obs_t.join(timeout=120); wrt_t.join(timeout=120)
+
+            if errors:
+                raise errors[0]
+
+            assert results["pre"] == 0, f"Table should be empty at BEGIN, got {results['pre']}"
+            assert results["in_txn"] == 0, (
+                f"REPEATABLE READ violated on zero-CTS table: "
+                f"pre={results['pre']}, in_txn={results['in_txn']}"
+            )
+            assert results["post"] == 1, (
+                f"Post-commit count wrong: expected 1, got {results['post']}"
+            )
+        finally:
+            try:
+                txn_spark.sql(f"DROP TABLE IF EXISTS {fq}")
+            except Exception:
+                pass
+            try:
+                txn_spark.sql(f"DROP NAMESPACE IF EXISTS {cat}.{ns}")
+            except Exception:
+                pass

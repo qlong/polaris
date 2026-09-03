@@ -34,6 +34,9 @@ public class TransactionRESTResponse implements RESTResponse {
   @JsonProperty("txn_snapshot_id")
   private Long txnSnapshotId;
 
+  @JsonProperty("txn_snapshot")
+  private String txnSnapshot;
+
   public TransactionRESTResponse() {}
 
   public long txnId() {
@@ -47,6 +50,14 @@ public class TransactionRESTResponse implements RESTResponse {
   /** Null for READ_COMMITTED transactions; set for REPEATABLE_READ. */
   public Long txnSnapshotId() {
     return txnSnapshotId;
+  }
+
+  /**
+   * Opaque, server-minted read-point handle. Null for READ_COMMITTED; set for REPEATABLE_READ. The
+   * client stores and echoes it verbatim (never parses it).
+   */
+  public String txnSnapshot() {
+    return txnSnapshot;
   }
 
   @Override

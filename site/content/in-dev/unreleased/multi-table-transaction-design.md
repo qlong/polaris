@@ -23,7 +23,7 @@
     - [The Server Process Stays Stateless Even Though Transactions Are Stateful](#the-server-process-stays-stateless-even-though-transactions-are-stateful)
     - [Why Transaction Coordination Cannot Be Pushed to the Engine or Client Side](#why-transaction-coordination-cannot-be-pushed-to-the-engine-or-client-side)
 
-> **Key insight — two kinds of "snapshot"**: The word "snapshot" has two distinct meanings in this system. A **`TxnSnapshot`** carries a single **`read_point`** — a monotonic commit-order value (a *commit timestamp*) captured when the snapshot is taken. It determines which committed table states a reader can see: a committed table snapshot is visible iff its `commit_scn <= read_point`. An **Iceberg table snapshot** (`table_snapshot_id`) is the native Iceberg point-in-time state of a table's data files. The catalog server maintains a `committed_table_snapshots` mapping table that translates a `read_point` into the specific Iceberg table snapshot to serve for each table. Pure readers acquire a `txn_snapshot_id` — lightweight, lock-free, no CLOG entry — and pass it on every table read; the server resolves the correct Iceberg table snapshot automatically. A query that reads multiple tables **must** use a shared `TxnSnapshot`; without one, successive reads can observe different committed states and produce a torn cross-table view.
+> **Key insight — two kinds of "snapshot"**: The word "snapshot" has two distinct meanings in this system. A **`TxnSnapshot`** carries a single **`read_point`** — a monotonic commit-order value (a *commit timestamp*) captured when the snapshot is taken. It determines which committed table states a reader can see: a committed table snapshot is visible iff its `commit_scn <= read_point`. An **Iceberg table snapshot** (`table_snapshot_id`) is the native Iceberg point-in-time state of a table's data files. The catalog server maintains a `committed_table_snapshots` mapping table that translates a `read_point` into the specific Iceberg table snapshot to serve for each table. Pure readers receive an opaque **`txn_snapshot` handle** — lightweight, lock-free, no CLOG entry — and pass it on every table read; the server decodes the handle and resolves the correct Iceberg table snapshot automatically. A query that reads multiple tables **must** use a shared `TxnSnapshot`; without one, successive reads can observe different committed states and produce a torn cross-table view.
 >
 > This is deliberately *simpler* than PostgreSQL's `pg_snapshot` `(xmin, xmax, xip_list)` triple. See [Why a single `read_point`](#why-a-single-read_point-and-not-xmin-xmax-xip) for why the triple is unnecessary in this model.
 
@@ -211,15 +211,17 @@ Without this mapping table, the catalog cannot answer "which table snapshot was 
 
 ### Do Readers Get a TxnID?
 
-No. A pure reader does **not** get a `txn_id`. It gets a `txn_snapshot_id` — a lightweight handle with no CLOG entry, no lock capability, and no write semantics. This is analogous to PostgreSQL's **virtual transaction IDs**: a real XID is only assigned when a transaction first writes. Read-only transactions consume no XID.
+No. A pure reader does **not** get a `txn_id`. It gets a **`txn_snapshot` handle** — an opaque string encoding `{v, r}` (version + `read_point`) with no CLOG entry, no lock capability, and no write semantics. This is analogous to PostgreSQL's **virtual transaction IDs**: a real XID is only assigned when a transaction first writes. Read-only transactions consume no XID.
+
+The handle is `base64url(JSON {"v":1,"r":<read_point>})` — URL-safe, unpadded, and opaque to the client. It encodes the read-point for opacity and evolvability (like a pagination cursor), not security. In a trusted-engine PoC, the handle is unsigned; a multi-tenant deployment would add an HMAC. Fail-closed: any malformed or tampered handle is rejected with `400 Bad Request`, never silently resolved to a default.
 
 There are three cases:
 
 | Case | Gets | Watermark contribution |
 |---|---|---|
-| Pure reader (SELECT) | `txn_snapshot_id` only | `MIN(txn_snapshot.read_point)` |
+| Pure reader (SELECT) | `txn_snapshot` handle only (no server row) | read floor: `MAX(commit_scn WHERE committed_at <= now - L)` |
 | Pure writer (optimistic append) | `txn_id` only | `MIN(txn_id) WHERE status=IN_PROGRESS` |
-| Read-write transaction (REPEATABLE READ, multi-table) | `txn_id` + embedded `read_point` | `MIN(read_point)` |
+| Read-write transaction (REPEATABLE READ, multi-table) | `txn_id` + embedded `read_point` (server row kept) | `MIN(read_point)` |
 
 A read-write transaction stores its `read_point` directly in the `transactions` row. All reads within that transaction use this embedded `read_point`, giving snapshot isolation (REPEATABLE READ) semantics. Read-your-own-writes is layered on top independently (staged metadata for the transaction's own `SUB_COMMITTED` subtransactions) and does not depend on the `read_point` — see the `txn_id` row in the next table.
 
@@ -229,23 +231,23 @@ When a client reads a table, the server resolves the appropriate Iceberg table s
 
 | Request | read_point Used | Table Snapshot Returned |
 |---|---|---|
-| `GET /tables/A` (no txn_snapshot_id) | Fresh: `read_point = current commit high-water-mark` | Latest committed table snapshot |
-| `GET /tables/A?txn_snapshot_id=RS` | RS from `txn_snapshots` table | Most recent table snapshot with `commit_scn <= RS.read_point` |
-| `GET /tables/A?txn_id=T` | Embedded `read_point` in transaction T | Most recent visible + RYOW (staged metadata if T has SUB_COMMITTED subtxn) |
+| `GET /tables/A` (no txn_snapshot) | Fresh: `read_point = current commit high-water-mark` | Latest committed table snapshot |
+| `GET /tables/A?txn_snapshot=<handle>` | Decoded from handle (fail-closed) | Most recent table snapshot with `commit_scn <= decoded.read_point` |
+| `GET /tables/A?txn_id=T` | Embedded `read_point` in transaction T's server row | Most recent visible + RYOW (staged metadata if T has SUB_COMMITTED subtxn) |
 
 **For any query that reads more than one table, the client must acquire a `TxnSnapshot` first and pass it on every read.** Without a shared `TxnSnapshot`, two successive GETs can observe different committed states and produce a torn cross-table view.
 
 The correct multi-table read pattern:
 
 ```
-1. POST /v1/txn-snapshots                            → txn_snapshot_id=RS, read_point=5050
-2. GET  /v1/tables/orders?txn_snapshot_id=RS         → table_snapshot_id=42 (visible to RS)
-3. GET  /v1/tables/customers?txn_snapshot_id=RS      → table_snapshot_id=17 (visible to RS)
+1. POST /v1/txn-snapshots                              → txn_snapshot=<handle>, read_point=5050
+2. GET  /v1/tables/orders?txn_snapshot=<handle>        → table_snapshot_id=42 (visible to RS)
+3. GET  /v1/tables/customers?txn_snapshot=<handle>     → table_snapshot_id=17 (visible to RS)
    Both tables are consistent at the same logical point in transaction history.
-4. DELETE /v1/txn-snapshots/RS                       → release (advance watermark)
+   (No DELETE needed — handles are reclaimed by TTL; L=3600s default)
 ```
 
-A `TxnSnapshot` is lightweight — no CLOG entry, no locks, no write state. Its only cost is pinning the purge watermark via its `read_point`.
+A `TxnSnapshot` handle is lightweight — no CLOG entry, no locks, no write state, no server row for standalone reads. Its only cost is advancing the GC watermark's read floor, bounded by `L` (default 3600 s).
 
 ### Relationship to Iceberg Time Travel
 
@@ -269,7 +271,7 @@ So the two are complementary — resolver + executor — and there are two valid
 
 **Prefer snapshot-ids over timestamps for the time-travel path.** `FOR VERSION AS OF <snapshot-id>` reads an exact snapshot and is always safe. `FOR TIMESTAMP AS OF t` resolves to the newest snapshot with `timestamp-ms <= t`, so to hit a specific snapshot `S` you must choose `t` in the half-open interval `[S.timestamp-ms, next_snapshot.timestamp-ms)` — fragile under non-monotonic writer clocks, same-millisecond snapshots, or a snapshot landing between resolution and read. A per-table timestamp is therefore only safe when *derived from* the already-resolved snapshot-id — i.e. once you have solved problem 1 anyway, the timestamp is just a lossy encoding of the snapshot-id you already hold.
 
-**Consistent `AS OF <timestamp>`, done correctly.** The design *can* offer a genuinely consistent wall-clock `AS OF ts1` — by routing it through the resolver: translate `ts1` once into a single cutoff, `read_point = MAX(commit_scn) WHERE committed_at <= ts1`, then apply that one `read_point` uniformly to all tables. This converts the unreliable per-table wall-clock lookup into the reliable global commit order. Caveat: this is only as precise as the `committed_at` clock resolution and assumes commits are timestamped monotonically at the catalog; for transactional correctness prefer handing out `read_point` (or `txn_snapshot_id`) directly, and treat the `ts1` path as a convenience for humans who think in timestamps.
+**Consistent `AS OF <timestamp>`, done correctly.** The design *can* offer a genuinely consistent wall-clock `AS OF ts1` — by routing it through the resolver: translate `ts1` once into a single cutoff, `read_point = MAX(commit_scn) WHERE committed_at <= ts1`, then apply that one `read_point` uniformly to all tables. This converts the unreliable per-table wall-clock lookup into the reliable global commit order. Caveat: this is only as precise as the `committed_at` clock resolution and assumes commits are timestamped monotonically at the catalog; for transactional correctness prefer handing out a `txn_snapshot` handle (which encodes the `read_point`) directly, and treat the `ts1` path as a convenience for humans who think in timestamps.
 
 ### Lock
 
@@ -399,9 +401,9 @@ CREATE INDEX txn_op_subtxn_idx ON transaction_operations (subtxn_id);
 CREATE INDEX txn_op_table_idx ON transaction_operations (table_uuid, txn_id);
 ```
 
-### `txn_snapshots` — Reader Visibility Snapshots
+### `txn_snapshots` — Reader Visibility Snapshots (Write Path Only)
 
-Pure readers (no writes) get a row here and pass its `txn_snapshot_id` on every table read. Read-write transactions (`REPEATABLE_READ`) also get a row here; the `transactions` row references it via `txn_snapshot_id`. `READ_COMMITTED` transactions do not pin a snapshot — they take a fresh `read_point` per statement.
+**Standalone readers no longer get a row here.** They receive an opaque `txn_snapshot` handle (encoded `{v, r}`) and the server decodes it on each `loadTable` call — no insert, no server row. The table is used exclusively by the **write path**: a `REPEATABLE_READ` write transaction gets a row and the `transactions` row references it via `txn_snapshot_id`. `READ_COMMITTED` transactions do not pin a snapshot.
 
 ```sql
 CREATE TABLE txn_snapshots (
@@ -481,7 +483,7 @@ LIMIT 1;
 
 This query returns the most recently committed Iceberg table snapshot that is visible to the given `TxnSnapshot` — the exact Iceberg metadata pointer the reader should use to scan data files.
 
-For an unregistered read (no `txn_snapshot_id`), the equivalent is simply the latest committed row (no cutoff):
+For an unregistered read (no `txn_snapshot` handle), the equivalent is simply the latest committed row (no cutoff):
 
 ```sql
 SELECT iceberg_snapshot_id, metadata_location
@@ -721,22 +723,22 @@ Simple, stateless. Equivalent to PostgreSQL `READ COMMITTED` for a single statem
 ### Multi-Table Consistent Read (New)
 
 ```
-1. Client: POST /v1/transactions/snapshot
+1. Client: POST /v1/txn-snapshots
    → Server captures read_point = current commit high-water-mark
-   → Returns snapshot_id=S
+   → Encodes it into handle = base64url({"v":1,"r":<read_point>})
+   → Returns { txn_snapshot: "<handle>", read_point: <informational> }
 
-2. Client: GET /v1/namespaces/ns/tables/orders?snapshot_id=S
-   → Server returns latest committed metadata for orders where commit_scn <= S.read_point
+2. Client: GET /v1/namespaces/ns/tables/orders?txn_snapshot=<handle>
+   → Server decodes handle → extracts read_point (fail-closed: malformed → 400)
+   → Returns latest committed metadata for orders where commit_scn <= read_point
 
-3. Client: GET /v1/namespaces/ns/tables/customers?snapshot_id=S
+3. Client: GET /v1/namespaces/ns/tables/customers?txn_snapshot=<handle>
    → Same visibility rule — both tables observed at same logical point in time
 
-4. Client: DELETE /v1/transactions/snapshots/S
-   → Releases snapshot; watermark can advance past S.read_point
-   → (Also released automatically when S.expires_at is reached)
+   (No DELETE needed — handles are TTL-reclaimed; L = 3600 s)
 ```
 
-No `txn_id` is created. No CLOG entry. The snapshot is a pure read artifact — lightweight, lock-free, and cheap to acquire. The cost is only the watermark pin: the catalog cannot purge transaction history older than `S.read_point` until S is released.
+No `txn_id` is created. No CLOG entry. No server row for standalone reads. The handle is a pure read artifact — lightweight, lock-free, and cheap to acquire (one `SELECT` of the commit counter, zero inserts). The GC cost is one `read_floor` advance per catalog per reaper tick, not one row per handle.
 
 ### Single-Table Optimistic Write (Current Behavior, Unchanged)
 
@@ -806,33 +808,32 @@ A single `TxnSnapshot` or a single `txn_id` can be shared across multiple indepe
 
 This is the read analog of PostgreSQL's `pg_export_snapshot()` / `SET TRANSACTION SNAPSHOT`, which was designed for parallel consistent reads (e.g., parallel `pg_dump`).
 
-**Pattern:** An orchestrator acquires one `TxnSnapshot` at pipeline start and distributes the `txn_snapshot_id` to all reader applications. Every application — regardless of when it physically starts — reads at the same logical point in time. Results from different applications can be safely joined or compared.
+**Pattern:** An orchestrator acquires one `TxnSnapshot` at pipeline start and distributes the `txn_snapshot` handle to all reader applications. Every application — regardless of when it physically starts — reads at the same logical point in time. Results from different applications can be safely joined or compared.
 
 ```
 Orchestrator:
   POST /v1/txn-snapshots
-  ← { txn_snapshot_id: RS, read_point: 5050, expires_at: ... }
+  ← { txn_snapshot: "eyJ2IjoxLCJyIjo1MDUwfQ", read_point: 5050 }
+  (handle = base64url({"v":1,"r":5050}))
 
-  → passes txn_snapshot_id=RS to SparkApp1 (reads orders)
-  → passes txn_snapshot_id=RS to SparkApp2 (reads customers)
-  → passes txn_snapshot_id=RS to SparkApp3 (reads products)
+  → passes handle to SparkApp1 (reads orders)
+  → passes handle to SparkApp2 (reads customers)
+  → passes handle to SparkApp3 (reads products)
 
-SparkApp1: GET /tables/orders?txn_snapshot_id=RS     → table_snapshot_id=42
-SparkApp2: GET /tables/customers?txn_snapshot_id=RS  → table_snapshot_id=17   (parallel)
-SparkApp3: GET /tables/products?txn_snapshot_id=RS   → table_snapshot_id=31   (parallel)
+SparkApp1: GET /tables/orders?txn_snapshot=<handle>     → table_snapshot_id=42
+SparkApp2: GET /tables/customers?txn_snapshot=<handle>  → table_snapshot_id=17   (parallel)
+SparkApp3: GET /tables/products?txn_snapshot=<handle>   → table_snapshot_id=31   (parallel)
 
   All three apps see a consistent cross-table state as of read_point=5050.
-  RS.read_point pins the watermark for the duration.
-
-Orchestrator (after all apps complete):
-  DELETE /v1/txn-snapshots/RS  → release; watermark advances
+  The handle is self-contained — no server row to release; the read floor
+  advances automatically after L seconds.
 ```
 
 **Key properties:**
-- RS is acquired *once*, at the moment the pipeline is scheduled — not when each job happens to start.
+- The handle is acquired *once*, at the moment the pipeline is scheduled — not when each job happens to start.
 - A job that starts 10 minutes late (cluster contention) still sees the same data as the job that started immediately.
-- Single watermark pin regardless of how many applications share RS.
-- RS is a read-only token: any bearer can read with it; no application can write using it.
+- The handle is a plain string — any bearer can read with it; no application can write using it.
+- No explicit release needed: GC is TTL-based (`L = 3600 s`); the orchestrator may discard the handle after all apps complete.
 
 ### Write Side: Shared txn_id Across Applications (Parallel Ingestion)
 
@@ -902,11 +903,11 @@ On any app failure:
 |---|---|---|
 | Acquired by | Orchestrator | Orchestrator |
 | Distributed to | All reader apps | One subtxn credential per writer app |
-| Apps share | Same `txn_snapshot_id` | Same `txn_id`; each has unique `subtxn_token` |
-| Top-level token held by | Orchestrator (releases snapshot) | Orchestrator (commits/aborts txn) |
-| App-level capability | Read any table at RS | Write assigned table; commit own subtxn only |
-| Finalization | Orchestrator releases RS | Orchestrator calls `T1/commit` |
-| Failure handling | Orchestrator releases RS early | Orchestrator calls `T1/abort` |
+| Apps share | Same `txn_snapshot` handle (opaque string) | Same `txn_id`; each has unique `subtxn_token` |
+| Top-level token held by | Orchestrator (discards handle when done) | Orchestrator (commits/aborts txn) |
+| App-level capability | Read any table at the encoded read_point | Write assigned table; commit own subtxn only |
+| Finalization | No action needed; TTL-reclaimed after `L` s | Orchestrator calls `T1/commit` |
+| Failure handling | No action needed; handle expires naturally | Orchestrator calls `T1/abort` |
 
 ---
 
@@ -1062,36 +1063,34 @@ Even if App1 and App2 each acquire their own snapshot independently, they still 
 ```
 -- Orchestrator acquires ONE snapshot before launching any app:
 Orchestrator: POST /v1/txn-snapshots
-  ← { txn_snapshot_id: RS, read_point: 5010 }
-  (captured before W commits at commit_scn=5011)
+  ← { txn_snapshot: "eyJ2IjoxLCJyIjo1MDEwfQ", read_point: 5010 }
+  (captured before W commits at commit_scn=5011; handle encodes read_point=5010)
 
--- Orchestrator passes RS to both apps:
-App1: GET /tables/orders?txn_snapshot_id=RS
+-- Orchestrator passes the handle to both apps:
+App1: GET /tables/orders?txn_snapshot=<handle>
   → W's commit (commit_scn=5011 > read_point=5010) is NOT visible
   → returns table_snapshot_id=42  ✓
 
-App2: GET /tables/customers?txn_snapshot_id=RS
+App2: GET /tables/customers?txn_snapshot=<handle>
   → Same visibility rule: W excluded
   → returns table_snapshot_id=17 (pre-W state)  ✓
 
 Both apps see the same pre-W consistent state regardless of when each app physically started.
-
--- Orchestrator releases RS after both apps complete:
-Orchestrator: DELETE /v1/txn-snapshots/RS  → watermark advances
+No explicit release needed — handle expires after L seconds.
 ```
 
-**What if the orchestrator wants to include W?** Acquire RS *after* W commits:
+**What if the orchestrator wants to include W?** Acquire a handle *after* W commits:
 ```
 -- W commits at commit_scn=5011
 Orchestrator: POST /v1/txn-snapshots
-  ← { txn_snapshot_id: RS2, read_point: 5011 }
+  ← { txn_snapshot: "eyJ2IjoxLCJyIjo1MDExfQ", read_point: 5011 }
   (captures state after W)
 
-App1: GET /tables/orders?txn_snapshot_id=RS2    → W visible (5011 <= 5011)
-App2: GET /tables/customers?txn_snapshot_id=RS2 → W visible ✓
+App1: GET /tables/orders?txn_snapshot=<handle2>    → W visible (5011 <= 5011)
+App2: GET /tables/customers?txn_snapshot=<handle2> → W visible ✓
 ```
 
-**Result**: The orchestrator controls exactly which committed state all apps observe — by choosing *when* to acquire the shared snapshot. Single watermark pin regardless of how many apps share it.
+**Result**: The orchestrator controls exactly which committed state all apps observe — by choosing *when* to acquire the shared snapshot. The handle is a plain string; any number of apps can share it with zero server-side coordination.
 
 ---
 
@@ -1336,7 +1335,7 @@ SparkApp1                   SparkApp2                   SparkApp3
   ← COMMITTED
 
 -- All three tables become visible simultaneously. ✓
--- Readers using txn_snapshot_id acquired after commit see all three updated. ✓
+-- Readers using a txn_snapshot handle acquired after commit see all three updated. ✓
 ```
 
 **Failure: SparkApp2 crashes mid-run**
@@ -1469,28 +1468,28 @@ WHERE read_point < :cts_watermark
 
 ### TxnSnapshot Management
 
-Used by pure readers that need a consistent multi-table view. No `txn_id` or CLOG entry is created. The `TxnSnapshot` captures a single `read_point` and is used by the server to resolve the correct Iceberg table snapshot via `committed_table_snapshots`.
+Used by pure readers that need a consistent multi-table view. No `txn_id` or CLOG entry is created. The server captures a `read_point`, encodes it into an opaque string handle, and returns it. No server row is inserted — the handle is self-contained and reclaimed purely by TTL (`L = 3600 s` hardcoded; the reaper advances the read floor once all handles older than `L + skew_pad` are past their horizon).
 
 ```
 POST   /v1/txn-snapshots
-  ← { txn_snapshot_id, read_point, expires_at }
-
-DELETE /v1/txn-snapshots/{txn_snapshot_id}          Release (advance watermark)
-POST   /v1/txn-snapshots/{txn_snapshot_id}/renew    Extend expiry for long-running jobs
+  ← { txn_snapshot: "<opaque handle>", read_point: <informational>, expires_at: null }
+  -- txn_snapshot is base64url({"v":1,"r":<read_point>}); ~18–46 chars
+  -- expires_at is null for standalone read handles (TTL is server-side, not per-handle)
+  -- No DELETE or renew endpoint for standalone read handles
 ```
 
-Pass `txn_snapshot_id` on every table read to get a consistent point-in-time view across all tables:
+Pass `txn_snapshot` on every table read to get a consistent point-in-time view across all tables:
 
 ```
-GET /v1/{prefix}/namespaces/{ns}/tables/{table}?txn_snapshot_id={txn_snapshot_id}
+GET /v1/{prefix}/namespaces/{ns}/tables/{table}?txn_snapshot={handle}
 ```
 
-The server resolves the Iceberg table snapshot using:
+The server decodes the handle (fail-closed: malformed → `400`), extracts `read_point`, and resolves the Iceberg table snapshot:
 ```sql
 SELECT iceberg_snapshot_id, metadata_location
 FROM committed_table_snapshots
 WHERE table_uuid = <table>
-  AND commit_scn <= read_point
+  AND commit_scn <= :read_point   -- from decoded handle
 ORDER BY commit_scn DESC LIMIT 1;
 ```
 
@@ -1577,7 +1576,7 @@ GET    /v1/tables/{table_uuid}/locks                 Inspect active locks on a t
 
 ```
 GET /v1/{prefix}/namespaces/{namespace}/tables/{table}
-    ?snapshot_id={snapshot_id}   optional: read at a specific snapshot point
+    ?txn_snapshot={handle}       optional: consistent pinned read (opaque handle from POST /txn-snapshots)
     &txn_id={txn_id}             optional: read-your-own-writes within a transaction
 ```
 
@@ -1745,13 +1744,13 @@ Note that the reaper is the same mechanism that handles crashed clients — ther
 
 ### TxnSnapshot Watermark Pinning
 
-A client creates many `TxnSnapshot`s with the maximum allowed `expires_at`, then never releases them. The watermark (`min(read_point)` across all active snapshots) is pinned at an old value, preventing purging of the CLOG, `committed_table_snapshots`, and `subtransactions` tables. The catalog DB grows unboundedly.
+With the handle-based read path, standalone reads create **no server row** and therefore cannot pin the watermark indefinitely. The read floor (`MAX(commit_scn WHERE committed_at <= now - L)`) advances automatically every reaper tick — it is bounded by `L` (3600 s default), not by whether clients release handles.
 
-**Mitigations:**
+The remaining pinning risk is from **write-path** `txn_snapshots` rows held by long-running `REPEATABLE_READ` transactions. Mitigations are the same as for any long-running transaction:
 
-- **Maximum snapshot TTL.** Cap `expires_at` to a reasonable maximum (e.g., 24 hours for batch jobs, configurable by admin).
-- **Snapshot count limit per principal.** Prevent a single client from holding an unlimited number of active snapshots simultaneously.
-- **Admin force-expiry.** Operators can explicitly release a snapshot via an admin API, advancing the watermark regardless of `expires_at`.
+- **Maximum transaction TTL.** Cap `expires_at` to a reasonable maximum (e.g., 24 hours for large ETL jobs, configurable by admin).
+- **Active-transaction count limit per principal.** Prevent a single client from holding an unlimited number of concurrent `IN_PROGRESS` transactions.
+- **Reaper.** Expires transactions (and their linked snapshot rows) past `expires_at`, bounding the maximum watermark pin duration.
 
 ---
 

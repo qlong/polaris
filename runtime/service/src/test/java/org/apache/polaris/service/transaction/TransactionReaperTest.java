@@ -24,6 +24,8 @@ import static org.mockito.Mockito.when;
 
 import jakarta.enterprise.inject.Instance;
 import java.io.InputStream;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
@@ -215,18 +217,24 @@ class TransactionReaperTest {
 
   /**
    * Exercises {@link TransactionReaper#runOnce()} through its real orchestration — catalog
-   * discovery, per-catalog horizon (MIN(read_point) over live snapshots, else current commit_scn),
-   * watermark upsert, and per-table survivor purge — plus the expired-transaction reap, all in one
-   * pass.
+   * discovery, per-catalog watermark {@code W = MIN(write_floor, read_floor)}, watermark upsert,
+   * and per-table survivor purge — plus the expired-transaction reap, all in one pass.
+   *
+   * <p>Standalone read snapshots are now opaque handles that persist <em>no</em> {@code
+   * txn_snapshots} row, so a catalog with only standalone readers has {@code write_floor = -1}
+   * (treated as +infinity) and its horizon is driven entirely by {@code read_floor}: the highest
+   * {@code commit_scn} whose {@code committed_at} is older than the lease+skew, i.e. past the point
+   * where any live read handle could still reference it. This test ages the older commits past that
+   * horizon and leaves the newest fresh.
    *
    * <p>Setup, all in realm {@link #REALM}:
    *
    * <ul>
-   *   <li><b>Catalog A</b> ({@link #CATALOG_ID}): table t1 committed at commit_scn 1, 2, then a
-   *       <em>live</em> snapshot is pinned (read_point = 2), then t1 committed again at 3. Horizon
-   *       = 2 → keep scn 2 (survivor) and 3 (above), delete scn 1.
-   *   <li><b>Catalog B</b> ({@link #CATALOG_ID_B}): table t2 committed at 1, 2; no live snapshot.
-   *       Horizon = current commit_scn = 2 → keep scn 2 (survivor), delete scn 1.
+   *   <li><b>Catalog A</b> ({@link #CATALOG_ID}): table t1 committed at commit_scn 1, 2, 3; scn 1
+   *       and 2 aged past the lease horizon, scn 3 left fresh. read_floor = 2 → keep scn 2
+   *       (survivor) and 3 (above, still protected), delete scn 1.
+   *   <li><b>Catalog B</b> ({@link #CATALOG_ID_B}): table t2 committed at 1, 2; both aged past the
+   *       horizon. read_floor = 2 → keep scn 2 (survivor), delete scn 1.
    *   <li>One expired IN_PROGRESS transaction in catalog A holding an EXCLUSIVE lock, to confirm
    *       the reap path runs in the same pass.
    * </ul>
@@ -235,18 +243,25 @@ class TransactionReaperTest {
   void runOnceReapsExpiredAndPurgesPerCatalogWithSurvivor() throws Exception {
     JdbcTransactionPersistence persistenceB =
         new JdbcTransactionPersistence(dataSource, DatabaseType.H2, REALM, CATALOG_ID_B);
-    TransactionService serviceA = new TransactionService(persistence, lockManager);
 
-    // Catalog A: t1 @1, @2 ; pin a live snapshot at read_point=2 ; then t1 @3.
+    // Catalog A: t1 @1, @2, @3.
     commitTable(persistence, "t1", "s3://a/t1-v1.json"); // scn 1
     commitTable(persistence, "t1", "s3://a/t1-v2.json"); // scn 2
-    TxnSnapshotRow liveSnapA = serviceA.createTransactionSnapshot(3600); // read_point = 2, live
-    assertThat(liveSnapA.readPoint()).isEqualTo(2L);
     commitTable(persistence, "t1", "s3://a/t1-v3.json"); // scn 3
 
-    // Catalog B: t2 @1, @2 ; no live snapshot.
+    // Catalog B: t2 @1, @2.
     commitTable(persistenceB, "t2", "s3://b/t2-v1.json"); // scn 1
     commitTable(persistenceB, "t2", "s3://b/t2-v2.json"); // scn 2
+
+    // Age scn 1 and 2 of both catalogs past the lease+skew horizon so read_floor = 2 for each;
+    // leave
+    // catalog A's scn 3 fresh (within the lease) so it stays above the horizon and is never purged.
+    long pastHorizonSeconds =
+        TransactionReaper.SNAPSHOT_LEASE_SECONDS + TransactionReaper.SKEW_PAD_SECONDS + 60;
+    ageCommittedRow(CATALOG_ID, 1L, pastHorizonSeconds);
+    ageCommittedRow(CATALOG_ID, 2L, pastHorizonSeconds);
+    ageCommittedRow(CATALOG_ID_B, 1L, pastHorizonSeconds);
+    ageCommittedRow(CATALOG_ID_B, 2L, pastHorizonSeconds);
 
     // An expired transaction in catalog A holding a lock, to verify reap runs too.
     TransactionRow expired = insertExpiredTransaction();
@@ -262,9 +277,9 @@ class TransactionReaperTest {
         .isEqualTo(JdbcTransactionPersistence.TXN_STATUS_ABORTED);
     assertThat(persistence.findGrantedLocksOnResource(RESOURCE, -1L)).isEmpty();
 
-    // --- Catalog A watermark + survivor purge (horizon = 2 from the live snapshot) ---
+    // --- Catalog A watermark + survivor purge (read_floor = 2; scn 3 fresh, above the horizon) ---
     assertThat(persistence.getWatermark())
-        .as("catalog A watermark = live snapshot read_point")
+        .as("catalog A watermark = read_floor over aged commits")
         .isEqualTo(2L);
     // scn 1 purged (strictly below the per-table survivor at scn 2)
     assertThat(persistence.resolveTableSnapshot("t1", syntheticSnapshot(CATALOG_ID, 1L))).isEmpty();
@@ -275,10 +290,10 @@ class TransactionReaperTest {
     assertThat(persistence.resolveTableSnapshot("t1", syntheticSnapshot(CATALOG_ID, 3L)))
         .hasValueSatisfying(r -> assertThat(r.metadataLocation()).isEqualTo("s3://a/t1-v3.json"));
 
-    // --- Catalog B watermark + survivor purge (no live snapshot → horizon = current commit_scn =
+    // --- Catalog B watermark + survivor purge (no live write snapshot → watermark = read_floor =
     // 2) ---
     assertThat(persistenceB.getWatermark())
-        .as("catalog B watermark = current commit_scn (no live snapshot)")
+        .as("catalog B watermark = read_floor over aged commits")
         .isEqualTo(2L);
     assertThat(persistenceB.resolveTableSnapshot("t2", syntheticSnapshot(CATALOG_ID_B, 1L)))
         .isEmpty();
@@ -317,5 +332,24 @@ class TransactionReaperTest {
     Instant now = Instant.now();
     return new TxnSnapshotRow(
         1L, REALM, catalogId, readPoint, now, now.plus(1, ChronoUnit.HOURS), null);
+  }
+
+  /**
+   * Backdates a committed_table_snapshots row's {@code committed_at} by {@code seconds} so it falls
+   * past the reaper's lease+skew horizon, making {@code read_floor} include it.
+   */
+  private void ageCommittedRow(long catalogId, long commitScn, long seconds) throws Exception {
+    String sql =
+        "UPDATE POLARIS_SCHEMA.committed_table_snapshots "
+            + "SET committed_at = DATEADD('SECOND', -?, now()) "
+            + "WHERE realm_id = ? AND catalog_id = ? AND commit_scn = ?";
+    try (Connection conn = dataSource.getConnection();
+        PreparedStatement ps = conn.prepareStatement(sql)) {
+      ps.setLong(1, seconds);
+      ps.setString(2, REALM);
+      ps.setLong(3, catalogId);
+      ps.setLong(4, commitScn);
+      ps.executeUpdate();
+    }
   }
 }

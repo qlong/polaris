@@ -895,6 +895,17 @@ public class JdbcTransactionPersistence {
    */
   public Optional<CommittedTableSnapshotRow> resolveTableSnapshot(
       @Nonnull String tableUuid, @Nonnull TxnSnapshotRow snapshot) throws SQLException {
+    return resolveTableSnapshot(tableUuid, snapshot.readPoint());
+  }
+
+  /**
+   * Resolves the per-table metadata location visible at commit-order cutoff {@code readPoint} — the
+   * newest commit with {@code commit_scn <= readPoint}. This is the representation-independent
+   * form: the read point may come from a live {@code txn_snapshots} row (write path) or be decoded
+   * from an opaque handle (standalone read path); both resolve identically.
+   */
+  public Optional<CommittedTableSnapshotRow> resolveTableSnapshot(
+      @Nonnull String tableUuid, long readPoint) throws SQLException {
 
     String sql =
         "SELECT table_uuid, commit_scn, iceberg_snapshot_id, metadata_location "
@@ -909,7 +920,7 @@ public class JdbcTransactionPersistence {
       ps.setString(idx++, realmId);
       ps.setLong(idx++, catalogId);
       ps.setString(idx++, tableUuid);
-      ps.setLong(idx++, snapshot.readPoint());
+      ps.setLong(idx++, readPoint);
 
       try (ResultSet rs = ps.executeQuery()) {
         if (rs.next()) {
@@ -1219,6 +1230,45 @@ public class JdbcTransactionPersistence {
           }
         }
         return -1L;
+      }
+    }
+  }
+
+  /**
+   * The {@code read_floor}: the highest {@code commit_scn} whose row is old enough that any
+   * standalone read handle referencing it must already have exceeded its lease. Standalone reads no
+   * longer persist a {@code txn_snapshots} row, so they contribute nothing to {@link
+   * #minLiveReadPointForCatalog()}; instead their retention is bounded by time. A handle minted at
+   * or below this scn was issued more than {@code (leaseSeconds + skewPadSeconds)} ago, so its
+   * lease has expired and the rows it could resolve are safe to purge.
+   *
+   * <p>Uses {@code committed_table_snapshots.(committed_at, commit_scn)} directly as the time→scn
+   * map — no separate checkpoint table. Returns {@code 0} when no row is old enough (NULL from
+   * {@code MAX}).
+   */
+  public long readFloor(long leaseSeconds, long skewPadSeconds) throws SQLException {
+    long cutoffSeconds = leaseSeconds + skewPadSeconds;
+    String interval =
+        dbType == DatabaseType.H2
+            ? "DATEADD('SECOND', -?, now())"
+            : "now() - make_interval(secs => ?)";
+    String sql =
+        "SELECT MAX(commit_scn) FROM POLARIS_SCHEMA.committed_table_snapshots "
+            + "WHERE realm_id = ? AND catalog_id = ? AND committed_at <= "
+            + interval;
+    try (Connection conn = dataSource.getConnection();
+        PreparedStatement ps = conn.prepareStatement(sql)) {
+      ps.setString(1, realmId);
+      ps.setLong(2, catalogId);
+      ps.setLong(3, cutoffSeconds);
+      try (ResultSet rs = ps.executeQuery()) {
+        if (rs.next()) {
+          long v = rs.getLong(1);
+          if (!rs.wasNull()) {
+            return v;
+          }
+        }
+        return 0L;
       }
     }
   }

@@ -220,12 +220,11 @@ public class TransactionManager {
       // read_point — read-only, no locks, no writes. This is the consuming side of Pillar 2.
       String attached = getConf(spark, CONF_ATTACHED_SNAPSHOT_ID);
       if (attached != null) {
-        long snapId = Long.parseLong(attached);
-        String metadataLocation = restCatalog.resolveTableMetadataLocation(ident, snapId);
+        String metadataLocation = restCatalog.resolveTableMetadataLocation(ident, attached);
         LOG.debug(
             "Resolved pinned metadata location for {} at ATTACHED snapshot {}: {}",
             ident,
-            snapId,
+            attached,
             metadataLocation);
         return Optional.of(metadataLocation);
       }
@@ -241,8 +240,8 @@ public class TransactionManager {
 
     ensureTransactionStarted(spark);
 
-    String snapIdStr = getConf(spark, CONF_TXN_SNAPSHOT_ID);
-    if (snapIdStr == null) {
+    String snapHandle = getConf(spark, CONF_TXN_SNAPSHOT_ID);
+    if (snapHandle == null) {
       // ACTIVE but READ_COMMITTED (no pinned snapshot) — reads use the latest committed version.
       // For a worker session, SparkCatalog.loadTable still wraps the live table in
       // PinnedTableOperations (using the live metadata as the base) so writes stage to the
@@ -251,13 +250,12 @@ public class TransactionManager {
       return Optional.empty();
     }
 
-    // ACTIVE + REPEATABLE_READ — resolve via pinned snapshot
-    long snapId = Long.parseLong(snapIdStr);
-    String metadataLocation = restCatalog.resolveTableMetadataLocation(ident, snapId);
+    // ACTIVE + REPEATABLE_READ — resolve via pinned snapshot (opaque handle, echoed verbatim)
+    String metadataLocation = restCatalog.resolveTableMetadataLocation(ident, snapHandle);
     LOG.debug(
         "Resolved pinned metadata location for {} at snapshot {}: {}",
         ident,
-        snapId,
+        snapHandle,
         metadataLocation);
     return Optional.of(metadataLocation);
   }
@@ -272,13 +270,13 @@ public class TransactionManager {
    * @throws IllegalStateException if a local transaction is already in progress (its own pin would
    *     conflict with the attached one — commit/rollback the local transaction first)
    */
-  public void attachSnapshot(SparkSession spark, long txnSnapshotId) {
+  public void attachSnapshot(SparkSession spark, String txnSnapshot) {
     if (getConf(spark, CONF_PENDING_ISOLATION) != null) {
       throw new IllegalStateException(
           "Cannot USE SNAPSHOT while a transaction is in progress. COMMIT or ROLLBACK first.");
     }
-    setConf(spark, CONF_ATTACHED_SNAPSHOT_ID, String.valueOf(txnSnapshotId));
-    LOG.debug("Attached session reads to external snapshot {}", txnSnapshotId);
+    setConf(spark, CONF_ATTACHED_SNAPSHOT_ID, txnSnapshot);
+    LOG.debug("Attached session reads to external snapshot {}", txnSnapshot);
   }
 
   /**
@@ -325,16 +323,16 @@ public class TransactionManager {
         restCatalog.beginTransaction(pendingIsolation, DEFAULT_LEASE_SECONDS);
     setConf(spark, CONF_TXN_ID, String.valueOf(txn.txnId()));
     setConf(spark, CONF_TXN_TOKEN, txn.txnToken());
-    Long snapId = txn.txnSnapshotId();
-    if (snapId != null) {
-      setConf(spark, CONF_TXN_SNAPSHOT_ID, String.valueOf(snapId));
+    String snapHandle = txn.txnSnapshot();
+    if (snapHandle != null) {
+      setConf(spark, CONF_TXN_SNAPSHOT_ID, snapHandle);
     }
     System.out.println(
         "Transaction started  txn_id="
             + txn.txnId()
             + ", txn_token="
             + txn.txnToken()
-            + (snapId != null ? ", txn_snapshot_id=" + snapId : ", (READ_COMMITTED)"));
+            + (snapHandle != null ? ", txn_snapshot=" + snapHandle : ", (READ_COMMITTED)"));
   }
 
   // -------------------------------------------------------------------------
@@ -409,8 +407,8 @@ public class TransactionManager {
     GetSubtransactionRESTResponse info = restCatalog.getSubtransaction(subtxnId, subtxnToken);
     setConf(spark, CONF_PENDING_ISOLATION, DEFAULT_ISOLATION);
     setConf(spark, CONF_TXN_ID, String.valueOf(info.txnId()));
-    if (info.txnSnapshotId() != null) {
-      setConf(spark, CONF_TXN_SNAPSHOT_ID, String.valueOf(info.txnSnapshotId()));
+    if (info.txnSnapshot() != null) {
+      setConf(spark, CONF_TXN_SNAPSHOT_ID, info.txnSnapshot());
     }
     setConf(spark, CONF_WORKER_SUBTXN_ID, String.valueOf(subtxnId));
     setConf(spark, CONF_WORKER_SUBTXN_TOKEN, subtxnToken);

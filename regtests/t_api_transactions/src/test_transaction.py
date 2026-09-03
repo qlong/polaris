@@ -128,12 +128,19 @@ class TestTransactionLifecycle:
             f"Expected 401/403, got {resp.status_code}: {resp.text}"
         )
 
-    def test_load_table_at_txn_snapshot_id(self, client, txn, namespace, table_orders):
-        """loadTable with txn_snapshot_id from a REPEATABLE_READ txn returns metadata-location."""
-        snap_id = txn["txn_snapshot_id"]
+    def test_load_table_at_txn_snapshot_handle(self, client, txn, namespace, table_orders):
+        """loadTable with the txn's opaque txn_snapshot handle returns metadata-location.
+
+        The write-linked transaction keeps its numeric txn_snapshot_id (for locking /
+        write_floor / revocation) but also exports the uniform string ``txn_snapshot``
+        handle — the same read wire standalone snapshots use. loadTable takes only the
+        string param now; the numeric id is not a query parameter.
+        """
+        handle = txn["txn_snapshot"]
+        assert handle, "REPEATABLE_READ txn must export a non-empty txn_snapshot handle"
         resp = client.iceberg_get(
             f"/namespaces/{namespace}/tables/{table_orders}",
-            params={"txn_snapshot_id": snap_id},
+            params={"txn_snapshot": handle},
         )
         assert resp.status_code == 200
         assert resp.json().get("metadata-location"), "metadata-location must be non-empty"

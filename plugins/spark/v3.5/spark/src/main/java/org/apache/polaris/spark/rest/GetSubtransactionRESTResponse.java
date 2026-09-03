@@ -40,6 +40,9 @@ public class GetSubtransactionRESTResponse implements RESTResponse {
   @JsonProperty("txn_snapshot_id")
   private Long txnSnapshotId;
 
+  @JsonProperty("txn_snapshot")
+  private String txnSnapshot;
+
   @JsonProperty("assigned_staging_path")
   private String assignedStagingPath;
 
@@ -57,6 +60,11 @@ public class GetSubtransactionRESTResponse implements RESTResponse {
 
   public Long txnSnapshotId() {
     return txnSnapshotId;
+  }
+
+  /** Opaque, server-minted read-point handle; stored and echoed verbatim. */
+  public String txnSnapshot() {
+    return txnSnapshot;
   }
 
   public String assignedStagingPath() {

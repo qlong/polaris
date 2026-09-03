@@ -77,29 +77,28 @@ public class TransactionService {
   // TxnSnapshot (read-only consistency handles)
   // ---------------------------------------------------------------------------
 
-  /**
-   * Acquires a new read-consistent snapshot. The returned {@link TxnSnapshotRow} carries a single
-   * {@code read_point} (a commit-order cutoff) captured atomically, giving the caller a pinned view
-   * across all subsequent {@code loadTable?txn_snapshot_id=X} calls.
-   */
-  public TxnSnapshotRow createTransactionSnapshot(int leaseSeconds) throws SQLException {
-    long id = persistence.nextTxnId();
-    long readPoint = persistence.captureReadPoint();
+  /** A newly minted standalone read snapshot: an opaque handle plus its captured read point. */
+  public record MintedSnapshot(String handle, long readPoint) {}
 
-    int effectiveLease = leaseSeconds > 0 ? leaseSeconds : DEFAULT_SNAPSHOT_LEASE_SECONDS;
-    Instant now = Instant.now();
-    TxnSnapshotRow row =
-        new TxnSnapshotRow(
-            id,
-            persistence.getRealmId(),
-            persistence.getCatalogId(),
-            readPoint,
-            now,
-            now.plus(effectiveLease, ChronoUnit.SECONDS),
-            null);
-    persistence.insertTxnSnapshot(row);
-    LOGGER.info("TxnSnapshot created: id={} read_point={}", id, readPoint);
-    return row;
+  /**
+   * Acquires a new read-consistent snapshot for standalone (non-transactional) reads. Captures a
+   * single {@code read_point} (a commit-order cutoff) atomically and mints an opaque handle
+   * carrying it, giving the caller a pinned view across all subsequent {@code
+   * loadTable?txn_snapshot=X} calls.
+   *
+   * <p>No {@code txn_snapshots} row is inserted: the handle is self-describing and is reclaimed by
+   * the reaper's time-based {@code read_floor} once its lease elapses. {@code leaseSeconds} is
+   * accepted for API symmetry but is not persisted — retention is governed globally by the reaper's
+   * configured lease.
+   */
+  public MintedSnapshot createTransactionSnapshot(int leaseSeconds) throws SQLException {
+    long readPoint = persistence.captureReadPoint();
+    String handle = TxnSnapshotHandle.encode(readPoint);
+    LOGGER.info(
+        "TxnSnapshot minted (handle-only): read_point={} requested_lease_seconds={}",
+        readPoint,
+        leaseSeconds);
+    return new MintedSnapshot(handle, readPoint);
   }
 
   public TxnSnapshotRow getTransactionSnapshot(long txnSnapshotId) throws SQLException {
@@ -107,6 +106,26 @@ public class TransactionService {
         .findTxnSnapshot(txnSnapshotId)
         .orElseThrow(
             () -> new NotFoundException("Transaction snapshot not found: " + txnSnapshotId));
+  }
+
+  /**
+   * Derives the opaque read-point handle for a write-linked snapshot row so a response can carry
+   * the uniform string read wire ({@code txn_snapshot}) alongside the numeric {@code
+   * txn_snapshot_id}. The write path keeps its live row; this only re-expresses that row's read
+   * point as a handle a client can echo on {@code loadTable?txn_snapshot=X}. Returns {@code null}
+   * when {@code snapId} is {@code null} (e.g. a READ_COMMITTED transaction has no pinned snapshot).
+   */
+  public String encodeHandleForSnapshot(Long snapId) throws SQLException {
+    if (snapId == null) {
+      return null;
+    }
+    TxnSnapshotRow row = getTransactionSnapshot(snapId);
+    return TxnSnapshotHandle.encode(row.readPoint());
+  }
+
+  /** Encodes a handle directly from a snapshot row, without a lookup. */
+  public String encodeHandleForSnapshot(TxnSnapshotRow row) {
+    return TxnSnapshotHandle.encode(row.readPoint());
   }
 
   public void releaseTransactionSnapshot(long txnSnapshotId) throws SQLException {
@@ -811,7 +830,8 @@ public class TransactionService {
       // Determine the baseline visible at transaction-begin time (REPEATABLE_READ only).
       String baselineMeta = null;
       if (txn.txnSnapshotId() != null) {
-        baselineMeta = resolveTableMetadataLocation(snapshotKey, txn.txnSnapshotId()).orElse(null);
+        baselineMeta =
+            resolveTableMetadataLocationByRow(snapshotKey, txn.txnSnapshotId()).orElse(null);
       }
 
       boolean conflict = baselineMeta != null && !baselineMeta.equals(currentMeta);
@@ -1002,10 +1022,31 @@ public class TransactionService {
   // ---------------------------------------------------------------------------
 
   /**
-   * Resolves the metadata location for {@code tableUuid} as visible under {@code txnSnapshotId}.
-   * Returns {@link Optional#empty()} if the table had no commits visible under this snapshot.
+   * Resolves the metadata location for {@code tableUuid} as visible under the opaque read-point
+   * {@code handle} (standalone read path). The handle is decoded fail-closed: a malformed handle
+   * throws {@link BadRequestException} rather than falling back to the latest state. Returns {@link
+   * Optional#empty()} if the table had no commits visible at the handle's read point.
+   *
+   * <p>The handle's read point is authoritative; there is no server row to look up, and the lease
+   * is enforced globally by the reaper's {@code read_floor} GC (a handle whose read point has been
+   * purged resolves to {@link Optional#empty()} → the caller surfaces a fail-closed 404).
    */
-  public Optional<String> resolveTableMetadataLocation(String tableUuid, long txnSnapshotId)
+  public Optional<String> resolveTableMetadataLocation(String tableUuid, String handle)
+      throws SQLException {
+    TxnSnapshotHandle.Payload payload = TxnSnapshotHandle.decode(handle);
+    return persistence
+        .resolveTableSnapshot(tableUuid, payload.readPoint())
+        .map(CommittedTableSnapshotRow::metadataLocation);
+  }
+
+  /**
+   * Resolves the metadata location for {@code tableUuid} as visible under a write-linked snapshot
+   * row (REPEATABLE_READ transaction baseline). Unlike the standalone read path this consults the
+   * live {@code txn_snapshots} row: the write path owns that row (it is lockable, revocable, and
+   * abortable), and its expiry/release is meaningful. Returns {@link Optional#empty()} if the table
+   * had no commits visible under the row's read point.
+   */
+  public Optional<String> resolveTableMetadataLocationByRow(String tableUuid, long txnSnapshotId)
       throws SQLException {
     TxnSnapshotRow snap =
         persistence

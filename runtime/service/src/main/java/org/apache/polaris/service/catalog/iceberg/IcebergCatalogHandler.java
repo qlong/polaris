@@ -751,7 +751,7 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
       TableIdentifier tableIdentifier,
       IfNoneMatch ifNoneMatch,
       String snapshots,
-      Optional<Long> txnSnapshotId,
+      Optional<String> txnSnapshot,
       Optional<Long> txnId) {
     return loadTable(
         tableIdentifier,
@@ -759,7 +759,7 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
         ifNoneMatch,
         EnumSet.noneOf(AccessDelegationMode.class),
         Optional.empty(),
-        txnSnapshotId,
+        txnSnapshot,
         txnId);
   }
 
@@ -801,7 +801,7 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
       IfNoneMatch ifNoneMatch,
       String snapshots,
       Optional<String> refreshCredentialsEndpoint,
-      Optional<Long> txnSnapshotId,
+      Optional<String> txnSnapshot,
       Optional<Long> txnId) {
     return loadTable(
         tableIdentifier,
@@ -809,7 +809,7 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
         ifNoneMatch,
         EnumSet.of(VENDED_CREDENTIALS),
         refreshCredentialsEndpoint,
-        txnSnapshotId,
+        txnSnapshot,
         txnId);
   }
 
@@ -1068,7 +1068,7 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
       IfNoneMatch ifNoneMatch,
       EnumSet<AccessDelegationMode> delegationModes,
       Optional<String> refreshCredentialsEndpoint,
-      Optional<Long> txnSnapshotId,
+      Optional<String> txnSnapshot,
       Optional<Long> txnId) {
 
     Set<PolarisStorageActions> actionsRequested =
@@ -1076,7 +1076,7 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
     Optional<AccessDelegationMode> resolvedMode = resolveAccessDelegationModes(delegationModes);
 
     boolean txnScopedRead =
-        txnSnapshotId.map(id -> id != null && id > 0).orElse(false)
+        txnSnapshot.map(s -> s != null && !s.isBlank()).orElse(false)
             || txnId.map(id -> id != null && id > 0).orElse(false);
 
     if (ifNoneMatch != null && !txnScopedRead) {
@@ -1102,7 +1102,7 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
     if (txnScopedRead) {
       if (!(baseCatalog instanceof IcebergCatalog icebergCatalog)) {
         throw new BadRequestException(
-            "txn_snapshot_id and txn_id are only supported for native Polaris-managed catalogs");
+            "txn_snapshot and txn_id are only supported for native Polaris-managed catalogs");
       }
       IcebergTableLikeEntity te = getTableEntity(tableIdentifier);
       if (te == null) {
@@ -1124,20 +1124,18 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
             Long linkedSnapId = txnService.getTransaction(txnId.get()).txnSnapshotId();
             if (linkedSnapId != null) {
               metadataLocation =
-                  txnService.resolveTableMetadataLocation(tableUuid, linkedSnapId).orElse(null);
+                  txnService
+                      .resolveTableMetadataLocationByRow(tableUuid, linkedSnapId)
+                      .orElse(null);
             }
           }
         }
         if (metadataLocation == null
-            && txnSnapshotId.map(id -> id != null && id > 0).orElse(false)) {
+            && txnSnapshot.map(s -> s != null && !s.isBlank()).orElse(false)) {
           metadataLocation =
               txnService
-                  .resolveTableMetadataLocation(tableUuid, txnSnapshotId.get())
-                  .orElseThrow(
-                      () ->
-                          new NoSuchTableException(
-                              "No committed metadata visible for table %s under this snapshot",
-                              tableIdentifier));
+                  .resolveTableMetadataLocation(tableUuid, txnSnapshot.get())
+                  .orElse(null);
         }
         if (metadataLocation != null) {
           TableMetadata tableMetadata =

@@ -96,7 +96,10 @@ public class TransactionManagerTest {
     // Tests that use different values can override this mock locally.
     GetSubtransactionRESTResponse defaultSubtxnInfo = mock(GetSubtransactionRESTResponse.class);
     when(defaultSubtxnInfo.txnId()).thenReturn(7L);
-    when(defaultSubtxnInfo.txnSnapshotId()).thenReturn(99L);
+    // Under the all-string read wire the worker pins the parent's opaque read-point handle, not a
+    // numeric id. beginWorkerSubtransaction reads txnSnapshot() and stores it verbatim in
+    // CONF_TXN_SNAPSHOT_ID; the legacy numeric txnSnapshotId() is no longer consulted on this path.
+    when(defaultSubtxnInfo.txnSnapshot()).thenReturn("handle-99");
     when(defaultSubtxnInfo.assignedStagingPath()).thenReturn("file:///tmp/txn-42.metadata.json");
     when(defaultSubtxnInfo.tableUuid()).thenReturn("demo_ns.orders");
     when(mockRestCatalog.getSubtransaction(anyLong(), anyString())).thenReturn(defaultSubtxnInfo);
@@ -181,8 +184,9 @@ public class TransactionManagerTest {
     when(txnResp.txnId()).thenReturn(123L);
     when(txnResp.txnToken()).thenReturn("tok");
     when(txnResp.txnSnapshotId()).thenReturn(47L);
+    when(txnResp.txnSnapshot()).thenReturn("handle-abc");
     when(mockRestCatalog.beginTransaction(eq("REPEATABLE_READ"), anyInt())).thenReturn(txnResp);
-    when(mockRestCatalog.resolveTableMetadataLocation(any(), anyLong()))
+    when(mockRestCatalog.resolveTableMetadataLocation(any(), anyString()))
         .thenReturn("file:///tmp/metadata/v5.metadata.json");
 
     txnManager.begin(mockSpark, "REPEATABLE_READ");
@@ -197,8 +201,9 @@ public class TransactionManagerTest {
         .isEqualTo("123");
     assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG)))
         .isEqualTo("tok");
+    // The stored read-point is the opaque handle string, not a numeric id.
     assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_SNAPSHOT_ID, CATALOG)))
-        .isEqualTo("47");
+        .isEqualTo("handle-abc");
   }
 
   @Test
@@ -206,7 +211,7 @@ public class TransactionManagerTest {
     TransactionRESTResponse txnResp = mock(TransactionRESTResponse.class);
     when(txnResp.txnId()).thenReturn(99L);
     when(txnResp.txnToken()).thenReturn("tok");
-    when(txnResp.txnSnapshotId()).thenReturn(null); // READ_COMMITTED has no snapshot
+    when(txnResp.txnSnapshot()).thenReturn(null); // READ_COMMITTED has no snapshot
     when(mockRestCatalog.beginTransaction(eq("READ_COMMITTED"), anyInt())).thenReturn(txnResp);
 
     txnManager.begin(mockSpark, "READ_COMMITTED");
@@ -214,7 +219,7 @@ public class TransactionManagerTest {
     Optional<String> result = txnManager.resolveMetadataLocation(mockSpark, ident);
 
     assertThat(result).isEmpty();
-    verify(mockRestCatalog, never()).resolveTableMetadataLocation(any(), anyLong());
+    verify(mockRestCatalog, never()).resolveTableMetadataLocation(any(), anyString());
   }
 
   @Test
@@ -222,9 +227,9 @@ public class TransactionManagerTest {
     TransactionRESTResponse txnResp = mock(TransactionRESTResponse.class);
     when(txnResp.txnId()).thenReturn(123L);
     when(txnResp.txnToken()).thenReturn("tok");
-    when(txnResp.txnSnapshotId()).thenReturn(47L);
+    when(txnResp.txnSnapshot()).thenReturn("handle-abc");
     when(mockRestCatalog.beginTransaction(anyString(), anyInt())).thenReturn(txnResp);
-    when(mockRestCatalog.resolveTableMetadataLocation(any(), anyLong()))
+    when(mockRestCatalog.resolveTableMetadataLocation(any(), anyString()))
         .thenReturn("file:///tmp/v5.metadata.json");
 
     txnManager.begin(mockSpark, "REPEATABLE_READ");
@@ -241,27 +246,27 @@ public class TransactionManagerTest {
 
   @Test
   public void testAttachSnapshotResolvesWithoutLocalBegin() {
-    when(mockRestCatalog.resolveTableMetadataLocation(any(), eq(555L)))
+    when(mockRestCatalog.resolveTableMetadataLocation(any(), eq("handle-555")))
         .thenReturn("file:///tmp/pinned/v9.metadata.json");
 
     // No begin() — the session merely attaches to a coordinator's exported snapshot.
-    txnManager.attachSnapshot(mockSpark, 555L);
+    txnManager.attachSnapshot(mockSpark, "handle-555");
     TableIdentifier ident = TableIdentifier.of(Namespace.of("ns"), "orders");
     Optional<String> result = txnManager.resolveMetadataLocation(mockSpark, ident);
 
     assertThat(result).hasValue("file:///tmp/pinned/v9.metadata.json");
     // Never starts a local transaction to consume an external snapshot.
     verify(mockRestCatalog, never()).beginTransaction(anyString(), anyInt());
-    verify(mockRestCatalog).resolveTableMetadataLocation(any(), eq(555L));
+    verify(mockRestCatalog).resolveTableMetadataLocation(any(), eq("handle-555"));
     assertThat(confStore.get(String.format(TransactionManager.CONF_ATTACHED_SNAPSHOT_ID, CATALOG)))
-        .isEqualTo("555");
+        .isEqualTo("handle-555");
   }
 
   @Test
   public void testDetachSnapshotReturnsToLatest() {
-    when(mockRestCatalog.resolveTableMetadataLocation(any(), anyLong()))
+    when(mockRestCatalog.resolveTableMetadataLocation(any(), anyString()))
         .thenReturn("file:///tmp/pinned/v9.metadata.json");
-    txnManager.attachSnapshot(mockSpark, 555L);
+    txnManager.attachSnapshot(mockSpark, "handle-555");
     txnManager.detachSnapshot(mockSpark);
 
     TableIdentifier ident = TableIdentifier.of(Namespace.of("ns"), "orders");
@@ -275,7 +280,7 @@ public class TransactionManagerTest {
   @Test
   public void testIsAttachedSnapshotMode() {
     assertThat(txnManager.isAttachedSnapshotMode(mockSpark)).isFalse();
-    txnManager.attachSnapshot(mockSpark, 555L);
+    txnManager.attachSnapshot(mockSpark, "handle-555");
     assertThat(txnManager.isAttachedSnapshotMode(mockSpark)).isTrue();
     txnManager.detachSnapshot(mockSpark);
     assertThat(txnManager.isAttachedSnapshotMode(mockSpark)).isFalse();
@@ -285,7 +290,7 @@ public class TransactionManagerTest {
   public void testAttachSnapshotThrowsIfTransactionInProgress() {
     txnManager.begin(mockSpark, "REPEATABLE_READ");
 
-    assertThatThrownBy(() -> txnManager.attachSnapshot(mockSpark, 555L))
+    assertThatThrownBy(() -> txnManager.attachSnapshot(mockSpark, "handle-555"))
         .isInstanceOf(IllegalStateException.class)
         .hasMessageContaining("transaction is in progress");
   }
@@ -356,7 +361,7 @@ public class TransactionManagerTest {
     TransactionRESTResponse txnResp = mock(TransactionRESTResponse.class);
     when(txnResp.txnId()).thenReturn(10L);
     when(txnResp.txnToken()).thenReturn("tok10");
-    when(txnResp.txnSnapshotId()).thenReturn(50L);
+    when(txnResp.txnSnapshot()).thenReturn("handle-50");
     when(mockRestCatalog.beginTransaction(anyString(), anyInt())).thenReturn(txnResp);
     SubtransactionRESTResponse subtxnResp = mock(SubtransactionRESTResponse.class);
     when(mockRestCatalog.createSubtransaction(
@@ -382,7 +387,7 @@ public class TransactionManagerTest {
     assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_TOKEN, CATALOG)))
         .isEqualTo("tok10");
     assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_SNAPSHOT_ID, CATALOG)))
-        .isEqualTo("50");
+        .isEqualTo("handle-50");
   }
 
   @Test
@@ -434,7 +439,7 @@ public class TransactionManagerTest {
     assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_ID, CATALOG)))
         .isEqualTo("7");
     assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_SNAPSHOT_ID, CATALOG)))
-        .isEqualTo("99");
+        .isEqualTo("handle-99");
     assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_SUBTXN_ID, CATALOG)))
         .isEqualTo("42");
     assertThat(confStore.get(String.format(TransactionManager.CONF_WORKER_SUBTXN_TOKEN, CATALOG)))
@@ -639,7 +644,7 @@ public class TransactionManagerTest {
     // Server returns a 2-table subtransaction via operations[].
     GetSubtransactionRESTResponse info = mock(GetSubtransactionRESTResponse.class);
     when(info.txnId()).thenReturn(7L);
-    when(info.txnSnapshotId()).thenReturn(99L);
+    when(info.txnSnapshot()).thenReturn("handle-99");
     SubtransactionOperationRESTResponse op1 = mock(SubtransactionOperationRESTResponse.class);
     when(op1.tableUuid()).thenReturn("demo_ns.orders");
     when(op1.assignedStagingPath()).thenReturn("file:///tmp/orders-42.metadata.json");
@@ -672,7 +677,7 @@ public class TransactionManagerTest {
   public void testCommitMultiTableWorkerRequiresAtLeastOneStaged() {
     GetSubtransactionRESTResponse info = mock(GetSubtransactionRESTResponse.class);
     when(info.txnId()).thenReturn(7L);
-    when(info.txnSnapshotId()).thenReturn(99L);
+    when(info.txnSnapshot()).thenReturn("handle-99");
     SubtransactionOperationRESTResponse op1 = mock(SubtransactionOperationRESTResponse.class);
     when(op1.tableUuid()).thenReturn("demo_ns.orders");
     when(op1.assignedStagingPath()).thenReturn("file:///tmp/orders-42.metadata.json");

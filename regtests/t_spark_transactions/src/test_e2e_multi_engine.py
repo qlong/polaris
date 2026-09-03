@@ -693,7 +693,7 @@ class TestEndToEndSparkAndTrino:
         self, txn_spark, test_ns, catalog_name, polaris_client,
         trino_host, trino_port, trino_catalog
     ):
-        """Back-compat: SET SESSION polaris_read_snapshot still pins reads explicitly."""
+        """SET SESSION polaris_read_snapshot='<handle>' pins Trino reads explicitly."""
         _require_trino()
         ns = test_ns["ns"]
         cat = catalog_name
@@ -701,13 +701,15 @@ class TestEndToEndSparkAndTrino:
 
         resp = polaris_client.post("/transaction-snapshots", {"lease_seconds": 300})
         resp.raise_for_status()
-        snap_id = resp.json()["txn_snapshot_id"]
+        handle = resp.json()["txn_snapshot"]
 
         conn = _open_trino(trino_host, trino_port, trino_catalog, ns)
         try:
             cur = conn.cursor()
+            # polaris_read_snapshot is a string session property carrying the opaque,
+            # case-sensitive base64url handle verbatim.
             cur.execute(
-                f"SET SESSION {trino_catalog}.polaris_read_snapshot = {int(snap_id)}"
+                f"SET SESSION {trino_catalog}.polaris_read_snapshot = '{handle}'"
             )
             cur.fetchall()
 
@@ -725,9 +727,8 @@ class TestEndToEndSparkAndTrino:
                 f"Explicit snapshot pin violated: baseline={baseline}, pinned={pinned}"
             )
 
-            polaris_client.delete(f"/transaction-snapshots/{snap_id}")
-            snap_id = None
-
+            # Standalone read handles are TTL-reclaimed — there is no server-side
+            # release. Detaching is just RESET SESSION.
             cur.execute(f"RESET SESSION {trino_catalog}.polaris_read_snapshot")
             cur.fetchall()
             cur.execute(f"SELECT count(*) FROM {trino_catalog}.{ns}.orders")
@@ -736,11 +737,6 @@ class TestEndToEndSparkAndTrino:
                 f"After unpinning Trino should see the new row: baseline={baseline}, post={post}"
             )
         finally:
-            if snap_id is not None:
-                try:
-                    polaris_client.delete(f"/transaction-snapshots/{snap_id}")
-                except Exception:
-                    pass
             try:
                 conn.close()
             except Exception:

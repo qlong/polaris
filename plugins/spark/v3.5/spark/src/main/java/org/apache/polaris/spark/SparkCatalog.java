@@ -382,7 +382,8 @@ public class SparkCatalog
       if (workerStagingPath.isPresent()) {
         TableMetadataParser.overwrite(metadata, stagedMetadataFile); // worker: create-or-replace
       } else {
-        TableMetadataParser.write(metadata, stagedMetadataFile); // inline/orchestrator: strict create
+        TableMetadataParser.write(
+            metadata, stagedMetadataFile); // inline/orchestrator: strict create
       }
 
       // Map the Iceberg snapshot operation to a server LockMode. The server keys its

@@ -316,7 +316,7 @@ public class IcebergCatalogAdapter
       String accessDelegationMode,
       String ifNoneMatchString,
       String snapshots,
-      Long txnSnapshotId,
+      String txnSnapshot,
       Long txnId,
       RealmContext realmContext,
       SecurityContext securityContext) {
@@ -332,7 +332,7 @@ public class IcebergCatalogAdapter
       throw new BadRequestException("If-None-Match may not take the value of '*'");
     }
 
-    Optional<Long> txnSnapOpt = Optional.ofNullable(txnSnapshotId).filter(v -> v > 0);
+    Optional<String> txnSnapOpt = Optional.ofNullable(txnSnapshot).filter(s -> !s.isBlank());
     Optional<Long> txnIdOpt = Optional.ofNullable(txnId).filter(v -> v > 0);
 
     return withCatalog(

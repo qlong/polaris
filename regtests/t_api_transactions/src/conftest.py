@@ -109,17 +109,17 @@ def txn(client) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Function-scoped: managed snapshot (auto-released on teardown)
+# Function-scoped: managed snapshot (TTL-reclaimed, no teardown DELETE)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def snapshot(client) -> dict:
-    """Create a TxnSnapshot; yield its response dict; release on teardown."""
+    """Create a TxnSnapshot; yield its response dict.
+
+    Standalone read handles are opaque strings reclaimed purely by TTL — there is
+    no server-side DELETE for them, so teardown is a no-op.
+    """
     resp = client.post("/transaction-snapshots", {"lease_seconds": 60})
     resp.raise_for_status()
     data = resp.json()
     yield data
-    try:
-        client.delete(f"/transaction-snapshots/{data['txn_snapshot_id']}")
-    except Exception:
-        pass

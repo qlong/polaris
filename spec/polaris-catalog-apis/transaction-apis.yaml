@@ -32,9 +32,11 @@ paths:
         - Transaction API
       summary: Acquire a consistent read snapshot
       description: >
-        Creates a TxnSnapshot capturing a single read_point (a commit-order cutoff).
-        The caller can pass txn_snapshot_id on subsequent loadTable calls to
-        get a consistent multi-table view pinned to this snapshot.
+        Creates a read snapshot capturing a single read_point (a commit-order cutoff) and
+        returns it as an opaque `txn_snapshot` handle. The caller echoes the handle on subsequent
+        loadTable?txn_snapshot=<handle> calls to get a consistent multi-table view pinned to this
+        read point. Standalone read snapshots hold no server row: they are not addressable by id
+        (no GET/DELETE/renew) and are reclaimed by time-based GC once their lease elapses.
       operationId: createTransactionSnapshot
       requestBody:
         required: true
@@ -60,6 +62,8 @@ paths:
         5XX:
           $ref: '../iceberg-rest-catalog-open-api.yaml#/components/responses/ServerErrorResponse'
 
+  # These by-id endpoints address only write-linked snapshot rows (REPEATABLE_READ transactions).
+  # Standalone read snapshots are handle-only and TTL-reclaimed — they are not addressable here.
   /polaris/v1/{prefix}/transaction-snapshots/{txn-snapshot-id}:
     parameters:
       - $ref: '../iceberg-rest-catalog-open-api.yaml#/components/parameters/prefix'
@@ -73,7 +77,7 @@ paths:
     get:
       tags:
         - Transaction API
-      summary: Get a transaction snapshot by ID
+      summary: Get a write-linked transaction snapshot by row ID
       operationId: getTransactionSnapshot
       responses:
         200:
@@ -709,23 +713,22 @@ components:
     TransactionSnapshot:
       type: object
       required:
-        - txn_snapshot_id
-        - read_point
-        - expires_at
+        - txn_snapshot
       properties:
-        txn_snapshot_id:
-          type: integer
-          format: int64
+        txn_snapshot:
+          type: string
+          description: >
+            Opaque, server-minted read-point handle. The client stores it and echoes it
+            verbatim on loadTable?txn_snapshot=<handle> for consistent reads. Standalone read
+            snapshots carry no server row and are not addressable by id — they are reclaimed by
+            time-based GC once their lease elapses, so there is no GET/DELETE/renew for a handle.
         read_point:
           type: integer
           format: int64
           description: >
-            Commit-order high-water-mark at snapshot time. A committed table snapshot
-            is visible under this handle iff its commit_scn <= read_point.
+            Commit-order high-water-mark at snapshot time (informational). A committed table
+            snapshot is visible under this handle iff its commit_scn <= read_point.
         expires_at:
-          type: string
-          format: date-time
-        released_at:
           type: string
           format: date-time
 
@@ -761,7 +764,15 @@ components:
         txn_snapshot_id:
           type: integer
           format: int64
-          description: Pinned read snapshot ID (set for REPEATABLE_READ transactions)
+          description: >
+            Pinned read snapshot row ID (set for REPEATABLE_READ transactions). Row-backed:
+            the write path owns this row for locking/revocation/abort.
+        txn_snapshot:
+          type: string
+          description: >
+            Opaque read-point handle derived from the pinned snapshot (set for REPEATABLE_READ).
+            Echo it on loadTable?txn_snapshot=<handle> for consistent reads — the uniform string
+            read wire shared with standalone read snapshots.
         expires_at:
           type: string
           format: date-time
@@ -884,9 +895,14 @@ components:
           type: integer
           format: int64
           description: >
-            The parent transaction's pinned snapshot id (REPEATABLE READ), or null for a
-            READ COMMITTED parent. A resuming worker uses this to pin all of its reads —
-            including tables it does not own — to the snapshot the parent transaction took,
+            The parent transaction's pinned snapshot row id (REPEATABLE READ), or null for a
+            READ COMMITTED parent. Row-backed (owned by the write path).
+        txn_snapshot:
+          type: string
+          description: >
+            The parent transaction's pinned read-point handle (REPEATABLE READ), or null for a
+            READ COMMITTED parent. A resuming worker echoes this on loadTable?txn_snapshot=<handle>
+            to pin all of its reads — including tables it does not own — to the parent's read point,
             so every read in the subtransaction shares the parent's read point.
         name:
           type: string
@@ -979,7 +995,12 @@ components:
         txn_snapshot_id:
           type: integer
           format: int64
-          description: Pinned read snapshot ID (null for READ_COMMITTED transactions)
+          description: Pinned read snapshot row ID (null for READ_COMMITTED transactions)
+        txn_snapshot:
+          type: string
+          description: >
+            Pinned read-point handle (null for READ_COMMITTED transactions). A resuming worker
+            echoes this on loadTable?txn_snapshot=<handle> for consistent reads.
         assigned_staging_path:
           type: string
           description: Server-assigned path for the worker to write staged metadata

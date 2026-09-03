@@ -94,29 +94,32 @@ No `JAVA_HOME` or `PYTHONPATH` setup needed — these tests use only the standar
 ```
 src/
   polaris_client.py      thin HTTP wrapper (OAuth token, polaris/iceberg URL prefixes)
-  conftest.py            fixtures: client, txn (auto-aborted), snapshot (auto-released)
-  test_snapshot.py       TxnSnapshot CRUD and consistent multi-table reads
+  conftest.py            fixtures: client, txn (auto-aborted), snapshot (TTL-reclaimed)
+  test_snapshot.py       TxnSnapshot opaque handle and consistent multi-table reads
   test_transaction.py    Transaction lifecycle and subtransaction lifecycle
 ```
 
 ### What is tested
 
 **`test_snapshot.py`** — `POST /transaction-snapshots`:
-- Response shape: `txn_snapshot_id`, `read_point`, `expires_at`
+- Response shape: opaque string `txn_snapshot` handle (required) + informational `read_point`
+- Standalone read handles carry no numeric id and no row; they are reclaimed purely by
+  TTL — there is no `GET` / `DELETE` / `renew` for a read handle
 - `read_point >= 0` invariant
-- `GET` returns same id
-- Successive creates return distinct ids
-- `DELETE` returns 204
-- `POST /{id}/renew` returns updated `expires_at`
-- `loadTable` with `?txn_snapshot_id=` returns `metadata-location`
-- Two tables loaded at the same snapshot both succeed
+- Successive creates return distinct opaque handles
+- `loadTable` with `?txn_snapshot=<handle>` returns `metadata-location`
+- A malformed handle is rejected fail-closed (`400`), never a torn read
+- Two tables loaded at the same handle both succeed
+- The handle is exportable: an independent client resolves the same `metadata-location`,
+  repeated reads are stable, two engines holding one handle agree
 
 **`test_transaction.py`** — `POST /transactions` and subtransaction endpoints:
-- `REPEATABLE_READ` includes `txn_snapshot_id`; `READ_COMMITTED` does not
+- `REPEATABLE_READ` includes the numeric write-linked `txn_snapshot_id` and also exports the
+  string `txn_snapshot` handle; `READ_COMMITTED` sets neither
 - Successive begins return distinct `txn_id`s
 - `GET /transactions/{id}` echoes the id
 - `POST /abort` with valid token returns 204; invalid token returns 401/403
-- `loadTable` with `?txn_snapshot_id=` and `?txn_id=` both return `metadata-location`
+- `loadTable` with `?txn_snapshot=<handle>` and `?txn_id=` both return `metadata-location`
 - `POST /subtransactions` returns `subtxn_id`, `subtxn_token`, `assigned_staging_path`
 - Staging path is inside the table's own `metadata/` directory
 - `GET /subtransactions/{id}` returns parent `txn_id` and matching staging path
@@ -131,22 +134,23 @@ src/
 ## Expected Output (all passing)
 
 ```
-test_snapshot.py::TestTransactionSnapshotCRUD::test_create_returns_required_fields PASSED
-test_snapshot.py::TestTransactionSnapshotCRUD::test_read_point_is_non_negative PASSED
-test_snapshot.py::TestTransactionSnapshotCRUD::test_get_snapshot_returns_same_id PASSED
-test_snapshot.py::TestTransactionSnapshotCRUD::test_each_create_returns_unique_id PASSED
-test_snapshot.py::TestTransactionSnapshotCRUD::test_release_returns_204 PASSED
-test_snapshot.py::TestTransactionSnapshotCRUD::test_renew_snapshot PASSED
+test_snapshot.py::TestTransactionSnapshotCreate::test_create_returns_required_fields PASSED
+test_snapshot.py::TestTransactionSnapshotCreate::test_read_point_is_non_negative PASSED
+test_snapshot.py::TestTransactionSnapshotCreate::test_each_create_returns_unique_handle PASSED
 test_snapshot.py::TestSnapshotConsistentRead::test_load_table_at_snapshot PASSED
 test_snapshot.py::TestSnapshotConsistentRead::test_two_tables_succeed_at_same_snapshot PASSED
 test_snapshot.py::TestSnapshotConsistentRead::test_load_without_snapshot_also_works PASSED
+test_snapshot.py::TestSnapshotConsistentRead::test_malformed_handle_returns_400 PASSED
+test_snapshot.py::TestSnapshotExportableHandle::test_snapshot_consumable_by_independent_client PASSED
+test_snapshot.py::TestSnapshotExportableHandle::test_pinned_load_is_stable_across_repeated_reads PASSED
+test_snapshot.py::TestSnapshotExportableHandle::test_two_engines_same_handle_resolve_identically PASSED
 test_transaction.py::TestTransactionLifecycle::test_begin_repeatable_read_returns_snapshot_id PASSED
 test_transaction.py::TestTransactionLifecycle::test_begin_read_committed_no_snapshot_id PASSED
 test_transaction.py::TestTransactionLifecycle::test_successive_transactions_get_distinct_ids PASSED
 test_transaction.py::TestTransactionLifecycle::test_get_transaction_returns_txn_id PASSED
 test_transaction.py::TestTransactionLifecycle::test_abort_transaction_returns_204 PASSED
 test_transaction.py::TestTransactionLifecycle::test_abort_wrong_token_rejected PASSED
-test_transaction.py::TestTransactionLifecycle::test_load_table_at_txn_snapshot_id PASSED
+test_transaction.py::TestTransactionLifecycle::test_load_table_at_txn_snapshot_handle PASSED
 test_transaction.py::TestTransactionLifecycle::test_load_table_with_txn_id_param PASSED
 test_transaction.py::TestTransactionLifecycle::test_commit_no_subtransactions PASSED
 test_transaction.py::TestSubtransactionLifecycle::test_create_returns_required_fields PASSED

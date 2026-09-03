@@ -171,8 +171,11 @@ public class TransactionCatalogAdapter
     int lease = createTransactionSnapshotRequest.getLeaseSeconds();
     try {
       TransactionService txnService = openTxnService(securityContext, prefix);
-      TxnSnapshotRow snap = txnService.createTransactionSnapshot(lease);
-      return Response.ok(toSnapshot(snap)).build();
+      TransactionService.MintedSnapshot minted = txnService.createTransactionSnapshot(lease);
+      // Standalone read snapshot: handle-only, no server row. read_point is informational; there is
+      // no expires_at because retention is governed globally by the reaper's read_floor TTL.
+      return Response.ok(new TransactionSnapshot(minted.handle(), minted.readPoint(), null))
+          .build();
     } catch (SQLException e) {
       return serverError("createTransactionSnapshot failed", e);
     }
@@ -187,7 +190,7 @@ public class TransactionCatalogAdapter
     try {
       TransactionService txnService = openTxnService(securityContext, prefix);
       TxnSnapshotRow snap = txnService.getTransactionSnapshot(txnSnapshotId);
-      return Response.ok(toSnapshot(snap)).build();
+      return Response.ok(toSnapshot(txnService, snap)).build();
     } catch (jakarta.ws.rs.NotFoundException e) {
       return notFound(e.getMessage());
     } catch (SQLException e) {
@@ -223,7 +226,7 @@ public class TransactionCatalogAdapter
     try {
       TransactionService txnService = openTxnService(securityContext, prefix);
       TxnSnapshotRow snap = txnService.renewTransactionSnapshot(txnSnapshotId, leaseSeconds);
-      return Response.ok(toSnapshot(snap)).build();
+      return Response.ok(toSnapshot(txnService, snap)).build();
     } catch (jakarta.ws.rs.NotFoundException e) {
       return notFound(e.getMessage());
     } catch (SQLException e) {
@@ -247,7 +250,7 @@ public class TransactionCatalogAdapter
       TransactionService txnService = openTxnService(securityContext, prefix);
       TransactionRow txn =
           txnService.beginTransaction(isolation.name(), leaseSeconds, principalName);
-      return Response.ok(toTransaction(txn, true)).build();
+      return Response.ok(toTransaction(txnService, txn, true)).build();
     } catch (SQLException e) {
       return serverError("beginTransaction failed", e);
     }
@@ -259,7 +262,7 @@ public class TransactionCatalogAdapter
     try {
       TransactionService txnService = openTxnService(securityContext, prefix);
       TransactionRow txn = txnService.getTransaction(txnId);
-      return Response.ok(toTransaction(txn, false)).build();
+      return Response.ok(toTransaction(txnService, txn, false)).build();
     } catch (jakarta.ws.rs.NotFoundException e) {
       return notFound(e.getMessage());
     } catch (SQLException e) {
@@ -394,7 +397,7 @@ public class TransactionCatalogAdapter
       // subtxnId + xSubtxnToken address the subtransaction directly. Return the full
       // subtransaction so a resuming worker sees every operation's assigned staging path.
       TransactionService.SubtxnInfo info = txnService.getSubtransactionInfo(subtxnId, xSubtxnToken);
-      return Response.ok(toSubtransaction(info, false)).build();
+      return Response.ok(toSubtransaction(txnService, info, false)).build();
     } catch (jakarta.ws.rs.BadRequestException e) {
       return Response.status(400).entity(simpleError(e.getMessage())).build();
     } catch (jakarta.ws.rs.ForbiddenException e) {
@@ -441,7 +444,7 @@ public class TransactionCatalogAdapter
     try {
       TransactionService txnService = openTxnService(securityContext, prefix);
       TransactionRow txn = txnService.renewTransaction(txnId, xTxnToken, leaseSeconds);
-      return Response.ok(toTransaction(txn, false)).build();
+      return Response.ok(toTransaction(txnService, txn, false)).build();
     } catch (jakarta.ws.rs.ForbiddenException e) {
       return Response.status(403).entity(simpleError(e.getMessage())).build();
     } catch (jakarta.ws.rs.NotFoundException e) {
@@ -517,7 +520,7 @@ public class TransactionCatalogAdapter
               createSubtransactionRequest.getName(),
               createSubtransactionRequest.getLeaseSeconds(),
               specs);
-      return Response.ok(toSubtransaction(subtxn, true)).build();
+      return Response.ok(toSubtransaction(txnService, subtxn, true)).build();
     } catch (jakarta.ws.rs.BadRequestException | jakarta.ws.rs.ForbiddenException e) {
       return Response.status(e instanceof jakarta.ws.rs.ForbiddenException ? 403 : 400)
           .entity(simpleError(e.getMessage()))
@@ -649,7 +652,7 @@ public class TransactionCatalogAdapter
       TransactionService.SubtxnInfo subtxn =
           txnService.renewSubtransaction(
               txnId, subtxnId, xSubtxnToken, renewLeaseRequest.getLeaseSeconds());
-      return Response.ok(toSubtransaction(subtxn, false)).build();
+      return Response.ok(toSubtransaction(txnService, subtxn, false)).build();
     } catch (jakarta.ws.rs.BadRequestException e) {
       return Response.status(400).entity(simpleError(e.getMessage())).build();
     } catch (jakarta.ws.rs.ForbiddenException e) {
@@ -661,21 +664,26 @@ public class TransactionCatalogAdapter
     }
   }
 
-  private static TransactionSnapshot toSnapshot(TxnSnapshotRow snap) {
+  /**
+   * Builds a {@link TransactionSnapshot} from a write-linked {@code txn_snapshots} row (the by-id
+   * GET/renew endpoints). The uniform read wire is the string {@code txn_snapshot} handle, derived
+   * here from the row's read point; standalone read snapshots carry no row and are minted directly.
+   */
+  private static TransactionSnapshot toSnapshot(
+      TransactionService txnService, TxnSnapshotRow snap) {
     return new TransactionSnapshot(
-        snap.txnSnapshotId(),
-        snap.readPoint(),
-        Date.from(snap.expiresAt()),
-        snap.releasedAt() != null ? Date.from(snap.releasedAt()) : null);
+        txnService.encodeHandleForSnapshot(snap), snap.readPoint(), Date.from(snap.expiresAt()));
   }
 
-  private static Transaction toTransaction(TransactionRow txn, boolean includeToken) {
+  private static Transaction toTransaction(
+      TransactionService txnService, TransactionRow txn, boolean includeToken) throws SQLException {
     return new Transaction(
         txn.txnId(),
         includeToken ? txn.txnToken() : null,
         toTransactionStatus(txn.status()),
         parseIsolation(txn.isolation()),
         txn.txnSnapshotId(),
+        txnService.encodeHandleForSnapshot(txn.txnSnapshotId()),
         Date.from(txn.expiresAt()),
         Date.from(txn.startedAt()),
         txn.endedAt() != null ? Date.from(txn.endedAt()) : null);
@@ -699,7 +707,8 @@ public class TransactionCatalogAdapter
    * fields mirror the first operation for the single-table shorthand path.
    */
   private static Subtransaction toSubtransaction(
-      TransactionService.SubtxnInfo info, boolean includeToken) {
+      TransactionService txnService, TransactionService.SubtxnInfo info, boolean includeToken)
+      throws SQLException {
     JdbcTransactionPersistence.SubtxnRow subtxn = info.subtxn();
     List<SubtransactionOperation> ops = new java.util.ArrayList<>(info.operations().size());
     for (OperationRow op : info.operations()) {
@@ -720,6 +729,7 @@ public class TransactionCatalogAdapter
         includeToken ? subtxn.subtxnToken() : null,
         subtxn.txnId(),
         info.parentTxnSnapshotId(),
+        txnService.encodeHandleForSnapshot(info.parentTxnSnapshotId()),
         subtxn.name(),
         subtxn.attempt(),
         ops,

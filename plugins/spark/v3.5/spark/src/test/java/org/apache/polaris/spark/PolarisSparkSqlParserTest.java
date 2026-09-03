@@ -498,7 +498,8 @@ public class PolarisSparkSqlParserTest {
 
       parser.parsePlan("USE SNAPSHOT 555");
 
-      verify(mockTxnManager).attachSnapshot(mockSpark, 555L);
+      // The token is an opaque handle echoed verbatim — not parsed into a numeric id.
+      verify(mockTxnManager).attachSnapshot(mockSpark, "555");
     }
   }
 
@@ -511,19 +512,36 @@ public class PolarisSparkSqlParserTest {
       parser.parsePlan("USE SNAPSHOT NONE");
 
       verify(mockTxnManager).detachSnapshot(mockSpark);
-      verify(mockTxnManager, never()).attachSnapshot(any(), org.mockito.ArgumentMatchers.anyLong());
+      verify(mockTxnManager, never())
+          .attachSnapshot(any(), org.mockito.ArgumentMatchers.anyString());
     }
   }
 
   @Test
-  public void testUseSnapshotNonNumericThrows() throws Exception {
+  public void testUseSnapshotAttachesOpaqueHandleVerbatim() throws Exception {
+    // The read-point handle is an opaque, case-sensitive base64url token. A non-numeric token is
+    // NOT an error (it is not parsed) and its case must be preserved exactly.
     try (org.mockito.MockedStatic<SparkSession> staticMock =
         org.mockito.Mockito.mockStatic(SparkSession.class)) {
       staticMock.when(SparkSession::active).thenReturn(mockSpark);
 
-      org.assertj.core.api.Assertions.assertThatThrownBy(() -> parser.parsePlan("USE SNAPSHOT abc"))
-          .isInstanceOf(IllegalArgumentException.class)
-          .hasMessageContaining("numeric snapshot id");
+      String handle = "eyJ2IjoxLCJjYXRhbG9nX2lkIjo5OX0";
+      parser.parsePlan("USE SNAPSHOT " + handle);
+
+      verify(mockTxnManager).attachSnapshot(mockSpark, handle);
+    }
+  }
+
+  @Test
+  public void testUseSnapshotStripsSurroundingQuotes() throws Exception {
+    try (org.mockito.MockedStatic<SparkSession> staticMock =
+        org.mockito.Mockito.mockStatic(SparkSession.class)) {
+      staticMock.when(SparkSession::active).thenReturn(mockSpark);
+
+      parser.parsePlan("USE SNAPSHOT 'Handle-AbC'");
+
+      // Quotes are stripped; the inner token's case is preserved verbatim.
+      verify(mockTxnManager).attachSnapshot(mockSpark, "Handle-AbC");
     }
   }
 
@@ -536,7 +554,8 @@ public class PolarisSparkSqlParserTest {
       parser.parsePlan("USE demo_ns");
 
       // Not a snapshot command — must delegate untouched, never touching the txn manager.
-      verify(mockTxnManager, never()).attachSnapshot(any(), org.mockito.ArgumentMatchers.anyLong());
+      verify(mockTxnManager, never())
+          .attachSnapshot(any(), org.mockito.ArgumentMatchers.anyString());
       verify(mockTxnManager, never()).detachSnapshot(any());
       verify(mockDelegate).parsePlan("USE demo_ns");
     }

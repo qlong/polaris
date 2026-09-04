@@ -1133,9 +1133,7 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
         if (metadataLocation == null
             && txnSnapshot.map(s -> s != null && !s.isBlank()).orElse(false)) {
           metadataLocation =
-              txnService
-                  .resolveTableMetadataLocation(tableUuid, txnSnapshot.get())
-                  .orElse(null);
+              txnService.resolveTableMetadataLocation(tableUuid, txnSnapshot.get()).orElse(null);
         }
         if (metadataLocation != null) {
           TableMetadata tableMetadata =

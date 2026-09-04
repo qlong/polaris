@@ -70,6 +70,10 @@ public class TransactionManager {
   // attach to an external snapshot without ever running BEGIN — reads resolve against the shared
   // read_point, no local transaction, no locks, no writes.
   static final String CONF_ATTACHED_SNAPSHOT_ID = "spark.sql.catalog.%s.attached_txn_snapshot_id";
+  // Set to "true" when the current transaction was started with READ ONLY. In this mode no server
+  // write transaction is created: REPEATABLE_READ pins via a stateless snapshot handle (zero rows);
+  // READ_COMMITTED needs no server call at all. COMMIT and ROLLBACK are client-side no-ops.
+  static final String CONF_READ_ONLY = "spark.sql.catalog.%s.txn_read_only";
 
   // Staged write tracking — CONF_STAGED_TABLES holds comma-separated table keys;
   // per-table path/op use stagedPathConfKey/stagedOpConfKey helpers (not sprintf templates)
@@ -112,13 +116,34 @@ public class TransactionManager {
   // Methods called by SQL command objects
   // -------------------------------------------------------------------------
 
-  /** Called by BeginTransactionCommand. Stores pending isolation; does NOT call REST yet. */
-  public void begin(SparkSession spark, String isolation) {
+  /**
+   * Called by BeginTransactionCommand. Stores pending isolation; does NOT call REST yet.
+   *
+   * <p>When {@code readOnly} is true the behavior depends on isolation level:
+   *
+   * <ul>
+   *   <li>READ_COMMITTED: no server call ever; COMMIT/ROLLBACK are no-ops.
+   *   <li>REPEATABLE_READ: on the first {@code loadTable} a stateless snapshot handle is minted via
+   *       {@code POST /transaction-snapshots} (zero DB rows); COMMIT/ROLLBACK are still no-ops.
+   * </ul>
+   */
+  public void begin(SparkSession spark, String isolation, boolean readOnly) {
     String pendingIsolation = getConf(spark, CONF_PENDING_ISOLATION);
     if (pendingIsolation != null) {
       throw new IllegalStateException("Transaction already in progress. COMMIT or ROLLBACK first.");
     }
     setConf(spark, CONF_PENDING_ISOLATION, isolation);
+    if (readOnly) {
+      setConf(spark, CONF_READ_ONLY, "true");
+    }
+  }
+
+  /**
+   * @deprecated Use {@link #begin(SparkSession, String, boolean)}
+   */
+  @Deprecated
+  public void begin(SparkSession spark, String isolation) {
+    begin(spark, isolation, false);
   }
 
   /**
@@ -145,14 +170,21 @@ public class TransactionManager {
           "Worker session: use COMMIT SUBTRANSACTION instead of COMMIT.");
     }
 
-    String txnId = getConf(spark, CONF_TXN_ID);
-    String txnToken = getConf(spark, CONF_TXN_TOKEN);
     String pending = getConf(spark, CONF_PENDING_ISOLATION);
-
     if (pending == null) {
       System.out.println("Nothing to commit — no active transaction.");
       return;
     }
+
+    // READ ONLY transactions have no server-side write transaction to commit.
+    if ("true".equals(getConf(spark, CONF_READ_ONLY))) {
+      clearConf(spark);
+      System.out.println("Read-only transaction ended.");
+      return;
+    }
+
+    String txnId = getConf(spark, CONF_TXN_ID);
+    String txnToken = getConf(spark, CONF_TXN_TOKEN);
 
     try {
       if (txnId != null && txnToken != null) {
@@ -174,14 +206,21 @@ public class TransactionManager {
           "Worker session: use ROLLBACK SUBTRANSACTION instead of ROLLBACK.");
     }
 
-    String txnId = getConf(spark, CONF_TXN_ID);
-    String txnToken = getConf(spark, CONF_TXN_TOKEN);
     String pending = getConf(spark, CONF_PENDING_ISOLATION);
-
     if (pending == null) {
       System.out.println("Nothing to roll back — no active transaction.");
       return;
     }
+
+    // READ ONLY transactions have no server-side state to abort.
+    if ("true".equals(getConf(spark, CONF_READ_ONLY))) {
+      clearConf(spark);
+      System.out.println("Read-only transaction ended.");
+      return;
+    }
+
+    String txnId = getConf(spark, CONF_TXN_ID);
+    String txnToken = getConf(spark, CONF_TXN_TOKEN);
 
     try {
       if (txnId != null && txnToken != null) {
@@ -236,6 +275,29 @@ public class TransactionManager {
     if (staged.isPresent()) {
       LOG.debug("RYOW: returning staged path for {} in active transaction", ident);
       return staged;
+    }
+
+    // READ ONLY: skip the write-transaction path entirely.
+    if ("true".equals(getConf(spark, CONF_READ_ONLY))) {
+      String isolation = getConf(spark, CONF_PENDING_ISOLATION);
+      if ("REPEATABLE_READ".equals(isolation)) {
+        // Lazily mint a stateless snapshot handle (zero DB rows) on the first read.
+        String snapHandle = getConf(spark, CONF_TXN_SNAPSHOT_ID);
+        if (snapHandle == null) {
+          snapHandle = restCatalog.createTransactionSnapshot(DEFAULT_LEASE_SECONDS);
+          setConf(spark, CONF_TXN_SNAPSHOT_ID, snapHandle);
+          System.out.println("Read-only snapshot pinned  txn_snapshot=" + snapHandle);
+        }
+        String metadataLocation = restCatalog.resolveTableMetadataLocation(ident, snapHandle);
+        LOG.debug(
+            "Resolved pinned metadata location for {} at READ ONLY snapshot {}: {}",
+            ident,
+            snapHandle,
+            metadataLocation);
+        return Optional.of(metadataLocation);
+      }
+      // READ_COMMITTED + READ ONLY: no server call, reads see the latest committed version.
+      return Optional.empty();
     }
 
     ensureTransactionStarted(spark);
@@ -798,6 +860,7 @@ public class TransactionManager {
     spark.conf().unset(confKey(CONF_TXN_ID));
     spark.conf().unset(confKey(CONF_TXN_TOKEN));
     spark.conf().unset(confKey(CONF_TXN_SNAPSHOT_ID));
+    spark.conf().unset(confKey(CONF_READ_ONLY));
     spark.conf().unset(confKey(CONF_ATTACHED_SNAPSHOT_ID));
     spark.conf().unset(confKey(CONF_WORKER_SUBTXN_ID));
     spark.conf().unset(confKey(CONF_WORKER_SUBTXN_TOKEN));

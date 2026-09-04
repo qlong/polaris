@@ -124,4 +124,9 @@ public class PolarisResourcePaths {
   public String subtransactionGet(long subtxnId) {
     return SLASH.join("polaris", "v1", prefix, "transactions", "subtransactions", subtxnId);
   }
+
+  /** POST /transaction-snapshots — mint a stateless read-only snapshot handle. */
+  public String transactionSnapshots() {
+    return SLASH.join("polaris", "v1", prefix, "transaction-snapshots");
+  }
 }

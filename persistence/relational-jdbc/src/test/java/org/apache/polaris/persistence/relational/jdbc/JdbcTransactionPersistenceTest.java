@@ -19,6 +19,7 @@
 package org.apache.polaris.persistence.relational.jdbc;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.InputStream;
 import java.sql.Connection;
@@ -335,6 +336,171 @@ class JdbcTransactionPersistenceTest {
 
     // Should not throw and the row should still be findable.
     assertThat(persistence.findTxnSnapshot(snapId)).isPresent();
+  }
+
+  // ---------------------------------------------------------------------------
+  // beginTransactionAtomically (collapsed BEGIN: one connection, one DB transaction)
+  // ---------------------------------------------------------------------------
+
+  @Test
+  void beginTransactionAtomicallyRepeatableReadInsertsBothRowsAndLinksThem() throws SQLException {
+    long txnId = persistence.nextTxnId();
+    long snapId = persistence.nextTxnId();
+    Instant now = Instant.now();
+    Instant expires = now.plusSeconds(300);
+
+    JdbcTransactionPersistence.TransactionRow txnRow =
+        new JdbcTransactionPersistence.TransactionRow(
+            txnId,
+            null,
+            REALM,
+            CATALOG_ID,
+            "tok-" + txnId,
+            "test-user",
+            JdbcTransactionPersistence.TXN_STATUS_IN_PROGRESS,
+            "REPEATABLE_READ",
+            snapId,
+            now,
+            expires,
+            null);
+    JdbcTransactionPersistence.TxnSnapshotRow snapRow =
+        new JdbcTransactionPersistence.TxnSnapshotRow(
+            snapId, REALM, CATALOG_ID, 0L, now, expires, null);
+
+    JdbcTransactionPersistence.TxnSnapshotRow persisted =
+        persistence.beginTransactionAtomically(txnRow, snapRow);
+
+    // Both rows are durable and the transaction links the snapshot.
+    Optional<JdbcTransactionPersistence.TransactionRow> foundTxn =
+        persistence.findTransaction(txnId);
+    assertThat(foundTxn).isPresent();
+    assertThat(foundTxn.get().txnSnapshotId()).isEqualTo(snapId);
+
+    Optional<JdbcTransactionPersistence.TxnSnapshotRow> foundSnap =
+        persistence.findTxnSnapshot(snapId);
+    assertThat(foundSnap).isPresent();
+    assertThat(foundSnap.get().releasedAt()).isNull();
+
+    // The method returns exactly the snapshot it persisted.
+    assertThat(persisted).isNotNull();
+    assertThat(persisted.txnSnapshotId()).isEqualTo(snapId);
+  }
+
+  @Test
+  void beginTransactionAtomicallyCapturesCurrentCommitScnAsReadPoint() throws SQLException {
+    // Advance commit_scn_counter to a known value by committing CTS rows through the commit path.
+    long scn1;
+    long scn2;
+    try (Connection conn = dataSource.getConnection()) {
+      conn.setAutoCommit(false);
+      scn1 = persistence.allocateCommitScn(conn);
+      conn.commit();
+    }
+    try (Connection conn = dataSource.getConnection()) {
+      conn.setAutoCommit(false);
+      scn2 = persistence.allocateCommitScn(conn);
+      conn.commit();
+    }
+    assertThat(scn2).isGreaterThan(scn1);
+
+    long txnId = persistence.nextTxnId();
+    long snapId = persistence.nextTxnId();
+    Instant now = Instant.now();
+    Instant expires = now.plusSeconds(300);
+
+    JdbcTransactionPersistence.TransactionRow txnRow =
+        new JdbcTransactionPersistence.TransactionRow(
+            txnId,
+            null,
+            REALM,
+            CATALOG_ID,
+            "tok-" + txnId,
+            "test-user",
+            JdbcTransactionPersistence.TXN_STATUS_IN_PROGRESS,
+            "REPEATABLE_READ",
+            snapId,
+            now,
+            expires,
+            null);
+    // Deliberately pass a bogus read_point (999) to prove it is ignored and recaptured.
+    JdbcTransactionPersistence.TxnSnapshotRow snapRow =
+        new JdbcTransactionPersistence.TxnSnapshotRow(
+            snapId, REALM, CATALOG_ID, 999L, now, expires, null);
+
+    JdbcTransactionPersistence.TxnSnapshotRow persisted =
+        persistence.beginTransactionAtomically(txnRow, snapRow);
+
+    // read_point equals the current commit_scn (scn2), not the caller-supplied 999.
+    assertThat(persisted).isNotNull();
+    assertThat(persisted.readPoint()).isEqualTo(scn2);
+    assertThat(persistence.findTxnSnapshot(snapId).orElseThrow().readPoint()).isEqualTo(scn2);
+  }
+
+  @Test
+  void beginTransactionAtomicallyReadCommittedInsertsOnlyTransactionRow() throws SQLException {
+    long txnId = persistence.nextTxnId();
+    Instant now = Instant.now();
+    Instant expires = now.plusSeconds(300);
+
+    JdbcTransactionPersistence.TransactionRow txnRow =
+        new JdbcTransactionPersistence.TransactionRow(
+            txnId,
+            null,
+            REALM,
+            CATALOG_ID,
+            "tok-" + txnId,
+            "test-user",
+            JdbcTransactionPersistence.TXN_STATUS_IN_PROGRESS,
+            "READ_COMMITTED",
+            null,
+            now,
+            expires,
+            null);
+
+    JdbcTransactionPersistence.TxnSnapshotRow persisted =
+        persistence.beginTransactionAtomically(txnRow, null);
+
+    assertThat(persisted).isNull();
+    Optional<JdbcTransactionPersistence.TransactionRow> foundTxn =
+        persistence.findTransaction(txnId);
+    assertThat(foundTxn).isPresent();
+    assertThat(foundTxn.get().txnSnapshotId()).isNull();
+  }
+
+  @Test
+  void beginTransactionAtomicallyRollsBackSnapshotWhenTransactionInsertFails() throws SQLException {
+    // Pre-insert a transaction so the atomic begin hits a duplicate-PK on the transaction insert.
+    long txnId = persistence.nextTxnId();
+    insertSimpleTransaction(txnId);
+
+    long snapId = persistence.nextTxnId();
+    Instant now = Instant.now();
+    Instant expires = now.plusSeconds(300);
+
+    JdbcTransactionPersistence.TransactionRow dupTxnRow =
+        new JdbcTransactionPersistence.TransactionRow(
+            txnId, // duplicate PK → transaction insert fails after the snapshot insert
+            null,
+            REALM,
+            CATALOG_ID,
+            "tok-dup",
+            "test-user",
+            JdbcTransactionPersistence.TXN_STATUS_IN_PROGRESS,
+            "REPEATABLE_READ",
+            snapId,
+            now,
+            expires,
+            null);
+    JdbcTransactionPersistence.TxnSnapshotRow snapRow =
+        new JdbcTransactionPersistence.TxnSnapshotRow(
+            snapId, REALM, CATALOG_ID, 0L, now, expires, null);
+
+    assertThatThrownBy(() -> persistence.beginTransactionAtomically(dupTxnRow, snapRow))
+        .isInstanceOf(SQLException.class);
+
+    // The snapshot insert that ran first in the same transaction must have been rolled back:
+    // no orphaned txn_snapshots row is left behind.
+    assertThat(persistence.findTxnSnapshot(snapId)).isEmpty();
   }
 
   // ---------------------------------------------------------------------------

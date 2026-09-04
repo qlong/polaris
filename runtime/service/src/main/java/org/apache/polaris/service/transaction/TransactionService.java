@@ -170,23 +170,24 @@ public class TransactionService {
     Instant now = Instant.now();
     Instant expiresAt = now.plus(effective, ChronoUnit.SECONDS);
 
+    // A linked txn_snapshots row is created for REPEATABLE_READ so the orchestrator can use
+    // txn_snapshot_id for consistent reads (loadTable?txn_snapshot_id=X) with the same pinned view.
+    // Its read_point is captured inside beginTransactionAtomically on the same connection.
     Long linkedTxnSnapshotId = null;
+    TxnSnapshotRow snapRow = null;
     if ("REPEATABLE_READ".equalsIgnoreCase(isolation)) {
-      long readPoint = persistence.captureReadPoint();
-
-      // Create a real txn_snapshots row so the orchestrator can use txn_snapshot_id for
-      // consistent reads (loadTable?txn_snapshot_id=X) with the same pinned view.
       long snapId = persistence.nextTxnId();
-      TxnSnapshotRow snapRow =
+      snapRow =
           new TxnSnapshotRow(
               snapId,
               persistence.getRealmId(),
               persistence.getCatalogId(),
-              readPoint,
+              // read_point is (re)captured atomically on the insert connection; this value is
+              // unused.
+              0L,
               now,
               expiresAt,
               null);
-      persistence.insertTxnSnapshot(snapRow);
       linkedTxnSnapshotId = snapId;
     }
 
@@ -204,7 +205,13 @@ public class TransactionService {
             now,
             expiresAt,
             (Instant) null);
-    persistence.insertTransaction(row);
+
+    // Persist the transaction and its optional linked snapshot in ONE database transaction on one
+    // pooled connection, instead of three autocommit round-trips (captureReadPoint +
+    // insertTxnSnapshot + insertTransaction). Keeps BEGIN from tripling its draw on the connection
+    // pool under write concurrency. Read-only transactions never reach this path (the Spark client
+    // mints a stateless read handle instead), so this optimizes the write BEGIN specifically.
+    persistence.beginTransactionAtomically(row, snapRow);
     LOGGER.info(
         "Transaction started: txn_id={} isolation={} expires={}", txnId, isolation, expiresAt);
     return row;

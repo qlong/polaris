@@ -111,7 +111,7 @@ public class TransactionManagerTest {
 
   @Test
   public void testBeginSetsPendingIsolation() {
-    txnManager.begin(mockSpark, "REPEATABLE_READ");
+    txnManager.begin(mockSpark, "REPEATABLE_READ", false);
 
     String key = String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG);
     assertThat(confStore.get(key)).isEqualTo("REPEATABLE_READ");
@@ -119,16 +119,16 @@ public class TransactionManagerTest {
 
   @Test
   public void testBeginThrowsIfAlreadyInProgress() {
-    txnManager.begin(mockSpark, "REPEATABLE_READ");
+    txnManager.begin(mockSpark, "REPEATABLE_READ", false);
 
-    assertThatThrownBy(() -> txnManager.begin(mockSpark, "READ_COMMITTED"))
+    assertThatThrownBy(() -> txnManager.begin(mockSpark, "READ_COMMITTED", false))
         .isInstanceOf(IllegalStateException.class)
         .hasMessageContaining("Transaction already in progress");
   }
 
   @Test
   public void testBeginDoesNotCallRestYet() {
-    txnManager.begin(mockSpark, "REPEATABLE_READ");
+    txnManager.begin(mockSpark, "REPEATABLE_READ", false);
 
     verify(mockRestCatalog, never()).beginTransaction(anyString(), anyInt());
   }
@@ -139,7 +139,7 @@ public class TransactionManagerTest {
 
   @Test
   public void testSetIsolationLevelUpdatesConf() {
-    txnManager.begin(mockSpark, "REPEATABLE_READ");
+    txnManager.begin(mockSpark, "REPEATABLE_READ", false);
     txnManager.setIsolationLevel(mockSpark, "READ_COMMITTED");
 
     String key = String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG);
@@ -189,7 +189,7 @@ public class TransactionManagerTest {
     when(mockRestCatalog.resolveTableMetadataLocation(any(), anyString()))
         .thenReturn("file:///tmp/metadata/v5.metadata.json");
 
-    txnManager.begin(mockSpark, "REPEATABLE_READ");
+    txnManager.begin(mockSpark, "REPEATABLE_READ", false);
     TableIdentifier ident = TableIdentifier.of(Namespace.of("ns"), "orders");
     Optional<String> result = txnManager.resolveMetadataLocation(mockSpark, ident);
 
@@ -214,7 +214,7 @@ public class TransactionManagerTest {
     when(txnResp.txnSnapshot()).thenReturn(null); // READ_COMMITTED has no snapshot
     when(mockRestCatalog.beginTransaction(eq("READ_COMMITTED"), anyInt())).thenReturn(txnResp);
 
-    txnManager.begin(mockSpark, "READ_COMMITTED");
+    txnManager.begin(mockSpark, "READ_COMMITTED", false);
     TableIdentifier ident = TableIdentifier.of(Namespace.of("ns"), "orders");
     Optional<String> result = txnManager.resolveMetadataLocation(mockSpark, ident);
 
@@ -232,7 +232,7 @@ public class TransactionManagerTest {
     when(mockRestCatalog.resolveTableMetadataLocation(any(), anyString()))
         .thenReturn("file:///tmp/v5.metadata.json");
 
-    txnManager.begin(mockSpark, "REPEATABLE_READ");
+    txnManager.begin(mockSpark, "REPEATABLE_READ", false);
     TableIdentifier ident = TableIdentifier.of(Namespace.of("ns"), "orders");
     txnManager.resolveMetadataLocation(mockSpark, ident); // first query — triggers begin
     txnManager.resolveMetadataLocation(mockSpark, ident); // second query — should NOT re-begin
@@ -288,7 +288,7 @@ public class TransactionManagerTest {
 
   @Test
   public void testAttachSnapshotThrowsIfTransactionInProgress() {
-    txnManager.begin(mockSpark, "REPEATABLE_READ");
+    txnManager.begin(mockSpark, "REPEATABLE_READ", false);
 
     assertThatThrownBy(() -> txnManager.attachSnapshot(mockSpark, "handle-555"))
         .isInstanceOf(IllegalStateException.class)
@@ -318,7 +318,7 @@ public class TransactionManagerTest {
 
   @Test
   public void testCommitNoOpWhenPending() {
-    txnManager.begin(mockSpark, "REPEATABLE_READ"); // PENDING state
+    txnManager.begin(mockSpark, "REPEATABLE_READ", false); // PENDING state
 
     txnManager.commit(mockSpark);
 
@@ -368,7 +368,7 @@ public class TransactionManagerTest {
             anyLong(), anyString(), anyString(), anyString(), anyInt()))
         .thenReturn(subtxnResp);
 
-    txnManager.begin(mockSpark, "REPEATABLE_READ"); // PENDING — no REST call yet
+    txnManager.begin(mockSpark, "REPEATABLE_READ", false); // PENDING — no REST call yet
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
     txnManager.createSubtransactionForOrchestrator(mockSpark, orders, "ROW_EXCLUSIVE");
 
@@ -457,7 +457,7 @@ public class TransactionManagerTest {
 
   @Test
   public void testBeginWorkerSubtransactionThrowsIfTransactionAlreadyActive() {
-    txnManager.begin(mockSpark, "REPEATABLE_READ");
+    txnManager.begin(mockSpark, "REPEATABLE_READ", false);
     TableIdentifier orders = TableIdentifier.of(Namespace.of("demo_ns"), "orders");
 
     assertThatThrownBy(
@@ -701,6 +701,106 @@ public class TransactionManagerTest {
     txnManager.commitWorkerSubtransaction(mockSpark);
 
     verify(mockRestCatalog).commitSubtransaction(7L, 42L, "subtok");
+  }
+
+  // -------------------------------------------------------------------------
+  // READ ONLY transactions
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void testBeginReadOnlySetsFlag() {
+    txnManager.begin(mockSpark, "REPEATABLE_READ", true);
+
+    assertThat(confStore.get(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG)))
+        .isEqualTo("REPEATABLE_READ");
+    assertThat(confStore.get(String.format(TransactionManager.CONF_READ_ONLY, CATALOG)))
+        .isEqualTo("true");
+  }
+
+  @Test
+  public void testBeginReadWriteDoesNotSetFlag() {
+    txnManager.begin(mockSpark, "REPEATABLE_READ", false);
+
+    assertThat(confStore.get(String.format(TransactionManager.CONF_READ_ONLY, CATALOG))).isNull();
+  }
+
+  @Test
+  public void testCommitReadOnlyIsClientSideNoOp() {
+    txnManager.begin(mockSpark, "REPEATABLE_READ", true);
+    // Simulate some table reads (snapshot handle pinned lazily — stored without a write txn)
+    confStore.put(
+        String.format(TransactionManager.CONF_TXN_SNAPSHOT_ID, CATALOG), "read-only-handle");
+
+    txnManager.commit(mockSpark);
+
+    // No REST call to commit
+    verify(mockRestCatalog, never()).commitTransaction(anyLong(), anyString(), anyList());
+    verify(mockRestCatalog, never()).abortTransaction(anyLong(), anyString());
+    // Conf fully cleared
+    assertThat(confStore.get(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG)))
+        .isNull();
+    assertThat(confStore.get(String.format(TransactionManager.CONF_READ_ONLY, CATALOG))).isNull();
+    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_SNAPSHOT_ID, CATALOG)))
+        .isNull();
+  }
+
+  @Test
+  public void testRollbackReadOnlyIsClientSideNoOp() {
+    txnManager.begin(mockSpark, "READ_COMMITTED", true);
+
+    txnManager.rollback(mockSpark);
+
+    verify(mockRestCatalog, never()).abortTransaction(anyLong(), anyString());
+    assertThat(confStore.get(String.format(TransactionManager.CONF_PENDING_ISOLATION, CATALOG)))
+        .isNull();
+    assertThat(confStore.get(String.format(TransactionManager.CONF_READ_ONLY, CATALOG))).isNull();
+  }
+
+  @Test
+  public void testResolveReadOnlyRepeatableReadMintsHandleLazily() {
+    when(mockRestCatalog.createTransactionSnapshot(anyInt())).thenReturn("ro-handle-xyz");
+    when(mockRestCatalog.resolveTableMetadataLocation(any(), eq("ro-handle-xyz")))
+        .thenReturn("file:///tmp/pinned/v3.metadata.json");
+
+    txnManager.begin(mockSpark, "REPEATABLE_READ", true);
+    TableIdentifier ident = TableIdentifier.of(Namespace.of("ns"), "orders");
+    Optional<String> result = txnManager.resolveMetadataLocation(mockSpark, ident);
+
+    assertThat(result).hasValue("file:///tmp/pinned/v3.metadata.json");
+    // A stateless snapshot was minted — no write transaction ever started
+    verify(mockRestCatalog).createTransactionSnapshot(TransactionManager.DEFAULT_LEASE_SECONDS);
+    verify(mockRestCatalog, never()).beginTransaction(anyString(), anyInt());
+    // Handle stored for subsequent reads in the same transaction
+    assertThat(confStore.get(String.format(TransactionManager.CONF_TXN_SNAPSHOT_ID, CATALOG)))
+        .isEqualTo("ro-handle-xyz");
+  }
+
+  @Test
+  public void testResolveReadOnlyRepeatableReadReusesHandleOnSecondRead() {
+    when(mockRestCatalog.createTransactionSnapshot(anyInt())).thenReturn("ro-handle-xyz");
+    when(mockRestCatalog.resolveTableMetadataLocation(any(), anyString()))
+        .thenReturn("file:///tmp/pinned/v3.metadata.json");
+
+    txnManager.begin(mockSpark, "REPEATABLE_READ", true);
+    TableIdentifier ident = TableIdentifier.of(Namespace.of("ns"), "orders");
+    txnManager.resolveMetadataLocation(mockSpark, ident); // first read — mints handle
+    txnManager.resolveMetadataLocation(mockSpark, ident); // second read — reuses handle
+
+    // createTransactionSnapshot called only once
+    verify(mockRestCatalog, org.mockito.Mockito.times(1)).createTransactionSnapshot(anyInt());
+  }
+
+  @Test
+  public void testResolveReadOnlyReadCommittedReturnsEmpty() {
+    txnManager.begin(mockSpark, "READ_COMMITTED", true);
+    TableIdentifier ident = TableIdentifier.of(Namespace.of("ns"), "orders");
+    Optional<String> result = txnManager.resolveMetadataLocation(mockSpark, ident);
+
+    assertThat(result).isEmpty();
+    // No server call at all for READ COMMITTED READ ONLY
+    verify(mockRestCatalog, never()).createTransactionSnapshot(anyInt());
+    verify(mockRestCatalog, never()).beginTransaction(anyString(), anyInt());
+    verify(mockRestCatalog, never()).resolveTableMetadataLocation(any(), anyString());
   }
 
   // -------------------------------------------------------------------------

@@ -227,14 +227,26 @@ public class JdbcTransactionPersistence {
       @Nullable Instant endedAt) {}
 
   public void insertTransaction(@Nonnull TransactionRow row) throws SQLException {
+    try (Connection conn = dataSource.getConnection()) {
+      conn.setAutoCommit(true);
+      insertTransaction(conn, row);
+    }
+  }
+
+  /**
+   * Inserts a {@code transactions} row on the <b>caller's</b> connection without touching
+   * autocommit. Lets {@link #beginTransactionAtomically} batch this insert into one shared
+   * transaction with the snapshot insert; the autocommit {@link #insertTransaction(TransactionRow)}
+   * delegates here.
+   */
+  public void insertTransaction(@Nonnull Connection conn, @Nonnull TransactionRow row)
+      throws SQLException {
     String sql =
         "INSERT INTO POLARIS_SCHEMA.transactions "
             + "(txn_id, parent_txn_id, realm_id, catalog_id, txn_token, owner_principal, "
             + " status, isolation, txn_snapshot_id, started_at, expires_at) "
             + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-    try (Connection conn = dataSource.getConnection();
-        PreparedStatement ps = conn.prepareStatement(sql)) {
-      conn.setAutoCommit(true);
+    try (PreparedStatement ps = conn.prepareStatement(sql)) {
       ps.setLong(1, row.txnId());
       setNullableLong(ps, 2, row.parentTxnId());
       ps.setString(3, row.realmId());
@@ -247,6 +259,63 @@ public class JdbcTransactionPersistence {
       ps.setTimestamp(10, Timestamp.from(row.startedAt()));
       ps.setTimestamp(11, Timestamp.from(row.expiresAt()));
       ps.executeUpdate();
+    }
+  }
+
+  /**
+   * Persists a new transaction and its optional linked read snapshot in a <b>single</b> database
+   * transaction, on one borrowed connection.
+   *
+   * <p>The autocommit-per-method alternative — {@link #captureReadPoint()} + {@link
+   * #insertTxnSnapshot(TxnSnapshotRow)} + {@link #insertTransaction(TransactionRow)} — borrows and
+   * returns three pooled connections for one client BEGIN. That triples begin's draw on the
+   * connection pool, which is the shared resource that saturates first under write concurrency.
+   * Folding the three round-trips into one keeps begin from becoming a connection multiplier while
+   * making no change to what is persisted: both rows are private to the not-yet-returned
+   * transaction, invisible to any other session until this method commits.
+   *
+   * <p>When {@code snapshotRow} is {@code null} (READ_COMMITTED write BEGIN) only the transaction
+   * row is inserted — still one connection, so the method is a safe fast path there too. When
+   * non-null, the {@code read_point} is (re)captured on this same connection via {@link
+   * #currentCommitScn(Connection)} and stamped onto the persisted snapshot, so the pinned read
+   * point reflects exactly the committed state visible on the connection that inserts it — the
+   * {@code readPoint} the caller put on {@code snapshotRow} is ignored.
+   *
+   * @param snapshotRow the linked snapshot to insert, or {@code null} for READ_COMMITTED. When
+   *     non-null, its {@code readPoint} is recomputed here (all other fields are used as given).
+   * @return the durable {@link TxnSnapshotRow} actually inserted (with the captured {@code
+   *     read_point}), or {@code null} when {@code snapshotRow} was {@code null}.
+   */
+  @Nullable
+  public TxnSnapshotRow beginTransactionAtomically(
+      @Nonnull TransactionRow txnRow, @Nullable TxnSnapshotRow snapshotRow) throws SQLException {
+    try (Connection conn = dataSource.getConnection()) {
+      boolean priorAutoCommit = conn.getAutoCommit();
+      conn.setAutoCommit(false);
+      try {
+        TxnSnapshotRow persistedSnapshot = null;
+        if (snapshotRow != null) {
+          long readPoint = currentCommitScn(conn);
+          persistedSnapshot =
+              new TxnSnapshotRow(
+                  snapshotRow.txnSnapshotId(),
+                  snapshotRow.realmId(),
+                  snapshotRow.catalogId(),
+                  readPoint,
+                  snapshotRow.createdAt(),
+                  snapshotRow.expiresAt(),
+                  snapshotRow.releasedAt());
+          insertTxnSnapshot(conn, persistedSnapshot);
+        }
+        insertTransaction(conn, txnRow);
+        conn.commit();
+        return persistedSnapshot;
+      } catch (SQLException | RuntimeException e) {
+        conn.rollback();
+        throw e;
+      } finally {
+        conn.setAutoCommit(priorAutoCommit);
+      }
     }
   }
 
@@ -732,13 +801,25 @@ public class JdbcTransactionPersistence {
       @Nullable Instant releasedAt) {}
 
   public void insertTxnSnapshot(@Nonnull TxnSnapshotRow row) throws SQLException {
+    try (Connection conn = dataSource.getConnection()) {
+      conn.setAutoCommit(true);
+      insertTxnSnapshot(conn, row);
+    }
+  }
+
+  /**
+   * Inserts a {@code txn_snapshots} row on the <b>caller's</b> connection without touching
+   * autocommit. Lets {@link #beginTransactionAtomically} batch this insert into one shared
+   * transaction with the transaction insert; the autocommit {@link
+   * #insertTxnSnapshot(TxnSnapshotRow)} delegates here.
+   */
+  public void insertTxnSnapshot(@Nonnull Connection conn, @Nonnull TxnSnapshotRow row)
+      throws SQLException {
     String sql =
         "INSERT INTO POLARIS_SCHEMA.txn_snapshots "
             + "(txn_snapshot_id, realm_id, catalog_id, read_point, created_at, expires_at) "
             + "VALUES (?, ?, ?, ?, ?, ?)";
-    try (Connection conn = dataSource.getConnection();
-        PreparedStatement ps = conn.prepareStatement(sql)) {
-      conn.setAutoCommit(true);
+    try (PreparedStatement ps = conn.prepareStatement(sql)) {
       ps.setLong(1, row.txnSnapshotId());
       ps.setString(2, row.realmId());
       ps.setLong(3, row.catalogId());

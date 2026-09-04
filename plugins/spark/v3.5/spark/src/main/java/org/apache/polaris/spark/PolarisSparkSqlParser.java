@@ -82,17 +82,20 @@ public class PolarisSparkSqlParser implements ParserInterface {
     if (normalized.equals("BEGIN") || normalized.equals("BEGIN TRANSACTION")) {
       SparkSession spark = SparkSession.active();
       String isolation = defaultIsolation(spark);
-      txnManager(spark).begin(spark, isolation);
+      txnManager(spark).begin(spark, isolation, false);
       return delegate.parsePlan(statusSql("Transaction pending -- isolation: " + isolation));
     }
 
     if (normalized.startsWith("BEGIN TRANSACTION ISOLATION LEVEL ")) {
       SparkSession spark = SparkSession.active();
-      String isolation =
-          parseIsolation(
-              normalized.substring("BEGIN TRANSACTION ISOLATION LEVEL ".length()).trim());
-      txnManager(spark).begin(spark, isolation);
-      return delegate.parsePlan(statusSql("Transaction pending -- isolation: " + isolation));
+      String rest = normalized.substring("BEGIN TRANSACTION ISOLATION LEVEL ".length()).trim();
+      // Standard SQL: ISOLATION LEVEL <level> [READ ONLY | READ WRITE]
+      String isolation = parseIsolation(rest);
+      boolean readOnly = parseAccessMode(rest);
+      txnManager(spark).begin(spark, isolation, readOnly);
+      String status =
+          "Transaction pending -- isolation: " + isolation + (readOnly ? ", READ ONLY" : "");
+      return delegate.parsePlan(statusSql(status));
     }
 
     if (normalized.startsWith("SET TRANSACTION ISOLATION LEVEL ")) {
@@ -315,10 +318,28 @@ public class PolarisSparkSqlParser implements ParserInterface {
   }
 
   private static String parseIsolation(String token) {
-    if (token.equals("REPEATABLE READ")) return "REPEATABLE_READ";
-    if (token.equals("READ COMMITTED")) return "READ_COMMITTED";
+    // Strip optional trailing access mode (READ ONLY / READ WRITE) before matching.
+    String level = stripAccessMode(token).trim();
+    if (level.equals("REPEATABLE READ")) return "REPEATABLE_READ";
+    if (level.equals("READ COMMITTED")) return "READ_COMMITTED";
     throw new IllegalArgumentException(
         "Unknown isolation level: " + token + ". Use REPEATABLE READ or READ COMMITTED.");
+  }
+
+  /** Returns true if the token ends with READ ONLY (standard SQL access mode). */
+  private static boolean parseAccessMode(String token) {
+    String t = token.trim();
+    if (t.endsWith(" READ ONLY")) return true;
+    if (t.endsWith(" READ WRITE")) return false;
+    return false; // default: READ WRITE
+  }
+
+  /** Strips the trailing READ ONLY / READ WRITE access mode token, if present. */
+  private static String stripAccessMode(String token) {
+    String t = token.trim();
+    if (t.endsWith(" READ ONLY")) return t.substring(0, t.length() - " READ ONLY".length());
+    if (t.endsWith(" READ WRITE")) return t.substring(0, t.length() - " READ WRITE".length());
+    return t;
   }
 
   /**

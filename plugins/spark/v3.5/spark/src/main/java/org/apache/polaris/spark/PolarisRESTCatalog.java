@@ -62,6 +62,7 @@ import org.apache.polaris.spark.rest.StagedTableCommitRESTRequest;
 import org.apache.polaris.spark.rest.SubtransactionRESTResponse;
 import org.apache.polaris.spark.rest.SubtransactionTableRESTRequest;
 import org.apache.polaris.spark.rest.TransactionRESTResponse;
+import org.apache.polaris.spark.rest.TransactionSnapshotRESTResponse;
 
 /**
  * [[PolarisRESTCatalog]] talks to Polaris REST APIs, and implements the PolarisCatalog interfaces,
@@ -302,6 +303,28 @@ public class PolarisRESTCatalog implements PolarisCatalog, Closeable {
                 ErrorHandlers.tableErrorHandler());
 
     return response.getTable();
+  }
+
+  /**
+   * POST /polaris/v1/{prefix}/transaction-snapshots — mints a stateless read-only snapshot handle.
+   *
+   * <p>No row is inserted; the returned opaque handle encodes the current read point and is
+   * reclaimed by the reaper after the TTL. Used by READ ONLY REPEATABLE READ transactions.
+   *
+   * @param leaseSeconds desired TTL for the handle
+   * @return opaque {@code txn_snapshot} handle (base64url-encoded read point)
+   */
+  public String createTransactionSnapshot(int leaseSeconds) {
+    TransactionSnapshotRESTResponse resp =
+        restClient
+            .withAuthSession(this.catalogAuth)
+            .post(
+                pathGenerator.transactionSnapshots(),
+                new BeginTransactionRESTRequest(null, leaseSeconds),
+                TransactionSnapshotRESTResponse.class,
+                Map.of(),
+                ErrorHandlers.defaultErrorHandler());
+    return resp.txnSnapshot();
   }
 
   /**

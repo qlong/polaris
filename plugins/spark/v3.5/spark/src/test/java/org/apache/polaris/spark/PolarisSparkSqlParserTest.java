@@ -20,6 +20,7 @@ package org.apache.polaris.spark;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -100,7 +101,8 @@ public class PolarisSparkSqlParserTest {
 
       parser.parsePlan(sql);
 
-      verify(mockTxnManager).begin(any(), anyString());
+      // Plain BEGIN defaults to READ WRITE (readOnly=false)
+      verify(mockTxnManager).begin(any(), anyString(), eq(false));
       verify(mockDelegate).parsePlan(anyString()); // returns status SELECT
     }
   }
@@ -113,7 +115,7 @@ public class PolarisSparkSqlParserTest {
 
       parser.parsePlan("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ");
 
-      verify(mockTxnManager).begin(mockSpark, "REPEATABLE_READ");
+      verify(mockTxnManager).begin(mockSpark, "REPEATABLE_READ", false);
     }
   }
 
@@ -125,7 +127,60 @@ public class PolarisSparkSqlParserTest {
 
       parser.parsePlan("BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED");
 
-      verify(mockTxnManager).begin(mockSpark, "READ_COMMITTED");
+      verify(mockTxnManager).begin(mockSpark, "READ_COMMITTED", false);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // READ ONLY / READ WRITE access mode
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void testBeginRepeatableReadReadOnly() throws Exception {
+    try (org.mockito.MockedStatic<SparkSession> staticMock =
+        org.mockito.Mockito.mockStatic(SparkSession.class)) {
+      staticMock.when(SparkSession::active).thenReturn(mockSpark);
+
+      parser.parsePlan("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+
+      verify(mockTxnManager).begin(mockSpark, "REPEATABLE_READ", true);
+    }
+  }
+
+  @Test
+  public void testBeginReadCommittedReadOnly() throws Exception {
+    try (org.mockito.MockedStatic<SparkSession> staticMock =
+        org.mockito.Mockito.mockStatic(SparkSession.class)) {
+      staticMock.when(SparkSession::active).thenReturn(mockSpark);
+
+      parser.parsePlan("BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY");
+
+      verify(mockTxnManager).begin(mockSpark, "READ_COMMITTED", true);
+    }
+  }
+
+  @Test
+  public void testBeginRepeatableReadReadWrite() throws Exception {
+    // Explicit READ WRITE is the default — treated identically to omitting it.
+    try (org.mockito.MockedStatic<SparkSession> staticMock =
+        org.mockito.Mockito.mockStatic(SparkSession.class)) {
+      staticMock.when(SparkSession::active).thenReturn(mockSpark);
+
+      parser.parsePlan("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ WRITE");
+
+      verify(mockTxnManager).begin(mockSpark, "REPEATABLE_READ", false);
+    }
+  }
+
+  @Test
+  public void testBeginReadOnlyCaseInsensitive() throws Exception {
+    try (org.mockito.MockedStatic<SparkSession> staticMock =
+        org.mockito.Mockito.mockStatic(SparkSession.class)) {
+      staticMock.when(SparkSession::active).thenReturn(mockSpark);
+
+      parser.parsePlan("begin transaction isolation level repeatable read read only");
+
+      verify(mockTxnManager).begin(mockSpark, "REPEATABLE_READ", true);
     }
   }
 
@@ -223,7 +278,7 @@ public class PolarisSparkSqlParserTest {
       parser.parsePlan(sql);
 
       verify(mockDelegate).parsePlan(sql);
-      verify(mockTxnManager, never()).begin(any(), anyString());
+      verify(mockTxnManager, never()).begin(any(), anyString(), anyBoolean());
       verify(mockTxnManager, never()).commit(any());
       verify(mockTxnManager, never()).rollback(any());
     }

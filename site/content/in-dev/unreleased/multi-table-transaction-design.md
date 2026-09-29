@@ -240,7 +240,7 @@ When a client reads a table, the server resolves the appropriate Iceberg table s
 The correct multi-table read pattern:
 
 ```
-1. POST /v1/txn-snapshots                              → txn_snapshot=<handle>, read_point=5050
+1. POST /v1/transaction-snapshots                              → txn_snapshot=<handle>, read_point=5050
 2. GET  /v1/tables/orders?txn_snapshot=<handle>        → table_snapshot_id=42 (visible to RS)
 3. GET  /v1/tables/customers?txn_snapshot=<handle>     → table_snapshot_id=17 (visible to RS)
    Both tables are consistent at the same logical point in transaction history.
@@ -723,7 +723,7 @@ Simple, stateless. Equivalent to PostgreSQL `READ COMMITTED` for a single statem
 ### Multi-Table Consistent Read (New)
 
 ```
-1. Client: POST /v1/txn-snapshots
+1. Client: POST /v1/transaction-snapshots
    → Server captures read_point = current commit high-water-mark
    → Encodes it into handle = base64url({"v":1,"r":<read_point>})
    → Returns { txn_snapshot: "<handle>", read_point: <informational> }
@@ -812,7 +812,7 @@ This is the read analog of PostgreSQL's `pg_export_snapshot()` / `SET TRANSACTIO
 
 ```
 Orchestrator:
-  POST /v1/txn-snapshots
+  POST /v1/transaction-snapshots
   ← { txn_snapshot: "eyJ2IjoxLCJyIjo1MDUwfQ", read_point: 5050 }
   (handle = base64url({"v":1,"r":5050}))
 
@@ -1062,7 +1062,7 @@ Even if App1 and App2 each acquire their own snapshot independently, they still 
 
 ```
 -- Orchestrator acquires ONE snapshot before launching any app:
-Orchestrator: POST /v1/txn-snapshots
+Orchestrator: POST /v1/transaction-snapshots
   ← { txn_snapshot: "eyJ2IjoxLCJyIjo1MDEwfQ", read_point: 5010 }
   (captured before W commits at commit_scn=5011; handle encodes read_point=5010)
 
@@ -1082,7 +1082,7 @@ No explicit release needed — handle expires after L seconds.
 **What if the orchestrator wants to include W?** Acquire a handle *after* W commits:
 ```
 -- W commits at commit_scn=5011
-Orchestrator: POST /v1/txn-snapshots
+Orchestrator: POST /v1/transaction-snapshots
   ← { txn_snapshot: "eyJ2IjoxLCJyIjo1MDExfQ", read_point: 5011 }
   (captures state after W)
 
@@ -1471,7 +1471,7 @@ WHERE read_point < :cts_watermark
 Used by pure readers that need a consistent multi-table view. No `txn_id` or CLOG entry is created. The server captures a `read_point`, encodes it into an opaque string handle, and returns it. No server row is inserted — the handle is self-contained and reclaimed purely by TTL (`L = 3600 s` hardcoded; the reaper advances the read floor once all handles older than `L + skew_pad` are past their horizon).
 
 ```
-POST   /v1/txn-snapshots
+POST   /v1/transaction-snapshots
   ← { txn_snapshot: "<opaque handle>", read_point: <informational>, expires_at: null }
   -- txn_snapshot is base64url({"v":1,"r":<read_point>}); ~18–46 chars
   -- expires_at is null for standalone read handles (TTL is server-side, not per-handle)
@@ -1576,7 +1576,7 @@ GET    /v1/tables/{table_uuid}/locks                 Inspect active locks on a t
 
 ```
 GET /v1/{prefix}/namespaces/{namespace}/tables/{table}
-    ?txn_snapshot={handle}       optional: consistent pinned read (opaque handle from POST /txn-snapshots)
+    ?txn_snapshot={handle}       optional: consistent pinned read (opaque handle from POST /transaction-snapshots)
     &txn_id={txn_id}             optional: read-your-own-writes within a transaction
 ```
 

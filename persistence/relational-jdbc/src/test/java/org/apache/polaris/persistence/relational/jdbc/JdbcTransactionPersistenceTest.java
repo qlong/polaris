@@ -681,6 +681,33 @@ class JdbcTransactionPersistenceTest {
     assertThat(persistence.resolveTableSnapshot("uuid-purge", atTen)).isEmpty();
   }
 
+  @Test
+  void purgeCommittedSnapshotsBelowWatermarkNeverDropsLoneSurvivor() throws SQLException {
+    // A table with a single, very old row — far below the watermark. Age alone must never remove
+    // the last pointer for a table: purge deletes only rows strictly older than the per-table
+    // survivor, and a lone row IS its own survivor. This is the "t1 has one ancient row" case: we
+    // guarantee at least one (the latest) row per table always remains resolvable.
+    insertCtsWithScn("uuid-lone", 5L, "s3://lone5.json");
+
+    // Watermark far above the only row.
+    persistence.purgeCommittedSnapshotsBelowWatermark(1000L);
+
+    // The lone row survives and still resolves for a snapshot at (or above) its scn.
+    Instant now = Instant.now();
+    JdbcTransactionPersistence.TxnSnapshotRow atFive =
+        new JdbcTransactionPersistence.TxnSnapshotRow(
+            persistence.nextTxnId(), REALM, CATALOG_ID, 5L, now, now.plusSeconds(60), null);
+    assertThat(persistence.resolveTableSnapshot("uuid-lone", atFive))
+        .hasValueSatisfying(r -> assertThat(r.metadataLocation()).isEqualTo("s3://lone5.json"));
+
+    // A snapshot pinned at the watermark still resolves the table (unchanged since scn=5).
+    JdbcTransactionPersistence.TxnSnapshotRow atWatermark =
+        new JdbcTransactionPersistence.TxnSnapshotRow(
+            persistence.nextTxnId(), REALM, CATALOG_ID, 1000L, now, now.plusSeconds(60), null);
+    assertThat(persistence.resolveTableSnapshot("uuid-lone", atWatermark))
+        .hasValueSatisfying(r -> assertThat(r.metadataLocation()).isEqualTo("s3://lone5.json"));
+  }
+
   /** Inserts a committed_table_snapshots row with an explicit commit_scn (via the primitive). */
   private void insertCtsWithScn(String tableUuid, long scn, String metadataLocation)
       throws SQLException {

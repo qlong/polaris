@@ -110,6 +110,17 @@ cp "${SCRIPT_DIR}/polaris-server.properties" "${CONFIG_DIR}/application.properti
 # ---------------------------------------------------------------------------
 # Start server — always pass bootstrap credentials since the DB is always fresh
 # ---------------------------------------------------------------------------
+# Run Java via mise when available (the maintainer's setup); otherwise fall back
+# to whatever `java` is on PATH so the script works on a stock machine.
+if command -v mise > /dev/null 2>&1; then
+  JAVA_RUNNER=(mise exec -- java)
+elif command -v java > /dev/null 2>&1; then
+  JAVA_RUNNER=(java)
+else
+  echo "✗ No Java found. Install a JDK 21+ (or mise) and retry."
+  exit 1
+fi
+
 echo "Starting Polaris server..."
 echo "  JAR:  ${JAR}"
 echo "  Log:  ${LOG}"
@@ -118,7 +129,7 @@ echo "  Config: ${CONFIG_DIR}/application.properties"
 cd "${CONFIG_DIR}/.."   # working dir = demos/multi-table-transaction so config/ is found
 
 POLARIS_BOOTSTRAP_CREDENTIALS=POLARIS,root,s3cr3t \
-  mise exec -- java -jar "${JAR}" > "${LOG}" 2>&1 &
+  "${JAVA_RUNNER[@]}" -jar "${JAR}" > "${LOG}" 2>&1 &
 
 SERVER_PID=$!
 echo "  PID:  ${SERVER_PID}"

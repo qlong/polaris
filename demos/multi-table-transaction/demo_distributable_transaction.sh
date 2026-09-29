@@ -75,9 +75,12 @@ step()   { echo; printf '%s\n' "${BOLD}${HEAD}━━━ $* ━━━${RST}"; }
 # ("who's acting now?") gives scannability without painting whole sentences —
 # long descriptions no longer become walls of color.
 say()    { printf '%s%s%s %s\n' "${BOLD}${MAGENTA}" "$1" "${RST}" "$2"; }
-sqlc()   { printf '%s    -- equivalent SQL: %s%s\n' "${DIM}" "$*" "${RST}"; }
-curlc()  { printf '%s    $ %s%s\n' "${ACCENT}" "$*" "${RST}"; }
-sql()    { printf '%s    %s%s\n' "${ACCENT}" "$*" "${RST}"; }
+# In Demo 4 the SQL and the REST call are EQUALLY important — the SQL is the
+# mental model, the curl is the real protocol you'd call. Both get bold accent so
+# neither recedes; the leading label ("equivalent SQL:" vs "$") tells them apart.
+sqlc()   { printf '%s    equivalent SQL:  %s%s\n' "${BOLD}${ACCENT}" "$*" "${RST}"; }
+curlc()  { printf '%s    $ %s%s\n' "${BOLD}${ACCENT}" "$*" "${RST}"; }
+sql()    { printf '%s    %s%s\n' "${BOLD}${ACCENT}" "$*" "${RST}"; }
 fail()   { printf '%s    %s%s\n' "${RED}" "$*" "${RST}"; }
 # pause [hint] — waits for Enter. The optional hint names the NEXT beat, dim so
 # the (frequently repeated) prompt recedes instead of dominating the output.

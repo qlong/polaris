@@ -34,14 +34,15 @@ so you will almost certainly need to override them.
 
 | Variable | What it is | Default in `spark-env.sh` |
 |---|---|---|
-| `SPARK_HOME` | A Spark 4.1.x distribution (Scala 2.13) | `${HOME}/spark-4.1.2-bin-hadoop3-connect` |
-| `ICEBERG_JAR` | Iceberg Spark 4.1 runtime fat jar (`1.11.0` release works) | `${HOME}/opensources/iceberg/spark/v4.1/spark-runtime/build/libs/...` (a local `1.12.0-SNAPSHOT` build) |
-| `TRINO_CLI` | Trino CLI executable jar, built from the Trino fork (only for the Trino reader demos) | `${HOME}/opensources/trino/client/trino-cli/target/trino-cli-483-SNAPSHOT-executable.jar` |
+| `SPARK_HOME` | The Spark 4.1.2 distribution (Scala 2.13) | `${HOME}/spark-4.1.2-bin-hadoop3-connect` |
+| `ICEBERG_JAR` | Iceberg Spark 4.1 runtime fat jar (released `1.11.0`) | `${HOME}/demo-jars/iceberg-spark-runtime-4.1_2.13-1.11.0.jar` |
+| `TRINO_CLI` | Trino CLI executable jar, built from the Trino fork (only for the Trino reader demos) | `${HOME}/opensources/launch/trino/client/trino-cli/target/trino-cli-483-SNAPSHOT-executable.jar` |
 | `POLARIS_PLUGIN_JAR` | Polaris Spark plugin bundle | **built from this repo** — resolved automatically |
 
 ### 1. Spark
 
-Download a Spark 4.1.x distribution built for Scala 2.13 and point `SPARK_HOME` at it:
+Download the released **Spark 4.1.2** distribution built for Scala 2.13
+(`spark-4.1.2-bin-hadoop3-connect`) and point `SPARK_HOME` at it:
 
 ```bash
 export SPARK_HOME=/path/to/spark-4.1.2-bin-hadoop3-connect
@@ -53,32 +54,40 @@ The released **Iceberg 1.11.0** Spark 4.1 runtime works and is on Maven Central,
 just download it — no Iceberg source build required:
 
 ```bash
-curl -LO https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-4.1_2.13/1.11.0/iceberg-spark-runtime-4.1_2.13-1.11.0.jar
-export ICEBERG_JAR=$PWD/iceberg-spark-runtime-4.1_2.13-1.11.0.jar
+mkdir -p ~/demo-jars
+curl -L -o ~/demo-jars/iceberg-spark-runtime-4.1_2.13-1.11.0.jar \
+  https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-4.1_2.13/1.11.0/iceberg-spark-runtime-4.1_2.13-1.11.0.jar
 ```
 
-The default in `spark-env.sh` points at a locally built `1.12.0-SNAPSHOT` simply because
-that is what the author had checked out; the demo does not depend on anything newer than
-1.11. (For reference, Polaris itself builds against Iceberg 1.10.1 — see
-`gradle/libs.versions.toml`.)
+That `~/demo-jars/` path is exactly the `ICEBERG_JAR` default in `spark-env.sh`, so no
+export is needed. The demo does not depend on anything newer than 1.11. (For reference,
+Polaris itself builds against Iceberg 1.10.1 — see `gradle/libs.versions.toml`.)
 
-If you do want to build from an Iceberg checkout instead:
+If you would rather build from an Iceberg checkout, produce the runtime jar and point
+`ICEBERG_JAR` at it:
 
 ```bash
 ./gradlew :iceberg-spark:iceberg-spark-runtime-4.1_2.13:shadowJar
-export ICEBERG_JAR=$PWD/spark/v4.1/spark-runtime/build/libs/iceberg-spark-runtime-4.1_2.13-1.12.0-SNAPSHOT.jar
+export ICEBERG_JAR=$PWD/spark/v4.1/spark-runtime/build/libs/iceberg-spark-runtime-4.1_2.13-*.jar
 ```
 
-### 3. Polaris Spark plugin (built here)
+### 3. Polaris server + Spark plugin (both built from this repo)
 
-This one comes from this repo, so `spark-env.sh` resolves it relative to the repo root —
-no override needed. Build it once:
+Two jars come from this Polaris checkout. Build both once, from the repo root, before
+running anything below:
 
 ```bash
+# Polaris server (Quarkus). start-polaris.sh requires this jar and exits if it is missing.
+./gradlew :polaris-runtime-service:quarkusBuild
+
+# Spark plugin (SparkCatalog facade + BEGIN/COMMIT/ROLLBACK).
 ./gradlew :polaris-spark-3.5_2.13:build -x test
 ```
 
-If the jar is missing, `spark-env.sh` prints a warning naming this command.
+Both are resolved automatically: `start-polaris.sh` finds the server jar under
+`runtime/service/build/`, and `spark-env.sh` finds the plugin jar relative to the repo
+root — no overrides needed. If either jar is missing, the script that needs it prints the
+exact `./gradlew` command to build it.
 
 ### 4. Trino (optional — reader-side isolation demos)
 
@@ -89,10 +98,14 @@ support for pinned read snapshots, so the isolation demos would not demonstrate 
 Build the fork (branch `lakehouse-transactions`), which produces both the server and the CLI:
 
 ```bash
-# in your Trino fork checkout
+cd ~/opensources/launch/trino
 ./mvnw -pl client/trino-cli -am -DskipTests package
 export TRINO_CLI=$PWD/client/trino-cli/target/trino-cli-483-SNAPSHOT-executable.jar
 ```
+
+That `~/opensources/launch/trino/...` path is the `TRINO_CLI` default in
+`demo_distributable_transaction.sh`, so the export is only needed if your fork lives
+elsewhere.
 
 Then start the Trino server from that same build and run the CLI against it:
 
@@ -115,8 +128,10 @@ Two notes on versions:
 
 ## Running the demo
 
+Build the two jars from step 3 first, then run these from the repo root:
+
 ```bash
-# 1. Start PostgreSQL (Docker) + build and start Polaris
+# 1. Start PostgreSQL (Docker) + a fresh Polaris server (uses the jar built in step 3)
 ./demos/multi-table-transaction/start-polaris.sh
 
 # 2. Configure the environment (prints what it resolved)

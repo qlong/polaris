@@ -32,12 +32,12 @@ export SPARK_HOME="${SPARK_HOME:-${HOME}/spark-4.1.2-bin-hadoop3-connect}"
 
 # ---------------------------------------------------------------------------
 # Iceberg runtime jar (fat jar, includes all Iceberg dependencies for Spark).
-# Spark 4.1 runtime jar is forward-compatible with Spark 4.2.
+# Use the Spark 4.1 runtime jar with the pinned Spark 4.1.2 distribution above.
 #
-# This default is a locally built 1.12.0-SNAPSHOT, but the demo does not require it:
-# the released 1.11.0 Spark 4.1 runtime is on Maven Central and works. See README.md.
+# The default is the released 1.11.0 Spark 4.1 runtime from Maven Central.
+# Download it with the curl command in README.md (no local Iceberg build needed).
 # ---------------------------------------------------------------------------
-export ICEBERG_JAR="${ICEBERG_JAR:-${HOME}/opensources/iceberg/spark/v4.1/spark-runtime/build/libs/iceberg-spark-runtime-4.1_2.13-1.12.0-SNAPSHOT.jar}"
+export ICEBERG_JAR="${ICEBERG_JAR:-${HOME}/demo-jars/iceberg-spark-runtime-4.1_2.13-1.11.0.jar}"
 
 # ---------------------------------------------------------------------------
 # Polaris Spark plugin jar (provides SparkCatalog facade + BEGIN/COMMIT/ROLLBACK)

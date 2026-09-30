@@ -57,7 +57,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/spark-env.sh"
 
-TRINO_CLI="${TRINO_CLI:-${HOME}/opensources/trino/client/trino-cli/target/trino-cli-483-SNAPSHOT-executable.jar}"
+TRINO_CLI="${TRINO_CLI:-${HOME}/opensources/launch/trino/client/trino-cli/target/trino-cli-483-SNAPSHOT-executable.jar}"
 TRINO_SERVER="${TRINO_SERVER:-localhost:8080}"
 
 # Transaction REST base: polaris/v1/{prefix}/transactions, prefix = catalog.

@@ -94,7 +94,7 @@ esac
 
 if [ ! -f "${ICEBERG_JAR}" ]; then
   echo "✗ Iceberg runtime jar not found: ${ICEBERG_JAR}"
-  echo "  Build it with: cd ~/opensources/iceberg && ./gradlew :iceberg-spark-runtime-4.1:build"
+  echo "  Download it with: mkdir -p ~/demo-jars && curl -L -o ~/demo-jars/iceberg-spark-runtime-4.1_2.13-1.11.0.jar https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-4.1_2.13/1.11.0/iceberg-spark-runtime-4.1_2.13-1.11.0.jar"
   exit 1
 fi
 

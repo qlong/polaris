@@ -17,6 +17,16 @@
   under the License.
 -->
 
+> **Part of [lakehouse-transactions](https://github.com/qlong/lakehouse-transactions).** This fork's
+> **`lakehouse-transactions`** branch adds multi-table transactions to Apache Polaris — the catalog
+> coordinator side of the project (the matching reader-side work is in the Trino fork). See the hub
+> for the design docs and demo; the runnable demo lives in
+> [`demos/multi-table-transaction/`](demos/multi-table-transaction/) (start with its `DEMOS.md`).
+>
+> Everything below is the upstream Apache Polaris README, unchanged.
+
+---
+
 # Apache Polaris
 
 Apache Polaris&trade; is an open-source, fully-featured catalog for Apache Iceberg&trade;. It implements Iceberg's 

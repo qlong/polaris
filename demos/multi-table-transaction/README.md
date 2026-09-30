@@ -36,7 +36,7 @@ so you will almost certainly need to override them.
 |---|---|---|
 | `SPARK_HOME` | The Spark 4.1.2 distribution (Scala 2.13) | `${HOME}/spark-4.1.2-bin-hadoop3-connect` |
 | `ICEBERG_JAR` | Iceberg Spark 4.1 runtime fat jar (released `1.11.0`) | `${HOME}/demo-jars/iceberg-spark-runtime-4.1_2.13-1.11.0.jar` |
-| `TRINO_CLI` | Trino CLI executable jar, built from the Trino fork (only for the Trino reader demos) | `${HOME}/opensources/launch/trino/client/trino-cli/target/trino-cli-483-SNAPSHOT-executable.jar` |
+| `TRINO_CLI` | Trino CLI executable jar, built from the Trino fork (only for the Trino reader demos) | *(set this)* `/path/to/trino/client/trino-cli/target/trino-cli-483-SNAPSHOT-executable.jar` |
 | `POLARIS_PLUGIN_JAR` | Polaris Spark plugin bundle | **built from this repo** — resolved automatically |
 
 ### 1. Spark
@@ -98,14 +98,13 @@ support for pinned read snapshots, so the isolation demos would not demonstrate 
 Build the fork (branch `lakehouse-transactions`), which produces both the server and the CLI:
 
 ```bash
-cd ~/opensources/launch/trino
+cd /path/to/trino          # your Trino fork checkout (lakehouse-transactions branch)
 ./mvnw -pl client/trino-cli -am -DskipTests package
 export TRINO_CLI=$PWD/client/trino-cli/target/trino-cli-483-SNAPSHOT-executable.jar
 ```
 
-That `~/opensources/launch/trino/...` path is the `TRINO_CLI` default in
-`demo_distributable_transaction.sh`, so the export is only needed if your fork lives
-elsewhere.
+Set `TRINO_CLI` to the jar you just built (as above), or the demo scripts fall back to a
+machine-specific default that will not match your checkout.
 
 Then start the Trino server from that same build and run the CLI against it:
 
@@ -140,18 +139,22 @@ source ./demos/multi-table-transaction/spark-env.sh
 # 3. Seed the tables — idempotent, run before every demo
 ./demos/multi-table-transaction/setup_spark_tables.sh
 
-# 4. Pick a demo
-./demos/multi-table-transaction/demo_distributable_transaction.sh
+# 4. Run the demos — see DEMOS.md
 ```
 
 `spark-env.sh` echoes each resolved path when sourced, so check its output before
 running a demo — a wrong `SPARK_HOME` or `ICEBERG_JAR` shows up there first.
 
-## Walkthroughs
+## The demos
 
-- [`demo_interactive.md`](demo_interactive.md) — step-by-step interactive session
-- [`demo_superpowers.md`](demo_superpowers.md) — the capabilities the demo highlights
-- [`demo_trino.sql`](demo_trino.sql) — Trino reader queries
+[**`DEMOS.md`**](DEMOS.md) is the run-sheet for the four demos — terminal layout, the exact commands
+per terminal, and the expected result of each:
+
+1. **RC tears, RR doesn't** — READ COMMITTED catches a torn read; REPEATABLE READ, pinned first, does not.
+2. **No partial write** — an atomic multi-table write is never visible half-applied.
+3. **Fan-out read** — one snapshot handle shared by Spark *and* Trino.
+4. **Fan-out write** — one transaction fanned out to independent workers (scripted:
+   [`demo_distributable_transaction.sh`](demo_distributable_transaction.sh)).
 
 ## Notes
 

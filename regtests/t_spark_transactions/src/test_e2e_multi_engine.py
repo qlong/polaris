@@ -601,7 +601,7 @@ class TestEndToEndSparkAndTrino:
 
         REPEATABLE-READ pinning is exercised two ways elsewhere:
           - SQL-level `START TRANSACTION ISOLATION LEVEL REPEATABLE READ` (manual / CLI; see
-            demos/multi-table-transaction/demo_interactive.md Part 3), and
+            demos/multi-table-transaction/DEMOS.md), and
           - the explicit `SET SESSION polaris_read_snapshot` path
             (test_trino_explicit_snapshot_pinned_across_spark_subtxn_commit).
         """

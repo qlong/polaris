@@ -57,7 +57,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/spark-env.sh"
 
-TRINO_CLI="${TRINO_CLI:-${HOME}/opensources/launch/trino/client/trino-cli/target/trino-cli-483-SNAPSHOT-executable.jar}"
+# TRINO_CLI must point at the Trino CLI jar you built from the Trino fork (see README.md).
+# No default: the path is specific to your checkout.
+if [ -z "${TRINO_CLI:-}" ] || [ ! -f "${TRINO_CLI}" ]; then
+  echo "✗ TRINO_CLI is not set to an existing Trino CLI jar."
+  echo "  Build it from your Trino fork checkout:"
+  echo "    cd /path/to/trino && ./mvnw -pl client/trino-cli -am -DskipTests package"
+  echo "  Then export the path, e.g.:"
+  echo "    export TRINO_CLI=/path/to/trino/client/trino-cli/target/trino-cli-483-SNAPSHOT-executable.jar"
+  exit 1
+fi
 TRINO_SERVER="${TRINO_SERVER:-localhost:8080}"
 
 # Transaction REST base: polaris/v1/{prefix}/transactions, prefix = catalog.

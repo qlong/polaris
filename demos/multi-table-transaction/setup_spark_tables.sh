@@ -191,5 +191,5 @@ SELECT 'customers current snapshot_id: ' || snapshot_id
 echo ""
 echo "================================================================="
 echo "  Tables created and seeded successfully."
-echo "  Run the interactive demo: see demo_interactive.md"
+echo "  Run the demos: see DEMOS.md"
 echo "================================================================="

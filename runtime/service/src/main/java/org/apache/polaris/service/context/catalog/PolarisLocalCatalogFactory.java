@@ -44,6 +44,7 @@ import org.apache.polaris.service.events.PolarisEventDispatcher;
 import org.apache.polaris.service.events.PolarisEventMetadataFactory;
 import org.apache.polaris.service.task.TaskExecutor;
 import org.apache.polaris.service.transaction.LockManager;
+import org.apache.polaris.service.transaction.TransactionSchemaSupport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -134,7 +135,15 @@ public class PolarisLocalCatalogFactory implements LocalCatalogFactory {
     // CatalogEntity.
     catalogInstance.initialize(catalogName, catalogProperties);
 
-    if (jdbcDataSources.isResolvable() && datasourceOperations.isResolvable()) {
+    // Only wire transaction persistence when the LIVE schema actually has the v5 transaction
+    // tables. Presence of a JDBC datasource is not sufficient: a dialect without a v5 script
+    // (or a deployment bootstrapped at an older version) is JDBC-backed but has no
+    // committed_table_snapshots / commit_scn_counter, and writing to them would fail every commit.
+    // Leaving jdbcTransactionPersistence null makes IcebergCatalog take its non-transactional
+    // path, which is the pre-existing upstream behaviour.
+    if (jdbcDataSources.isResolvable()
+        && datasourceOperations.isResolvable()
+        && TransactionSchemaSupport.isSupported(callContext)) {
       try {
         JdbcTransactionPersistence jdbcTx =
             new JdbcTransactionPersistence(

@@ -96,6 +96,14 @@ public class JdbcBasePersistenceImpl implements BasePersistence, IntegrationPers
   // The max number of components a location can have before the optimized sibling check is not used
   private static final int MAX_LOCATION_COMPONENTS = 40;
 
+  /**
+   * First schema version that contains the multi-table transaction tables ({@code transactions},
+   * {@code committed_table_snapshots}, {@code commit_scn_counter}, {@code locks}, ...). Deployments
+   * on an older schema -- including dialects for which a v5 script has not been written -- must not
+   * take any code path that reads or writes those tables.
+   */
+  public static final int TRANSACTION_SCHEMA_VERSION = 5;
+
   public JdbcBasePersistenceImpl(
       PolarisDiagnostics diagnostics,
       DatasourceOperations databaseOperations,
@@ -109,6 +117,23 @@ public class JdbcBasePersistenceImpl implements BasePersistence, IntegrationPers
     this.storageIntegrationProvider = storageIntegrationProvider;
     this.realmId = realmId;
     this.schemaVersion = schemaVersion;
+  }
+
+  /**
+   * Returns the schema version this persistence instance was bootstrapped against, as read from the
+   * {@code version} row of the live database.
+   */
+  public int getSchemaVersion() {
+    return schemaVersion;
+  }
+
+  /**
+   * Whether the live schema contains the multi-table transaction tables. This is the gate for every
+   * transaction-aware code path: {@code committed_table_snapshots} and {@code commit_scn_counter}
+   * only exist from schema v5 onward, and only for dialects that ship a v5 script.
+   */
+  public boolean supportsTransactions() {
+    return schemaVersion >= TRANSACTION_SCHEMA_VERSION;
   }
 
   @Override

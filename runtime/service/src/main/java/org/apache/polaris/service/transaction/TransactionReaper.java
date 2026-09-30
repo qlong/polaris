@@ -180,6 +180,16 @@ public class TransactionReaper {
     if (dataSources.isUnsatisfied()) {
       return 0;
     }
+    // Nothing to reap on a schema that has no transaction tables. Every query below targets
+    // `transactions` / `locks` / `committed_table_snapshots`, so without this guard a deployment on
+    // a dialect that ships no v5 script logs a SQL error on every tick, forever.
+    if (!TransactionSchemaSupport.isSupported(datasourceOperations.getDatabaseType())) {
+      LOGGER
+          .atDebug()
+          .addKeyValue("databaseType", datasourceOperations.getDatabaseType())
+          .log("Transaction reaper is a no-op: relational schema has no transaction tables");
+      return 0;
+    }
     DataSource ds = dataSources.get();
     int total = 0;
     for (String realm : realmsCsv.split(",")) {

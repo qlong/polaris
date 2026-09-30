@@ -149,6 +149,7 @@ import org.apache.polaris.service.http.IcebergHttpUtil;
 import org.apache.polaris.service.http.IfNoneMatch;
 import org.apache.polaris.service.reporting.PolarisMetricsReporter;
 import org.apache.polaris.service.transaction.LockManager;
+import org.apache.polaris.service.transaction.TransactionSchemaSupport;
 import org.apache.polaris.service.transaction.TransactionService;
 import org.apache.polaris.service.types.NotificationRequest;
 import org.slf4j.Logger;
@@ -920,11 +921,14 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
 
   /**
    * Returns a {@link JdbcTransactionPersistence} for the current catalog and realm if JDBC
-   * persistence is active, or {@code null} if not (e.g. in-memory or NoSQL deployments).
+   * persistence is active <i>and</i> the live schema contains the transaction tables, or {@code
+   * null} if not (e.g. in-memory or NoSQL deployments, or a dialect/schema version without v5).
    */
   @Nullable
   private JdbcTransactionPersistence buildJdbcTransactionPersistenceIfActive() {
-    if (!jdbcDataSource().isResolvable() || !datasourceOperations().isResolvable()) {
+    if (!jdbcDataSource().isResolvable()
+        || !datasourceOperations().isResolvable()
+        || !TransactionSchemaSupport.isSupported(callContext())) {
       return null;
     }
     try {
@@ -1046,6 +1050,12 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
     if (!jdbcDataSource().isResolvable() || !datasourceOperations().isResolvable()) {
       throw new ServiceUnavailableException(
           "Multi-table transaction JDBC persistence is not available in this deployment");
+    }
+    if (!TransactionSchemaSupport.isSupported(callContext())) {
+      throw new ServiceUnavailableException(
+          "Multi-table transactions require relational schema v"
+              + JdbcBasePersistenceImpl.TRANSACTION_SCHEMA_VERSION
+              + " or later; this deployment's schema does not provide the transaction tables");
     }
     try {
       JdbcTransactionPersistence persistence =

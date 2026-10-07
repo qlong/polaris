@@ -798,9 +798,14 @@ public class TransactionService {
    * abort the transaction and throw {@link SerializationFailureException} before this returns.
    * {@code mergeRetry} is always empty for inline transactions (kept for API symmetry with {@link
    * PrepareCommitResult}).
+   *
+   * @param mergeOnConflict whether a conflict found at finalize time (a commit that landed after
+   *     this check) may be resolved by re-applying appends onto the new table state. True for
+   *     READ_COMMITTED; false for REPEATABLE_READ, where any concurrent commit is a serialization
+   *     failure, as it is here.
    */
   public record PrepareInlineResult(
-      List<StagedTableInfo> direct, List<StagedTableInfo> mergeRetry) {}
+      List<StagedTableInfo> direct, List<StagedTableInfo> mergeRetry, boolean mergeOnConflict) {}
 
   /**
    * Validates and classifies the inline staged tables provided by the client (Use Case 1).
@@ -811,11 +816,13 @@ public class TransactionService {
    *
    * <ul>
    *   <li>Any concurrent write → first-committer-wins; aborts the transaction and throws {@link
-   *       SerializationFailureException}. Merge-and-retry is not used for inline transactions
-   *       because there is no server-held staged file to re-parent onto the new table state.
+   *       SerializationFailureException}. This includes a table that had no committed version at
+   *       the read point but has one now.
    * </ul>
    *
-   * For READ_COMMITTED all tables are routed directly (no snapshot baseline).
+   * For READ_COMMITTED all tables are routed directly (no snapshot baseline). Inline transactions
+   * hold no locks, so the table can still move after this check; finalize re-checks each table
+   * against the state it commits over (see {@link PrepareInlineResult#mergeOnConflict()}).
    */
   public PrepareInlineResult prepareInlineCommit(
       long txnId, String txnToken, List<StagedTableInfo> inputTables) throws SQLException {
@@ -841,7 +848,12 @@ public class TransactionService {
             resolveTableMetadataLocationByRow(snapshotKey, txn.txnSnapshotId()).orElse(null);
       }
 
-      boolean conflict = baselineMeta != null && !baselineMeta.equals(currentMeta);
+      // Same two cases as prepareCommit: the baseline moved, or there was no committed version at
+      // the read point but a concurrent writer has since committed one.
+      boolean conflict =
+          txn.txnSnapshotId() != null
+              && currentMeta != null
+              && (baselineMeta == null || !baselineMeta.equals(currentMeta));
       if (!conflict) {
         direct.add(
             new StagedTableInfo(
@@ -851,9 +863,8 @@ public class TransactionService {
                 info.lockMode(),
                 snapshotKey));
       } else {
-        // Inline transactions always use first-committer-wins under REPEATABLE_READ.
-        // Unlike the subtransaction path, there is no server-held staged file to re-parent,
-        // so merge-and-retry is not applicable here regardless of lock mode.
+        // Inline transactions use first-committer-wins under REPEATABLE_READ, regardless of lock
+        // mode.
         persistence.updateTransactionStatus(txnId, JdbcTransactionPersistence.TXN_STATUS_ABORTED);
         lockManager.releaseAll(txnId);
         LOGGER.info(
@@ -868,7 +879,7 @@ public class TransactionService {
                 + info.tableIdentifier());
       }
     }
-    return new PrepareInlineResult(direct, mergeRetry);
+    return new PrepareInlineResult(direct, mergeRetry, txn.txnSnapshotId() == null);
   }
 
   /**
@@ -977,9 +988,9 @@ public class TransactionService {
         // EXCLUSIVE / ACCESS_EXCLUSIVE (pessimistic, potentially destructive): a concurrent writer
         // advanced the table since this op was created. First-committer-wins — abort the whole
         // transaction and surface a serialization failure (PostgreSQL 40001 semantics, documented
-        // in multi-table-transaction-design.md). Unlike the inline path — which cannot re-parent
-        // and so aborts on ANY conflict — the subtransaction path merges ROW_EXCLUSIVE above and
-        // only reaches this abort branch for the pessimistic lock modes.
+        // in multi-table-transaction-design.md). Unlike the inline REPEATABLE_READ path — which
+        // aborts on ANY conflict — the subtransaction path merges ROW_EXCLUSIVE above and only
+        // reaches this abort branch for the pessimistic lock modes.
         persistence.updateTransactionStatus(txnId, JdbcTransactionPersistence.TXN_STATUS_ABORTED);
         lockManager.releaseAll(txnId);
         LOGGER.info(

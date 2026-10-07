@@ -22,6 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.InputStream;
+import java.util.List;
 import java.util.UUID;
 import javax.sql.DataSource;
 import org.apache.polaris.persistence.relational.jdbc.DatabaseType;
@@ -421,5 +422,45 @@ class TransactionConflictTest {
     assertThat(result.mergeRetry()).hasSize(1);
     assertThat(result.mergeRetry().get(0).tableUuid()).isEqualTo(TABLE_UUID);
     assertThat(result.mergeRetry().get(0).tableEntityId()).isEqualTo(ENTITY_ID);
+  }
+
+  // ---------------------------------------------------------------------------
+  // 4. Inline path (prepareInlineCommit), REPEATABLE_READ
+  // ---------------------------------------------------------------------------
+
+  private static List<TransactionService.StagedTableInfo> inlineStaged() {
+    return List.of(
+        new TransactionService.StagedTableInfo(
+            TABLE_UUID, TABLE_META_DIR + "/staged.metadata.json", null, "ROW_EXCLUSIVE"));
+  }
+
+  @Test
+  void inlineRepeatableRead_concurrentCommitAfterBegin_throwsSerializationFailure()
+      throws Exception {
+    commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v1.json");
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
+
+    // A concurrent writer advances the table after the transaction's read point.
+    commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v2.json");
+
+    assertThatThrownBy(
+            () -> service.prepareInlineCommit(txn.txnId(), txn.txnToken(), inlineStaged()))
+        .isInstanceOf(TransactionService.SerializationFailureException.class);
+  }
+
+  @Test
+  void inlineRepeatableRead_firstCommitAfterBegin_nullBaseline_throwsSerializationFailure()
+      throws Exception {
+    // The table has no committed_table_snapshots row when the transaction begins (e.g. it predates
+    // the transaction schema), so the baseline resolved under the read point is null.
+    var txn = service.beginTransaction("REPEATABLE_READ", 3600, OWNER);
+
+    // A concurrent writer then commits the table's first recorded version.
+    commitTableVersion(TABLE_UUID, "s3://bucket/ns/orders/metadata/v2.json");
+
+    assertThatThrownBy(
+            () -> service.prepareInlineCommit(txn.txnId(), txn.txnToken(), inlineStaged()))
+        .as("a commit after the read point must be detected even when the baseline is null")
+        .isInstanceOf(TransactionService.SerializationFailureException.class);
   }
 }

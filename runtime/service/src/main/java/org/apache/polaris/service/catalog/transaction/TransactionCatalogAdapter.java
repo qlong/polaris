@@ -327,7 +327,13 @@ public class TransactionCatalogAdapter
               result.direct().size(),
               result.mergeRetry().size());
           handler.finalizeInlineTables(
-              result.direct(), result.mergeRetry(), handlerFactory, catalogName, principal, txnId);
+              result.direct(),
+              result.mergeRetry(),
+              result.mergeOnConflict(),
+              handlerFactory,
+              catalogName,
+              principal,
+              txnId);
         } else {
           // Use Case 2: multi-app subtransaction path
           TransactionService.PrepareCommitResult result =

@@ -55,11 +55,13 @@ import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.BaseMetadataTable;
 import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DataOperations;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.ManifestFiles;
 import org.apache.iceberg.ManifestReader;
 import org.apache.iceberg.MetadataUpdate;
 import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.Table;
@@ -79,6 +81,7 @@ import org.apache.iceberg.exceptions.ForbiddenException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.exceptions.ServiceFailureException;
+import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.metrics.ScanReport;
 import org.apache.iceberg.rest.Endpoint;
@@ -1533,28 +1536,22 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
         TableOperations ops = ((BaseTable) table).operations();
         FileIO io = ops.io();
         // base must be ops.current() (reference equality required by IcebergCatalog.commit's OCC
-        // guard). Conflict detection does NOT depend on base: it already ran in prepareCommit (CTS
-        // compare) and the snapshot-chain guard below, and the CAS in doCommit is the real atomic
-        // guard. Reading serverBaseMetadataLocation here would yield base != ops.current() → a
-        // spurious CommitFailedException/500. Mirror finalizeInlineTables.
+        // guard). Reading serverBaseMetadataLocation here would yield base != ops.current() → a
+        // spurious CommitFailedException/500.
         TableMetadata base = ops.current();
-        TableMetadata staged = TableMetadataParser.read(io, sub.stagedMetadataLocation());
-        // Guard: staged was built on a snapshot that pre-dates base's current snapshot.
-        // This happens when the EXCLUSIVE lock retry fires after a concurrent transaction
-        // committed (so serverBase == currentMeta), but the worker's MVCC snapshot was taken
-        // before that commit, so staged points to the old chain.  A direct ops.commit() would
-        // succeed at the OCC pointer-swap level but silently overwrite the concurrent commit's
-        // snapshot chain, losing that writer's data files.  Route to mergeRetry instead so the
-        // added files are re-appended on top of the live (post-conflict) table.
-        if (staged.currentSnapshot() != null) {
-          Long stagedParentId = staged.currentSnapshot().parentId();
-          // null when base has no snapshots yet (fresh table)
-          Long baseCurrSnapId =
-              base.currentSnapshot() != null ? base.currentSnapshot().snapshotId() : null;
-          if (!java.util.Objects.equals(stagedParentId, baseCurrSnapId)) {
-            mergeRetry.add(sub);
-            continue;
-          }
+        TableMetadata staged =
+            readStagedMetadata(io, sub.stagedMetadataLocation(), base, sub.tableUuid());
+        // prepareCommit compared the CTS pointer against server_base, but that is neither the
+        // state the worker staged on (a REPEATABLE_READ worker reads at the txn snapshot, which
+        // can predate server_base) nor the state this commit swaps from (a ROW_EXCLUSIVE lock
+        // does not block other writers and is released at stage time). Re-check against base: a
+        // direct ops.commit() of metadata built on an older state would replace everything
+        // committed since. Route to mergeRetry instead, which re-appends additive work and
+        // rejects the rest. A commit after this point fails the entity-version check of the final
+        // batch write.
+        if (!isBuiltOnLive(staged, base)) {
+          mergeRetry.add(sub);
+          continue;
         }
         ops.commit(base, staged);
       }
@@ -1567,31 +1564,16 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
         tableHandler.setWorkspaceMetaStoreManager(workspace);
         // Exclude the committing txn's own lock from the doCommit conflict check (self-conflict).
         tableHandler.setActiveCommitTxnId(sub.txnId());
-        FileIO io = ((BaseTable) liveTable).operations().io();
-        TableMetadata staged = TableMetadataParser.read(io, sub.stagedMetadataLocation());
-        // Route on the STAGED SNAPSHOT'S operation, not the lock mode (lock-protocol design §5):
-        // only an "append" may be merge-retried, because extractAddedDataFiles + newAppend treats
-        // every staged entry as ADDED. An EXCLUSIVE lock holder that merely INSERTs (op="append")
-        // lands here when its client staged against a snapshot older than the live tip (a benign
-        // client-cache lag — the EXCLUSIVE lock already excludes any concurrent writer), and it is
-        // safe to re-parent its appended files. A destructive staged op ("overwrite"/"delete"/
-        // "replace") reaching mergeRetry means a concurrent commit was detected at finalize time
-        // (the
-        // snapshot-chain guard promoted it): re-appending would re-materialize survivors/replaced
-        // rows on top of that commit — silent corruption (duplicate PKs, lost replace). That is a
-        // first-committer-wins loss → fail with 409 instead of degrading to an append.
-        if (!isMergeRetryableAppend(staged)) {
-          throw new TransactionService.SerializationFailureException(
-              "Destructive operation ("
-                  + stagedOperation(staged)
-                  + ") on table "
-                  + sub.tableUuid()
-                  + " conflicts with a concurrent commit; cannot merge-retry a non-append operation");
-        }
-        List<DataFile> addedFiles = extractAddedDataFiles(staged, io);
-        AppendFiles append = liveTable.newAppend();
-        addedFiles.forEach(append::appendFile);
-        append.commit();
+        TableOperations liveOps = ((BaseTable) liveTable).operations();
+        FileIO io = liveOps.io();
+        TableMetadata staged =
+            readStagedMetadata(
+                io, sub.stagedMetadataLocation(), liveOps.current(), sub.tableUuid());
+        // Route on the STAGED SNAPSHOTS' operations, not the lock mode (lock-protocol design §5).
+        // An EXCLUSIVE lock holder that merely INSERTs lands here when its client staged against
+        // a state older than the live tip (a benign client-cache lag — the lock already excludes
+        // concurrent writers), and re-appending its files is safe.
+        reapplyStagedAppends(liveTable, staged, io, sub.tableUuid());
       }
     } finally {
       for (IcebergCatalogHandler h : openHandlers) {
@@ -1617,12 +1599,16 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
    * @param direct tables with no concurrent conflict — apply staged pointer swap
    * @param mergeRetry APPEND tables that had a concurrent commit — re-parent data files onto live
    *     head
+   * @param mergeOnConflict whether a table found to have moved since it was staged is re-applied
+   *     onto the live head (READ_COMMITTED) or fails the commit (REPEATABLE_READ); see {@link
+   *     TransactionService.PrepareInlineResult#mergeOnConflict()}
    * @param txnId the committing transaction's id, so doCommit's lock check excludes its own held
    *     lock (self-conflict); pass {@code -1} for a non-transactional commit
    */
   public void finalizeInlineTables(
       List<TransactionService.StagedTableInfo> direct,
       List<TransactionService.StagedTableInfo> mergeRetry,
+      boolean mergeOnConflict,
       IcebergCatalogHandlerFactory handlerFactory,
       String catalogName,
       org.apache.polaris.core.auth.PolarisPrincipal principal,
@@ -1651,9 +1637,23 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
         TableOperations ops = ((BaseTable) table).operations();
         FileIO io = ops.io();
         // base must be ops.current() (reference equality required by IcebergCatalog.commit).
-        // OCC was already validated in prepareInlineCommit; no second check needed here.
         TableMetadata base = ops.current();
-        TableMetadata staged = TableMetadataParser.read(io, info.stagedMetadataLocation());
+        TableMetadata staged =
+            readStagedMetadata(io, info.stagedMetadataLocation(), base, info.tableIdentifier());
+        // Inline transactions hold no locks, so the table may have moved after
+        // prepareInlineCommit, and under READ_COMMITTED that check does not run at all. A direct
+        // ops.commit() of metadata built on an older state would replace everything committed
+        // since, so re-check against base. A commit after this point fails the entity-version
+        // check of the final batch write.
+        if (!isBuiltOnLive(staged, base)) {
+          if (!mergeOnConflict) {
+            throw new TransactionService.SerializationFailureException(
+                "could not serialize access due to concurrent update on table "
+                    + info.tableIdentifier());
+          }
+          mergeRetry.add(info);
+          continue;
+        }
         ops.commit(base, staged);
       }
       for (TransactionService.StagedTableInfo info : mergeRetry) {
@@ -1665,27 +1665,12 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
         tableHandler.setWorkspaceMetaStoreManager(workspace);
         // Exclude the committing txn's own lock from the doCommit conflict check (self-conflict).
         tableHandler.setActiveCommitTxnId(txnId);
-        FileIO io = ((BaseTable) liveTable).operations().io();
-        TableMetadata staged = TableMetadataParser.read(io, info.stagedMetadataLocation());
-        // Parity with finalizeExtensionTransaction: route on the STAGED SNAPSHOT'S operation, not
-        // the
-        // lock mode (lock-protocol design §5). Only an append (or no snapshot) may be
-        // merge-retried;
-        // a destructive staged op reaching here is a real first-committer-wins conflict → 409.
-        // Inline mergeRetry is always empty today (prepareInlineCommit aborts on any conflict), so
-        // this is defense-in-depth against a future finalize-time promotion.
-        if (!isMergeRetryableAppend(staged)) {
-          throw new TransactionService.SerializationFailureException(
-              "Destructive operation ("
-                  + stagedOperation(staged)
-                  + ") on table "
-                  + info.tableIdentifier()
-                  + " conflicts with a concurrent commit; cannot merge-retry a non-append operation");
-        }
-        List<DataFile> addedFiles = extractAddedDataFiles(staged, io);
-        AppendFiles append = liveTable.newAppend();
-        addedFiles.forEach(append::appendFile);
-        append.commit();
+        TableOperations liveOps = ((BaseTable) liveTable).operations();
+        FileIO io = liveOps.io();
+        TableMetadata staged =
+            readStagedMetadata(
+                io, info.stagedMetadataLocation(), liveOps.current(), info.tableIdentifier());
+        reapplyStagedAppends(liveTable, staged, io, info.tableIdentifier());
       }
     } finally {
       for (IcebergCatalogHandler h : openHandlers) {
@@ -1709,12 +1694,90 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
         Namespace.of(Arrays.copyOf(parts, parts.length - 1)), parts[parts.length - 1]);
   }
 
-  /** Extracts the data files added by the current snapshot in {@code meta}. */
-  private static List<DataFile> extractAddedDataFiles(TableMetadata meta, FileIO io) {
-    org.apache.iceberg.Snapshot snap = meta.currentSnapshot();
-    if (snap == null) {
-      return List.of();
+  /**
+   * Reads a client-staged metadata file and rejects it unless it belongs to the table being
+   * committed (same {@code table-uuid} as {@code live}). The inline path takes the staged location
+   * from the client as given, and the subtransaction path only fixes where the file lives, so
+   * neither stops a file built for another table from reaching finalize. Swapping one in would
+   * leave this table unreadable (Iceberg rejects a UUID change on refresh); merge-retrying one
+   * would append the other table's data files here.
+   */
+  private static TableMetadata readStagedMetadata(
+      FileIO io, String location, TableMetadata live, String tableName) {
+    TableMetadata staged = TableMetadataParser.read(io, location);
+    ValidationException.check(
+        live.uuid() == null || live.uuid().equals(staged.uuid()),
+        "Staged metadata %s does not belong to table %s: table-uuid %s, expected %s",
+        location,
+        tableName,
+        staged.uuid(),
+        live.uuid());
+    return staged;
+  }
+
+  /**
+   * Whether {@code staged} was built on the table's live state {@code live}. Every commit writes a
+   * new metadata file at a unique path, so the table is unchanged since the client read it exactly
+   * when the live metadata location is in the staged file's metadata log. Entries after it can only
+   * be this transaction's own uncommitted staging (read-your-own-writes), since nothing has
+   * committed past the live head. This compares the whole table state: a concurrent schema,
+   * property or snapshot-expiry change is a conflict even though the current snapshot did not move.
+   */
+  private static boolean isBuiltOnLive(TableMetadata staged, TableMetadata live) {
+    String liveLocation = live.metadataFileLocation();
+    return liveLocation != null
+        && staged.previousFiles().stream().anyMatch(e -> liveLocation.equals(e.file()));
+  }
+
+  /**
+   * Re-applies a staged change onto the live table after a concurrent commit: the data files added
+   * by every snapshot the staged metadata adds on top of the live table are appended as one new
+   * snapshot. Only additive work can be re-applied this way. A staged change that adds no snapshot
+   * (metadata-only), adds any non-append snapshot ({@code overwrite}/{@code delete}/{@code
+   * replace}), or whose base can no longer be located in the live table is a first-committer-wins
+   * conflict and fails with {@link TransactionService.SerializationFailureException} rather than
+   * being degraded to an append.
+   */
+  private static void reapplyStagedAppends(
+      Table liveTable, TableMetadata staged, FileIO io, String tableName) {
+    TableMetadata live = ((BaseTable) liveTable).operations().current();
+    List<Snapshot> added = new ArrayList<>();
+    Snapshot snap = staged.currentSnapshot();
+    while (snap != null && live.snapshot(snap.snapshotId()) == null) {
+      added.add(snap);
+      snap = snap.parentId() == null ? null : staged.snapshot(snap.parentId());
     }
+    // The walk must stop at a snapshot the live table still has; otherwise it ran into history
+    // the live table no longer carries (e.g. expired) and would re-append already-committed files.
+    // A live table with no snapshots has no history to re-append.
+    boolean baseLocated = snap != null || live.currentSnapshot() == null;
+    if (added.isEmpty() || !baseLocated) {
+      throw new TransactionService.SerializationFailureException(
+          "Change to table "
+              + tableName
+              + " conflicts with a concurrent commit and adds no snapshot that can be re-applied"
+              + " onto the live table; cannot merge-retry it");
+    }
+    for (Snapshot s : added) {
+      if (!DataOperations.APPEND.equals(s.operation())) {
+        throw new TransactionService.SerializationFailureException(
+            "Destructive operation ("
+                + s.operation()
+                + ") on table "
+                + tableName
+                + " conflicts with a concurrent commit; cannot merge-retry a non-append operation");
+      }
+    }
+    AppendFiles append = liveTable.newAppend();
+    for (Snapshot s : added.reversed()) {
+      extractAddedDataFiles(s, staged, io).forEach(append::appendFile);
+    }
+    append.commit();
+  }
+
+  /** Extracts the data files added by {@code snap}, a snapshot of {@code meta}. */
+  private static List<DataFile> extractAddedDataFiles(
+      Snapshot snap, TableMetadata meta, FileIO io) {
     List<DataFile> out = new ArrayList<>();
     for (ManifestFile mf : snap.dataManifests(io)) {
       if (mf.snapshotId() == null || mf.snapshotId() != snap.snapshotId()) {
@@ -1730,28 +1793,6 @@ public abstract class IcebergCatalogHandler extends CatalogHandler implements Au
       }
     }
     return out;
-  }
-
-  /**
-   * The operation of the staged snapshot ({@code append}/{@code overwrite}/{@code delete}/{@code
-   * replace}), or {@code "empty"} when the staged metadata has no current snapshot (e.g. a schema-
-   * only change). Used to route the finalize mergeRetry decision on the actual staged operation
-   * rather than on the lock mode (lock-protocol design §5).
-   */
-  private static String stagedOperation(TableMetadata staged) {
-    org.apache.iceberg.Snapshot snap = staged.currentSnapshot();
-    return snap == null ? "empty" : snap.operation();
-  }
-
-  /**
-   * A staged commit may be merge-retried (its added files re-parented onto the live tip via {@code
-   * newAppend}) only when it is an append or carries no snapshot. Any destructive staged operation
-   * ({@code overwrite}/{@code delete}/{@code replace}) reaching the mergeRetry loop signals a real
-   * first-committer-wins conflict and must fail with 409 rather than silently degrade to an append.
-   */
-  private static boolean isMergeRetryableAppend(TableMetadata staged) {
-    org.apache.iceberg.Snapshot snap = staged.currentSnapshot();
-    return snap == null || org.apache.iceberg.DataOperations.APPEND.equals(snap.operation());
   }
 
   public ListTablesResponse listViews(Namespace namespace, String pageToken, Integer pageSize) {

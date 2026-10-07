@@ -317,16 +317,29 @@ unaffected unless a client explicitly reaches for `EXCLUSIVE`.
 its operation commits or aborts (so a waiting `EXCLUSIVE` acquirer proceeds as soon as staging is
 done); an `EXCLUSIVE` lock is held until the whole transaction ends.
 
-**Conflict routing at commit.** For each operation the server compares the table's
-`server_base_metadata_location` (captured at operation-create) against the current committed pointer.
-Unchanged → direct pointer swap. Changed →
+**Conflict routing at commit.** Conflicts are checked twice. Before finalize, the server compares
+each table's baseline (`server_base_metadata_location`, captured at operation-create, or the
+REPEATABLE READ read point on the inline path) against the current committed pointer; a table with no
+baseline but a committed version now also counts as changed. Unchanged → direct pointer swap.
+Changed →
 
 - **`ROW_EXCLUSIVE`, subtransaction path → merge-and-retry.** The server holds the operation's staged
-  metadata, re-derives just its added data files, and re-applies them onto the current state
-  (`extractAddedDataFiles` + a fresh `newAppend()`). Commit succeeds; the client does nothing.
-- **`ROW_EXCLUSIVE`, inline path → first-committer-wins abort (HTTP 409).** The inline path has no
-  per-table operation the server can re-parent, so abort is the only correct response.
+  metadata, re-derives the data files of every snapshot it adds, and re-applies them onto the current
+  state with a fresh `newAppend()`. Commit succeeds; the client does nothing.
+- **Inline path, REPEATABLE READ → first-committer-wins abort (HTTP 409)**, regardless of lock mode.
 - **`EXCLUSIVE` → first-committer-wins abort**, always.
+
+Locks do not cover every writer (a `ROW_EXCLUSIVE` lock blocks no one and is released at stage time;
+an inline transaction takes none), so the table can still move after that check. Finalize therefore
+re-checks each table against the exact state its pointer swap replaces: the staged metadata is
+accepted only if the live metadata file appears in its metadata log, i.e. the client built on the
+live state. Every commit writes a new metadata file at a unique path, so this catches any concurrent
+change — data, schema, properties, snapshot expiry — not just a moved current snapshot. On a
+mismatch, the subtransaction path and the inline READ COMMITTED path re-apply the staged appends onto
+the live state; the inline REPEATABLE READ path aborts. Re-applying works only for additive changes:
+a staged change that is destructive (overwrite, delete, replace) or metadata-only fails with HTTP 409
+instead. Anything that commits after this re-check fails the entity-version check of the final batch
+write, so the transaction never overwrites a commit it did not see.
 
 This is one-directional self-defense, not mutual exclusion: `ROW_EXCLUSIVE` aborts *your* transaction
 if the table moved under it, but never blocks an independent writer. A client that must actually
@@ -495,9 +508,9 @@ Optimistic concurrency is the model Iceberg already uses: a plain single-table w
 compare-and-swap on the metadata pointer, and non-transactional writes keep using Iceberg's native
 CAS unchanged. Transactions extend the same *idea*, but the catalog does the check itself rather than
 delegating to Iceberg's CAS — at finalize the server must commit with `base == current`, so Iceberg's
-own OCC can no longer see a concurrent write, and the catalog's commit-time divergence check
-(`server_base_metadata_location` vs. the current committed pointer) *is* the OCC for the transaction
-path.
+own OCC can no longer see a concurrent write, and the catalog's commit-time checks (the baseline
+vs. the current committed pointer, then the staged metadata's lineage vs. the live metadata file
+at finalize) *are* the OCC for the transaction path.
 
 The default `ROW_EXCLUSIVE` mode is non-blocking so that the dominant lakehouse workload — many
 concurrent appends — keeps running exactly as it does without transactions. When that divergence
@@ -558,42 +571,55 @@ operation that is fundamentally I/O-bound, not catalog-bound. (Reproduce:
 
 ### 17. Mixed write paths and CTS completeness
 
-Two paths can advance a table's pointer: the **transaction path** (inserts a CTS row) and the
-ordinary **plain path** (`updateTable`, which does not). If both touch the same table, CTS becomes a
-*partial* history — a snapshot read can then resolve a stale row that silently diverges from live
-state (worse than having no CTS row, which at least falls through to a live read). Three ways to
-handle it:
+Two paths can advance a table's pointer: the **transaction path** and the ordinary **plain path**
+(`createTable`, `updateTable`, `registerTable`, and any other Iceberg commit through the catalog). If
+only the transaction path recorded CTS rows, a table written both ways would have a *partial*
+history — a snapshot read could resolve a stale row that silently diverges from live state. Three
+ways to handle it:
 
-- **Option 1 — enrollment (PoC choice).** Once a table has any CTS row it is "enrolled"; subsequent
-  plain writes are rejected unless inside a transaction. Zero read-path cost, absolute CTS invariant;
-  cost is a breaking change for plain clients on enrolled tables. Right for a controlled PoC.
-- **Option 2 — universal CTS (production answer).** Every commit, transactional or not, allocates a
-  `commit_scn` and inserts a CTS row. No breaking change, CTS always complete; cost is a sequence
-  bump + insert on every write and more purge load. The right long-term answer where plain clients
-  must coexist with snapshot readers.
-- **Option 3 — resolve-time detection.** Detect the partial-history case at read time. Handles the
-  safe fall-through cases cleanly but does not fix the dangerous post-enrollment plain write; useful
-  as observability layered on Option 1 or 2, not a standalone fix.
+- **Option 1 — enrollment.** Once a table has any CTS row it is "enrolled"; subsequent plain writes
+  are rejected unless inside a transaction. Zero write-path cost, but a breaking change for plain
+  clients on enrolled tables.
+- **Option 2 — universal CTS (implemented).** Every commit, transactional or not, allocates a
+  `commit_scn` and inserts a CTS row in the same JDBC transaction as the pointer swap. No breaking
+  change and CTS stays complete; the cost is a counter bump + insert on every write and more purge
+  load.
+- **Option 3 — resolve-time detection.** Detect the partial-history case at read time. Useful as
+  observability layered on Option 1 or 2, not a standalone fix.
+
+The implementation uses **Option 2**: plain commits go through the same atomic entity-swap + CTS
+insert as transactional ones, so plain writers keep working unchanged on every table and snapshot
+readers see their commits in order. When the backing store has no transaction schema (in-memory,
+NoSQL, or a relational schema older than v5) no CTS rows are written, and the transaction endpoints
+are unavailable.
+
+One gap remains: a table with **no** CTS row at or below the read point resolves to its *live*
+state rather than failing. That covers a table that predates the transaction schema and has not
+been written since, and a table created after the read point. A pinned read of such a table is
+therefore not isolated from later commits to it.
 
 ### 18. Scope and non-goals
 
 - **Additive and opt-in by design.** There is no table-format change and no server feature flag: the
   transaction endpoints are simply present, and a client that never calls them sees a stock Iceberg
   REST catalog, unchanged. A client opts in per operation — pass a read handle for a consistent read,
-  or wrap writes in `BEGIN`/`COMMIT`. (The one exception is per-table: once a table is *enrolled*
-  under the Option-1 write-path rule in [§17](#17-mixed-write-paths-and-cts-completeness), plain
-  writes to that table are rejected.)
+  or wrap writes in `BEGIN`/`COMMIT`. Plain writes are never rejected; they are recorded in CTS like
+  transactional ones ([§17](#17-mixed-write-paths-and-cts-completeness)).
 - **REST catalog only.** The stateful-server coordinator model is what makes this tractable; Hive
   Metastore / Glue / JDBC catalogs are out of scope.
 - **DML only.** `CREATE`/`ALTER`/`DROP` inside a transaction is a non-goal today (it is the case that
-  most needs an `ACCESS_EXCLUSIVE` lock held across statements).
+  most needs an `ACCESS_EXCLUSIVE` lock held across statements). The server does not reject a staged
+  metadata-only change: it commits if nothing else changed the table, and fails with HTTP 409
+  otherwise ([§9](#9-locking-and-conflict-resolution)).
 - **Single catalog.** A transaction is scoped to one `(realm, catalog)`; cross-catalog is out of
   scope.
 - **SERIALIZABLE is future work.** REPEATABLE READ (snapshot isolation) and READ COMMITTED are the
   built, selectable levels.
 - **PoC hardening gaps** are called out where they exist (orphaned-file cleanup
   [§12](#12-garbage-collection-and-table-maintenance); single-leader reaper gating; HMAC on handles
-  for untrusted clients [§6](#6-reads-consistent-multi-table-snapshots)).
+  for untrusted clients [§6](#6-reads-consistent-multi-table-snapshots); per-transaction lock limit
+  [§19](#19-security-considerations); pinned reads of tables with no CTS history
+  [§17](#17-mixed-write-paths-and-cts-completeness)).
 
 ### 19. Security considerations
 
@@ -610,13 +636,22 @@ and table-level `WRITE` is checked at subtransaction-create time, so a transacti
 extra privilege. `owner_principal` is recorded at begin for audit and admin override.
 
 **Staged-metadata trust boundary.** The client writes metadata to object storage and hands the server
-a path. The server assigns that path (inside the table's own metadata directory), validates the
-staged file's `table-uuid` and base snapshot before accepting it, and only then swaps the pointer —
-so a client cannot point the table at arbitrary or another table's metadata.
+a path. What the server checks today:
+
+- **Subtransaction path:** the server assigns the staging path (inside the table's own metadata
+  directory) and rejects a commit that names any other path.
+- **Inline path:** the client chooses the path and the server accepts it as given.
+- **Both paths, at finalize:** the staged file must belong to the table — its `table-uuid` must match
+  the live table's, else the commit fails with HTTP 400 — and it is swapped in only if it was built
+  on the table's live state ([§9](#9-locking-and-conflict-resolution)). The ordinary location checks
+  of an Iceberg commit still apply.
+
+So a client cannot commit a metadata file built for another table: swapped in, it would leave the
+table unreadable, and merge-retried, it would append the other table's data files.
 
 **Bounded blast radius.** The read handle carries no authority
-([§6](#6-reads-consistent-multi-table-snapshots)); lock DoS is bounded by short leases, a per-
-transaction lock count limit, and the reaper.
+([§6](#6-reads-consistent-multi-table-snapshots)); lock DoS is bounded by short leases and the reaper.
+There is no per-transaction limit on the number of locks yet.
 
 ### 20. Relationship to prior art & future direction
 

@@ -19,9 +19,14 @@
 
 # Multi-Table Transactions on the Iceberg REST Catalog — Design
 
-Iceberg's REST catalog commits one table atomically, but has no way to commit *several* tables as a
-unit, and no way for a reader to see several tables at one consistent instant. This document
-describes a design that adds both, implemented as an additive extension to Apache Polaris.
+Iceberg's REST catalog commits one table atomically, and can even apply a prepared bundle of changes
+to several tables atomically in a single request ([§2](#2-the-core-idea-coordinate-in-the-catalog)).
+What it lacks is a multi-table, multi-statement *transaction*: no `BEGIN`/`COMMIT` that spans
+statements or independent workers, and no automatic way to *find* one consistent instant across
+tables — time travel (`AS OF`) can read each table at a chosen point, but nothing tells a reader which
+per-table snapshots belong together (tags must be hand-coordinated by writers, and timestamps are each
+writer's clock). This document describes a design that adds that transaction layer, implemented as an
+additive extension to Apache Polaris.
 
 It is written to be read without reading the code. **Part I** is the architecture and vocabulary a
 contributor needs to navigate the implementation. **Part II** is the behavior — reads, writes,
@@ -72,6 +77,24 @@ coordinator either gets authority over the pointers — at which point it *is* t
 coordinates with the catalog across two authorities, which is two-phase commit, the thing we want to
 avoid. So the catalog is not a convenient choice; it is the one place a multi-table commit is a single
 local transaction instead of a distributed handshake. (Full argument: [§13](#13-server-side-transaction-state).)
+
+**Relationship to the existing multi-table commit.** The Iceberg REST spec already has
+`POST /v1/{prefix}/transactions/commit`, and Polaris implements it: one request carrying changes for
+several tables, each with its own requirements (e.g. `assert-ref-snapshot-id`), applied all-or-nothing.
+That is an atomic *apply* of a bundle one client has fully prepared — and this design's `COMMIT` reuses
+the same machinery (Polaris' transaction workspace buffering every table's update into one atomic
+metastore write). What it does not provide is a *transaction* around the bundle:
+
+- no `BEGIN`/`COMMIT` boundary spanning several statements, so SQL engines can't use it for
+  `INSERT …; INSERT …` (each still commits per table);
+- no shared read point while the bundle is built — the per-table loads are independent reads that can
+  be torn, and reads of tables the bundle doesn't write are never validated;
+- no isolation level;
+- no fan-out — one client must assemble every change, so independent workers can't each contribute
+  part of one atomic commit.
+
+This design adds that transaction layer — `BEGIN`/`COMMIT`, a `read_point`, isolation levels, and
+subtransactions — on top of the same single-step swap.
 
 ### 3. Architecture at a glance
 
@@ -229,11 +252,15 @@ couldn't already. Encoding is for opacity and evolvability (clients treat it as 
 pagination cursor), not secrecy; an untrusted-client deployment can add an HMAC for integrity, but
 correctness never rests on it.
 
-**Fail-closed resolve.** Resolution can miss two ways, and both return `410 read point expired`,
-never stale bytes: (a) the row was purged because the GC watermark moved past `read_point`
-([§12](#12-garbage-collection-and-table-maintenance)); (b) the row survives but its `metadata.json`
-was physically deleted by an external Iceberg maintenance job. The object-store existence check is a
-cold fallback, not on the hot path.
+**Resolution miss — intended fail-closed, not yet implemented.** The intended guarantee is that a
+miss returns `410 read point expired`, never data from a different instant. **Today it does not.**
+When resolution finds no row at or below `read_point` — because the GC watermark moved past it
+([§12](#12-garbage-collection-and-table-maintenance)), or because the table has no history at that
+point ([§17](#17-mixed-write-paths-and-cts-completeness)) — `loadTable` falls back to an ordinary
+load and returns the table's **latest** state, without an error. What does fail closed today: a
+malformed handle is rejected with `400`, and a surviving row whose `metadata.json` was deleted by
+external Iceberg maintenance fails when the file is read (an error, not stale data). Returning `410`
+on a purged row is an open hardening item.
 
 ### 7. Writes: stage, then publish atomically
 
@@ -410,7 +437,7 @@ Two things are reclaimed independently, and keeping them straight is the whole G
 | Domain | Reclaims | Governed by | Safety |
 |---|---|---|---|
 | **Our rows** (`committed_table_snapshots`) | pointer history | watermark `W` (our purge) | `W` must be ≤ every live read point |
-| **Iceberg files** (`metadata.json`, manifests) | object storage | Iceberg snapshot expiry, per table, owned by the table owner | fail-closed resolve → `410` |
+| **Iceberg files** (`metadata.json`, manifests) | object storage | Iceberg snapshot expiry, per table, owned by the table owner | a deleted file makes the read fail (error, not stale data) |
 
 **The watermark `W`** is the purge horizon for CTS, one durable row per `(realm, catalog)` in
 `txn_watermark`. Invariant: `W ≤ read_point(t)` for every still-honorable read `t`. Over-advancing is
@@ -427,21 +454,24 @@ Write transactions have rows, so their floor is exact. Standalone reads have **n
 of the stateless handle), so `read_floor` cannot be an exact MIN — it is derived conservatively from
 a **lease `L`**: the server retains pointer history for `L` after a read point could have been
 issued, using the `(committed_at, commit_scn)` map already in CTS. `L` is a server-side retention
-budget, not a client validity promise — a read past `L` degrades to a clean `410`, never a torn read.
+budget, not a client validity promise. A read past `L` is *intended* to fail with `410`; today it
+falls back to the table's latest state instead ([§6](#6-reads-consistent-multi-table-snapshots)) —
+an open hardening item.
 
 **Per-table survivor.** Purge keeps, per table, the newest row with `commit_scn <= W` (plus
 everything above `W`), and deletes only rows strictly older than that survivor — so a reader pinned
 exactly at `W` can still resolve a table that has not changed recently.
 
 **Two id-space horizons.** CTS purge is gated by a `commit_scn` (the watermark above). Lifecycle rows
-(`transactions`, `subtransactions`, `transaction_operations`, `locks`) are keyed by `txn_id` and
-purged below `MIN(txn_id)` over in-progress transactions. `commit_scn` and `txn_id` are different id
-spaces and are never compared.
+(`transactions`, `subtransactions`, `transaction_operations`) are keyed by `txn_id`; the intended
+policy is to purge them below `MIN(txn_id)` over in-progress transactions, but **that purge is not
+implemented yet** — today only locks are deleted (when their transaction ends). `commit_scn` and
+`txn_id` are different id spaces and are never compared.
 
 **Why not extend Iceberg retention to the watermark?** Because that would let a leaked or long-lived
 read pin physical storage indefinitely — the exact abandoned-context liability the stateless handle
-avoids. Iceberg retention stays sovereign over files; fail-closed resolve keeps reads correct when a
-file is gone.
+avoids. Iceberg retention stays sovereign over files; when a file is gone, the read fails rather than
+returning wrong data.
 
 **Known gap.** No server-side cleanup of orphaned staged files exists yet — abort, rollback-retry,
 reap, and worker re-stage all leak metadata/data files that no committed pointer references. This is a
@@ -628,18 +658,29 @@ therefore not isolated from later commits to it.
 - `txn_token` — held by the orchestrator only; authorizes commit/abort/renew and creating
   subtransactions.
 - `subtxn_token` — handed to one worker; authorizes staging and committing *its* subtransaction only.
-- `op_token` — per-operation secret; authorizes that operation, not the top-level transaction.
+- `op_token` — minted per operation and returned at create, but not accepted by any endpoint today
+  (subtransaction staging and commit use `subtxn_token`).
 
-Tokens are capability secrets (32 random bytes, compared by equality), **not** authentication.
-Authn/authz remain the request's own credentials — a worker must still be an authorized principal,
-and table-level `WRITE` is checked at subtransaction-create time, so a transaction envelope grants no
-extra privilege. `owner_principal` is recorded at begin for audit and admin override.
+Tokens are capability secrets (32 random bytes, compared by equality), **not** authentication. Every
+request is still authenticated with the caller's own credentials.
+
+**Authorization is incomplete (open hardening item).** The intent is that a transaction envelope
+grants no extra privilege: table-level write privilege should be checked like an ordinary
+`updateTable`. **Today it is not.** The transaction endpoints resolve tables through `loadTable`,
+which authorizes *read* access; the finalize path then commits through the catalog without the
+write-privilege check an ordinary table commit performs. The snapshot-row endpoints
+(`getTransactionSnapshot`, `releaseTransactionSnapshot`, `renewTransactionSnapshot`) take no token,
+so any principal with catalog access can act on a snapshot row by id — including releasing a write
+transaction's snapshot, which lets the purge move below that writer's read point. Until these are
+enforced, **do not expose this extension to untrusted principals.** `owner_principal` is recorded at
+begin for audit; nothing reads it for admin override yet.
 
 **Staged-metadata trust boundary.** The client writes metadata to object storage and hands the server
 a path. What the server checks today:
 
 - **Subtransaction path:** the server assigns the staging path (inside the table's own metadata
-  directory) and rejects a commit that names any other path.
+  directory); `commitSubtransaction` takes no path, and the server finalizes the file at the path it
+  assigned.
 - **Inline path:** the client chooses the path and the server accepts it as given.
 - **Both paths, at finalize:** the staged file must belong to the table — its `table-uuid` must match
   the live table's, else the commit fails with HTTP 400 — and it is swapped in only if it was built
@@ -649,9 +690,11 @@ a path. What the server checks today:
 So a client cannot commit a metadata file built for another table: swapped in, it would leave the
 table unreadable, and merge-retried, it would append the other table's data files.
 
-**Bounded blast radius.** The read handle carries no authority
-([§6](#6-reads-consistent-multi-table-snapshots)); lock DoS is bounded by short leases and the reaper.
-There is no per-transaction limit on the number of locks yet.
+**Blast radius.** The read handle carries no authority
+([§6](#6-reads-consistent-multi-table-snapshots)). Locks have no lease of their own — they last as
+long as their transaction's lease (default 3600 s, renewable, with no upper cap), and the reaper
+releases them when that lease expires. There is no per-transaction limit on the number of locks and
+no lease cap yet — both open hardening items.
 
 ### 20. Relationship to prior art & future direction
 
@@ -681,6 +724,11 @@ not a settled conclusion.
 Transaction endpoints are a Polaris extension under `/polaris/v1/{prefix}/`
 (`spec/polaris-catalog-apis/transaction-apis.yaml`). Reads ride two optional params on the existing
 `loadTable`.
+
+> **Naming note:** the extension's `POST /polaris/v1/{prefix}/transactions/{txn-id}/commit`
+> (`commitTransaction`) commits an open transaction by id. It is distinct from the Iceberg REST spec's
+> stateless `POST /v1/{prefix}/transactions/commit`, which atomically applies a prepared multi-table
+> bundle in one request (see [§2](#2-the-core-idea-coordinate-in-the-catalog)).
 
 **Consistent read handles** — used by pure readers; no `txn_id`, no CLOG entry.
 

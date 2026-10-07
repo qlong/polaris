@@ -23,6 +23,12 @@
 > for the design docs and demo; the runnable demo lives in
 > [`demos/multi-table-transaction/`](demos/multi-table-transaction/) (start with its `DEMOS.md`).
 >
+> **How this was built.** I used AI coding assistants throughout this work, for writing and
+> refactoring code, drafting tests and documentation, and as a sounding board when exploring design
+> options. The design direction, the decisions, and the review are mine: I directed the changes,
+> examined the code, and verified the behavior with tests and end-to-end runs against my own
+> expectations. I am responsible for all of it.
+>
 > Everything below is the upstream Apache Polaris README, unchanged.
 
 ---
